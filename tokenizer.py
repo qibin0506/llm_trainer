@@ -23,14 +23,14 @@ class Tokenizer:
         self.bot_text = '[BOT]'
 
         if token_type == TOKEN_TYPE_BERT:
-            self.tokenizer = BertTokenizerFast(f'{os.environ['TOKEN_DIR']}bert_vocab.txt')
+            self.tokenizer = BertTokenizerFast(f"{os.environ['TOKEN_DIR']}bert_vocab.txt")
             self.eot = self.tokenizer.sep_token_id
             self.pad = self.tokenizer.pad_token_id
             self.unk = self.tokenizer.unk_token_id
         elif token_type == TOKEN_TYPE_QWEN:
             self.tokenizer = Qwen2TokenizerFast(
-                vocab_file=f'{os.environ['TOKEN_DIR']}qwen_vocab.json',
-                merges_file=f'{os.environ['TOKEN_DIR']}qwen_merges.txt',
+                vocab_file=f"{os.environ['TOKEN_DIR']}qwen_vocab.json",
+                merges_file=f"{os.environ['TOKEN_DIR']}qwen_merges.txt",
                 unk_token=self.unk_text,
                 eos_token=self.eot_text,
                 pad_token=self.pad_text)

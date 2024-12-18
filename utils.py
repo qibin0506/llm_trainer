@@ -8,20 +8,20 @@ from .ddp import DDPHelper
 
 
 class TrainConfig:
-    # singleton
-    _instance = None
-
     def __init__(self):
-        # 梯度积累步数
-        self.gradient_accumulation_steps = self._get_env_int('GRADIENT_ACCUMULATION_STEPS', 0)
+        if not hasattr(TrainConfig, "_first_init"):
+            TrainConfig._first_init = True
 
-        self.ddp_helper = DDPHelper()
-        self.tokenizer = Tokenizer(self._get_env_int('TOKENIZERS_TYPE', 0))
+            # 梯度积累步数
+            self.gradient_accumulation_steps = self._get_env_int('GRADIENT_ACCUMULATION_STEPS', 0)
 
-        self.use_amp = 'cuda' in self.ddp_helper.device
-        self.dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+            self.ddp_helper = DDPHelper()
+            self.tokenizer = Tokenizer(self._get_env_int('TOKENIZERS_TYPE', 0))
 
-        self.bot_token = self.tokenizer.encode_to_token('[BOT]', unsqueeze=False, covert_tensor=False)[0]
+            self.use_amp = 'cuda' in self.ddp_helper.device
+            self.dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+
+            self.bot_token = self.tokenizer.encode_to_token('[BOT]', unsqueeze=False, covert_tensor=False)[0]
 
     def _get_env_int(self, name, default_value: int) -> int:
         try:
@@ -31,9 +31,10 @@ class TrainConfig:
             return default_value
 
     def __new__(cls, *args, **kwargs):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
+        if not hasattr(TrainConfig, "_instance"):
+            TrainConfig._instance = object.__new__(cls)
+
+        return TrainConfig._instance
 
 
 # def get_llama_config():

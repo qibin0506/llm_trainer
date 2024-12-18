@@ -55,7 +55,7 @@ def train(
         prompt_on_batch: str,
         prompt_on_epoch: str,
 ):
-    llama = TrainConfig().ddp_helper.process_model(LlamaModel(llama_config), f'{os.environ['SAVE_DIR']}modeling.pth')
+    llama = TrainConfig().ddp_helper.process_model(LlamaModel(llama_config), f"{os.environ['SAVE_DIR']}modeling.pth")
 
     if TrainConfig().ddp_helper.is_main_process():
         eval_model = LlamaModel(llama_config).to('cpu')

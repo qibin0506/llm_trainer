@@ -3,12 +3,41 @@ import torch
 from pytorch.llm.llama import KVCache
 from pytorch.llm.llm_trainer.utils import TrainConfig
 
+
+def _suppress_warper(logits: torch.Tensor, suppress_tokens: list[int]) -> torch.Tensor:
+    """
+    抑制特殊token输出
+    :param logits:
+    :param suppress_tokens:
+    :return:
+    """
+    suppress_tokens = torch.tensor(suppress_tokens, device=logits.device)
+    vocab_tensor = torch.arange(logits.shape[-1], device=logits.device)
+    suppress_token_mask = torch.isin(vocab_tensor, suppress_tokens)
+    logits = torch.where(suppress_token_mask, -float("inf"), logits)
+
+    return logits
+
+
 def _temperature_warper(logits: torch.Tensor, temperature: float) -> torch.Tensor:
+    """
+    应用temperature
+    :param logits:
+    :param temperature:
+    :return:
+    """
     logits = logits / temperature
     return logits
 
 
 def _top_k_warper(logits: torch.Tensor, k: float, device: Union[str, torch.device, int] = None) -> torch.Tensor:
+    """
+    top k采样
+    :param logits:
+    :param k:
+    :param device:
+    :return:
+    """
     topk_logits, _ = torch.topk(logits, k=k)
     min_val: torch.Tensor = topk_logits[:, -1]
     logits = torch.where(logits < min_val, torch.tensor(-torch.inf).to(device), logits)
@@ -16,6 +45,13 @@ def _top_k_warper(logits: torch.Tensor, k: float, device: Union[str, torch.devic
 
 
 def _top_p_warper(logits: torch.Tensor, p: float, min_tokens_to_keep: int = 1) -> torch.Tensor:
+    """
+    top p 核采样
+    :param logits:
+    :param p:
+    :param min_tokens_to_keep:
+    :return:
+    """
     # 正序排列 eg: [0.1, 0.2, 0.3]
     sorted_logits, sorted_indices = torch.sort(logits, dim=-1, descending=False)
     # cumsum求和, 每一个元素的值都是与之前元素的求和
@@ -64,6 +100,7 @@ def generate_text(
         temperature: Optional[float],
         k: Optional[int],
         p: Optional[float],
+        suppress_tokens: Optional[list[int]] = None,
         device: Union[str, torch.device, int],
         token_item_callback
 ):
@@ -75,6 +112,7 @@ def generate_text(
     :param temperature: 设置None不不生效temperature
     :param k: top k参数，设置为None或者0不生效topk
     :param p: top p参数，设置为None不生效top p
+    :param suppression_tokens: 要抑制的tokens
     :param device:
     :param token_item_callback:
 
@@ -96,8 +134,9 @@ def generate_text(
 
         # (batch, vocab_size)
         logits = logits[:, -1, :]
-        # 抑制[UNK]输出
-        logits[..., TrainConfig().tokenizer.unk] = torch.tensor(-torch.inf)
+        # 抑制特殊token输出
+        if suppress_tokens is not None and len(suppress_tokens) != 0:
+            logits = _suppress_warper(logits, suppress_tokens)
 
         multinomial = False
         if temperature is not None and temperature > 0:
@@ -142,6 +181,7 @@ def generate(
         temperature: Optional[float] = 1.0,
         k: Optional[int] = 50,
         p: Optional[float] = 1.0,
+        suppress_tokens: Optional[list[int]] = None,
         device: Union[str, torch.device, int] = None,
         item_callback = None,
 ):
@@ -164,6 +204,7 @@ def generate(
         k=k,
         p=p,
         device=device,
+        suppress_tokens=suppress_tokens,
         token_item_callback=token_item_callback
     )
 

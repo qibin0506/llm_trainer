@@ -50,7 +50,7 @@ def _top_p_warper(logits: torch.Tensor, p: float, min_tokens_to_keep: int = 1) -
     indices_to_remove = sorted_indices_to_remove.scatter(1, index=sorted_indices, src=sorted_indices_to_remove)
 
     # 将需要移除的元素的值设置为-inf
-    scores_processed = logits.masked_fill(indices_to_remove, -float("Inf"))
+    scores_processed = logits.masked_fill_(indices_to_remove, -float("Inf"))
 
     return scores_processed
 

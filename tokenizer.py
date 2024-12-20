@@ -38,10 +38,13 @@ class Tokenizer:
             self.pad = self.tokenizer.pad_token_id
             self.unk = self.tokenizer.unk_token_id
 
-        self.user_token = AddedToken(self.user_text, lstrip=False, rstrip=False)
-        self.bot_token = AddedToken(self.bot_text, lstrip=False, rstrip=False)
+        added_user_token = AddedToken(self.user_text, lstrip=False, rstrip=False)
+        added_bot_token = AddedToken(self.bot_text, lstrip=False, rstrip=False)
+        self.tokenizer.add_special_tokens({"additional_special_tokens": [added_user_token, added_bot_token]})
 
-        self.tokenizer.add_special_tokens({"additional_special_tokens": [self.user_token, self.bot_token]})
+        self.user = self.tokenizer.convert_tokens_to_ids(self.user_text)
+        self.bot = self.tokenizer.convert_tokens_to_ids(self.bot_text)
+
         self.vocab_size = len(self.tokenizer)
 
     def encode_to_token(self, text: str, unsqueeze=True, covert_tensor=True):
@@ -63,20 +66,22 @@ class Tokenizer:
 
 
 # if __name__ == '__main__':
-#    tokenizer = Tokenizer(TOKEN_TYPE_QWEN)
-#    print(tokenizer.vocab_size)
+#     tokenizer = Tokenizer(TOKEN_TYPE_QWEN)
+#     print(tokenizer.vocab_size)
 #
-#    eot = tokenizer.eot
-#    pad = tokenizer.pad
-#    unk = tokenizer.unk
+#     eot = tokenizer.eot
+#     pad = tokenizer.pad
+#     unk = tokenizer.unk
 #
-#    print(eot, pad, unk)
-#    print(tokenizer.decode_to_text(torch.tensor([eot])),
-#          tokenizer.decode_to_text(torch.tensor([pad])),
-#          tokenizer.decode_to_text(torch.tensor([unk])))
+#     print(eot, pad, unk)
+#     print(tokenizer.decode_to_text(torch.tensor([eot])),
+#           tokenizer.decode_to_text(torch.tensor([pad])),
+#           tokenizer.decode_to_text(torch.tensor([unk])))
 #
-#    print(tokenizer.encode_to_token(' '))
-#    print(tokenizer.encode_to_token('[USER]'))
-#    print(tokenizer.encode_to_token('[BOT]'))
+#     print(tokenizer.encode_to_token(' '))
+#     print(tokenizer.encode_to_token('[USER]'))
+#     print(tokenizer.encode_to_token('[BOT]'))
+#     print(tokenizer.user)
+#     print(tokenizer.bot)
 
 

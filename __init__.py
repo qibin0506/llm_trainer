@@ -1,4 +1,5 @@
-from . import trainer
-from .utils import TrainConfig, generate
+from pytorch.llm.llm_trainer.trainer import train
+from pytorch.llm.llm_trainer.utils import TrainConfig
+from pytorch.llm.llm_trainer.generate_utils import generate
 
-train_fn = trainer.train
+train_fn = train

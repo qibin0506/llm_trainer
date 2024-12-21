@@ -112,7 +112,7 @@ def generate_text(
     :param temperature: 设置None不不生效temperature
     :param k: top k参数，设置为None或者0不生效topk
     :param p: top p参数，设置为None不生效top p
-    :param suppression_tokens: 要抑制的tokens
+    :param suppress_tokens: 要抑制的tokens
     :param device:
     :param token_item_callback:
 

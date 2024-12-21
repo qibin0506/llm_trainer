@@ -1,8 +1,10 @@
 import os
 import threading
 import torch
+import torch.distributed as dist
 from pytorch.llm.llm_trainer.generate_utils import generate
 from pytorch.llm.llama import LlamaConfig
+from pytorch.llm.llm_trainer.parallel_fsdp import FsdpParallel
 from pytorch.llm.llm_trainer.utils import TrainerTools
 
 
@@ -36,6 +38,11 @@ def _submit_gen_task(eval_model, sign, epoch, batch, state_dict, prompt, max_pos
 
 
 def _save_model():
+    if isinstance(TrainerTools().parallel, FsdpParallel):
+        # 如果是fsdp模式，则需要等所有gpu本轮都完毕后才能保存
+        # use a barrier to make sure training is done on all ranks
+        dist.barrier()
+
     save_dir = os.environ['SAVE_DIR']
     if os.path.exists(f'{save_dir}modeling.pth'):
         if os.path.exists(f'{save_dir}modeling_bak.pth'):

@@ -1,7 +1,7 @@
 from typing import Union, Optional
 import torch
 from pytorch.llm.llama import KVCache
-from pytorch.llm.llm_trainer.utils import TrainConfig
+from pytorch.llm.llm_trainer.utils import TrainerTools
 
 
 def _suppress_warper(logits: torch.Tensor, suppress_tokens: list[int]) -> torch.Tensor:
@@ -128,7 +128,7 @@ def generate_text(
     for _ in range(max_new_tokens):
         t = tokens[:, -max_position_embeddings:]
         with torch.no_grad():
-            with torch.autocast(device_type=device, dtype=TrainConfig().dtype, enabled=enable_autocast):
+            with torch.autocast(device_type=device, dtype=TrainerTools().dtype, enabled=enable_autocast):
                 # logits (batch, seq_len, vocab_size)
                 logits, kv_cache = model(t, past_key_values=kv_cache, use_cache=use_kv_cache)
 
@@ -166,7 +166,7 @@ def generate_text(
         else:
             tokens = torch.cat((tokens, next_token), dim=-1)
 
-        if next_token.item() == TrainConfig().tokenizer.eot:
+        if next_token.item() == TrainerTools().tokenizer.eot:
             break
 
     return tokens if not use_kv_cache else generate_tokens
@@ -188,12 +188,12 @@ def generate(
     model.eval()
 
     if item_callback is not None:
-        token_item_callback = lambda token: item_callback(TrainConfig().tokenizer.decode_to_text(token))
+        token_item_callback = lambda token: item_callback(TrainerTools().tokenizer.decode_to_text(token))
     else:
         token_item_callback = None
 
-    device = TrainConfig().ddp_helper.device if device is None else device
-    encoded_tokens = TrainConfig().tokenizer.encode_to_token(prompt).to(device)
+    device = TrainerTools().parallel.device if device is None else device
+    encoded_tokens = TrainerTools().tokenizer.encode_to_token(prompt).to(device)
 
     output = generate_text(
         model=model,
@@ -208,6 +208,6 @@ def generate(
         token_item_callback=token_item_callback
     )
 
-    decoded = TrainConfig().tokenizer.decode_to_text(output)
+    decoded = TrainerTools().tokenizer.decode_to_text(output)
 
     return decoded

@@ -3,40 +3,41 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 import torch.nn.functional as F
 from pytorch.llm.llm_trainer.tokenizer import Tokenizer
-from pytorch.llm.llm_trainer.ddp import DDPHelper
+from pytorch.llm.llm_trainer.parallel import Parallel
+from pytorch.llm.llm_trainer.parallel_fsdp import FsdpParallel
+from pytorch.llm.llm_trainer.parallel_ddp import DdpParallel
+from pytorch.llm.llm_trainer.parallel_none import NoneParallel
 
 
-class TrainConfig:
+class TrainerTools:
     def __init__(self):
-        if not hasattr(TrainConfig, "_first_init"):
-            TrainConfig._first_init = True
+        if not hasattr(TrainerTools, "_first_init"):
+            TrainerTools._first_init = True
 
-            # 梯度积累步数
-            self.gradient_accumulation_steps = self._get_env_int('GRADIENT_ACCUMULATION_STEPS', 0)
+            parallel_type = os.environ.get('PARALLEL_TYPE', 'none')
+            if parallel_type == 'fsdp':
+                self.parallel: Parallel = FsdpParallel()
+            elif parallel_type == 'ddp':
+                self.parallel: Parallel = DdpParallel()
+            else:
+                self.parallel: Parallel = NoneParallel()
 
-            self.ddp_helper = DDPHelper()
-            self.tokenizer = Tokenizer(self._get_env_int('TOKENIZERS_TYPE', 0))
+            self.tokenizer = Tokenizer(int(os.environ.get('TOKENIZERS_TYPE', 0)))
 
-            self.use_amp = 'cuda' in self.ddp_helper.device
+            self.use_amp = 'cuda' in self.parallel.device
             self.dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
 
             self.bot_token = self.tokenizer.encode_to_token('[BOT]', unsqueeze=False, covert_tensor=False)[0]
 
-    def _get_env_int(self, name, default_value: int) -> int:
-        try:
-            value = os.environ[name]
-            return int(value)
-        except:
-            return default_value
 
     def __new__(cls, *args, **kwargs):
-        if not hasattr(TrainConfig, "_instance"):
-            TrainConfig._instance = object.__new__(cls)
+        if not hasattr(TrainerTools, "_instance"):
+            TrainerTools._instance = object.__new__(cls)
 
-        return TrainConfig._instance
+        return TrainerTools._instance
 
 def pretrain_padding_fn(batch_data):
-    inputs = pad_sequence(batch_data, batch_first=True, padding_value=TrainConfig().tokenizer.pad)
+    inputs = pad_sequence(batch_data, batch_first=True, padding_value=TrainerTools().tokenizer.pad)
     # crossEntropy默认的ignore_index是-100
     labels = pad_sequence(batch_data, batch_first=True, padding_value=-100)
 
@@ -58,7 +59,7 @@ def sft_padding_fn(batch_data):
     """
     inputs, labels = pretrain_padding_fn(batch_data)
     batch_size = len(labels)
-    batch_bot_idx = torch.nonzero(torch.eq(labels, TrainConfig().bot_token), as_tuple=True)[1]
+    batch_bot_idx = torch.nonzero(torch.eq(labels, TrainerTools().bot_token), as_tuple=True)[1]
 
     for batch in range(batch_size):
         bot_idx = batch_bot_idx[batch].item() + 1

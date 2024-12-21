@@ -4,10 +4,12 @@ from torch.utils.data import Dataset
 import torch.distributed as dist
 import pickle
 
-from pytorch.llm.llama import LlamaModel, LlamaConfig
+from pytorch.llm.llama import LlamaModel
 from pytorch.llm.llm_trainer.scheduler import CosineAnnealingWarmupScheduler
+from pytorch.llm.llm_trainer.train_args import TrainArgs
+from pytorch.llm.llm_trainer.parallel_fsdp import FsdpParallel
 from pytorch.llm.llm_trainer.utils import (
-    TrainConfig,
+    TrainerTools,
     calc_loss,
     pretrain_padding_fn,
     sft_padding_fn,
@@ -46,29 +48,37 @@ class LLMDataset(Dataset):
 
 
 def train(
-        n_epochs: int,
-        batch_size: int,
         *,
-        llama_config: LlamaConfig,
-        all_data_size: int,
-        all_files: list[any],
-        is_sft: bool, # 是否sft
+        train_args: TrainArgs,
         prompt_on_batch: str,
         prompt_on_epoch: str,
 ):
-    llama = TrainConfig().ddp_helper.process_model(LlamaModel(llama_config), f"{os.environ['SAVE_DIR']}modeling.pth")
+    llama_config = train_args.llama_config
 
-    if TrainConfig().ddp_helper.is_main_process():
+    if isinstance(TrainerTools().parallel, FsdpParallel):
+        fsdp_kwargs = {
+            'wrap_policy_num_params': train_args.wrap_policy_num_params,
+            'cpu_offload': train_args.cpu_offload,
+            'offload_params': train_args.offload_params
+        }
+    else:
+        fsdp_kwargs = None
+
+    llama = TrainerTools().parallel.process_model(
+        LlamaModel(llama_config),
+        f"{os.environ['SAVE_DIR']}modeling.pth",
+        kwargs=fsdp_kwargs
+    )
+
+    if TrainerTools().parallel.is_main_process:
         eval_model = LlamaModel(llama_config).to('cpu')
-        if TrainConfig().ddp_helper.use_compile:
-            torch.compile(eval_model)
     else:
         eval_model = None
 
     # initialize a GradScaler. If enabled=False scaler is a no-op
-    scalar = torch.GradScaler(enabled=TrainConfig().use_amp)
+    scalar = torch.GradScaler(enabled=TrainerTools().use_amp)
 
-    if TrainConfig().ddp_helper.is_main_process():
+    if TrainerTools().parallel.is_main_process:
         total_params = sum(p.numel() for p in llama.parameters())
         print(f"Total number of parameters: {total_params:,}")
 
@@ -76,61 +86,77 @@ def train(
         total_size_mb = total_size_bytes / (1024 * 1024)
         print(f"Total size of the model: {total_size_mb:.2f} MB")
 
-    gradient_accumulation_steps = TrainConfig().gradient_accumulation_steps
-    batch_count = all_data_size // TrainConfig().ddp_helper.world_size() // batch_size
+    # 梯度累积步数
+    gradient_accumulation_steps = train_args.gradient_accumulation_steps
+    batch_count = train_args.all_data_size // TrainerTools().parallel.world_size // train_args.batch_size
 
     if gradient_accumulation_steps > 1:
         batch_count = batch_count // gradient_accumulation_steps
 
-    train_iters = batch_count * n_epochs
+    train_iters = batch_count * train_args.n_epochs
 
     warmup_iters = int(0.2 * train_iters)
     # 学习率要根据GPU的数量进行倍增：
     # 在训练的过程中，损失梯度决定下降的方向，学习率决定下降的步长。如果有两块gpu，前进的综合步长为：平均学习率*2
-    initial_lr = 1e-5 * TrainConfig().ddp_helper.world_size()
+    initial_lr = 1e-5 * TrainerTools().parallel.world_size
     min_lr = 0.1 * initial_lr
-    max_lr = 5e-4 * TrainConfig().ddp_helper.world_size()
+    max_lr = 5e-4 * TrainerTools().parallel.world_size
 
     optimizer = torch.optim.AdamW(llama.parameters(), lr=initial_lr, weight_decay=0.1)
     lr_scheduler = CosineAnnealingWarmupScheduler(optimizer, warmup_iters, initial_lr, min_lr, max_lr, train_iters)
 
-    for epoch in range(n_epochs):
-        loss_accumulation = torch.tensor(0.0, device=TrainConfig().ddp_helper.device)
+    for epoch in range(train_args.n_epochs):
+        loss_accumulation = torch.tensor(0.0, device=TrainerTools().parallel.device)
         llama.train()
 
-        for file in all_files:
+        for file in train_args.all_files:
             dataset = LLMDataset(llama_config.max_position_embeddings, file)
-            train_data_loader = TrainConfig().ddp_helper.create_dataloader(
+
+            data_loader_kwargs = {
+                "batch_size": train_args.batch_size,
+                "pin_memory": train_args.data_loader_pin_memory,
+                "collate_fn": sft_padding_fn if train_args.is_sft else pretrain_padding_fn,
+                "num_workers": train_args.data_loader_num_workers,
+                "shuffle": train_args.data_loader_shuffle,
+                "drop_last": train_args.data_loader_drop_last,
+            }
+
+            sampler_kwargs = {
+                "shuffle": train_args.data_loader_shuffle,
+                "drop_last": train_args.data_loader_drop_last,
+            }
+
+            train_data_loader = TrainerTools().parallel.create_dataloader(
                 dataset=dataset,
-                batch_size=batch_size,
-                collate_fn=sft_padding_fn if is_sft else pretrain_padding_fn
+                data_loader_kwargs=data_loader_kwargs,
+                sampler_kwargs=sampler_kwargs
             )
 
             train_loader_len = len(train_data_loader)
-            TrainConfig().ddp_helper.on_epoch(epoch)
+            TrainerTools().parallel.on_epoch_start(epoch)
 
             for batch, (inputs, labels) in enumerate(train_data_loader):
                 # 是否需要更新梯度
                 if gradient_accumulation_steps > 1:
                     need_update_grad = (batch + 1) % gradient_accumulation_steps == 0 or batch == train_loader_len - 1
-                    if TrainConfig().ddp_helper.is_main_process() and need_update_grad:
+                    if TrainerTools().parallel.is_main_process and need_update_grad:
                         print(f"need_update_grad: {batch}")
                 else:
                     need_update_grad = True
 
                 try:
-                    inputs, labels = inputs.to(TrainConfig().ddp_helper.device), labels.to(TrainConfig().ddp_helper.device)
-                    attention_mask = inputs != TrainConfig().tokenizer.pad
+                    inputs, labels = inputs.to(TrainerTools().parallel.device), labels.to(TrainerTools().parallel.device)
+                    attention_mask = inputs != TrainerTools().tokenizer.pad
 
-                    if TrainConfig().ddp_helper.ddp:
+                    if TrainerTools().parallel.parallel_train:
                         # in DDP training we only need to sync gradients at the last micro step.
                         # the official way to do this is with model.no_sync() context manager, but
                         # I really dislike that this bloats the code and forces us to repeat code
                         # looking at the source of that context manager, it just toggles this variable
                         llama.require_backward_grad_sync = need_update_grad
 
-                    with torch.autocast(device_type=TrainConfig().ddp_helper.device_type,
-                                        dtype=TrainConfig().dtype, enabled=TrainConfig().use_amp):
+                    with torch.autocast(device_type=TrainerTools().parallel.device_type,
+                                        dtype=TrainerTools().dtype, enabled=TrainerTools().use_amp):
                         logits, _ = llama(inputs, attention_mask=attention_mask)
                         # calc loss
                         loss = calc_loss(logits, labels)
@@ -155,15 +181,30 @@ def train(
                         # flush the gradients as soon as we can, no need for this memory anymore
                         optimizer.zero_grad(set_to_none=True)
 
-                        TrainConfig().ddp_helper.synchronize()
+                        TrainerTools().parallel.synchronize()
 
                     loss_accumulation += loss.detach()
 
                     if gradient_accumulation_steps > 1:
-                        on_batch(eval_model, epoch, batch, loss.detach().item() * gradient_accumulation_steps,
-                                 need_update_grad, prompt_on_batch)
+                        on_batch(
+                            eval_model,
+                            epoch,
+                            batch,
+                            loss.detach().item() * gradient_accumulation_steps,
+                            need_update_grad,
+                            prompt_on_batch,
+                            llama_config
+                        )
                     else:
-                        on_batch(eval_model, epoch, batch, loss.detach().item(), need_update_grad, prompt_on_batch)
+                        on_batch(
+                            eval_model,
+                            epoch,
+                            batch,
+                            loss.detach().item(),
+                            need_update_grad,
+                            prompt_on_batch,
+                            llama_config
+                        )
 
                     del loss
                 except KeyboardInterrupt as e:
@@ -171,12 +212,26 @@ def train(
                 except Exception as e:
                     on_exception(e, epoch, batch)
 
-            on_file(eval_model, epoch, batch, TrainConfig().tokenizer.decode_to_text(dataset.get_first()))
+            on_file(
+                eval_model,
+                epoch,
+                batch,
+                TrainerTools().tokenizer.decode_to_text(dataset.get_first()),
+                llama_config
+            )
 
-        if TrainConfig().ddp_helper.ddp:
+        if TrainerTools().parallel.parallel_train:
             dist.all_reduce(loss_accumulation, dist.ReduceOp.AVG)
 
-        TrainConfig().ddp_helper.end_epoch(epoch)
-        on_epoch(eval_model, epoch, loss_accumulation, batch_count, need_update_grad, prompt_on_epoch)
+        TrainerTools().parallel.on_epoch_end(epoch)
+        on_epoch(
+            eval_model,
+            epoch,
+            loss_accumulation,
+            batch_count,
+            need_update_grad,
+            prompt_on_epoch,
+            llama_config
+        )
 
-    TrainConfig().ddp_helper.destroy()
+    TrainerTools().parallel.destroy()

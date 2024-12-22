@@ -25,6 +25,7 @@ class TrainerTools:
             self.tokenizer = Tokenizer(int(os.environ.get('TOKENIZERS_TYPE', 0)))
 
             self.use_amp = 'cuda' in self.parallel.device
+
             self.dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
 
             self.bot_token = self.tokenizer.encode_to_token('[BOT]', unsqueeze=False, covert_tensor=False)[0]

@@ -1,4 +1,6 @@
+from typing import Optional
 from dataclasses import dataclass
+from torch import nn
 from pytorch.llm.llama import LlamaConfig
 
 
@@ -11,6 +13,7 @@ class TrainArgs:
     all_data_size: int
     all_files: list[any]
     gradient_accumulation_steps: int = 0
+    transformer_layer_cls: Optional[nn.Module] = None,
     wrap_policy_num_params: int = -1
     cpu_offload: bool = False
     offload_params: bool = False

@@ -57,6 +57,7 @@ def train(
 
     if isinstance(TrainerTools().parallel, FsdpParallel):
         fsdp_kwargs = {
+            'transformer_layer_cls': train_args.transformer_layer_cls,
             'wrap_policy_num_params': train_args.wrap_policy_num_params,
             'cpu_offload': train_args.cpu_offload,
             'offload_params': train_args.offload_params

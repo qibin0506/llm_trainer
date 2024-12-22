@@ -2,13 +2,22 @@ from typing import Optional
 import functools
 import torch
 from torch import nn
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    MixedPrecision,
+    BackwardPrefetch,
+    ShardingStrategy,
+    FullStateDictConfig,
+    StateDictType,
+)
+
 from torch.distributed.fsdp.fully_sharded_data_parallel import (
     CPUOffload,
     BackwardPrefetch,
 )
 from torch.distributed.fsdp.wrap import (
     size_based_auto_wrap_policy,
+    transformer_auto_wrap_policy,
     enable_wrap,
     wrap,
 )
@@ -44,7 +53,14 @@ class FsdpParallel(Parallel):
             model = torch.compile(model)
 
         if self._use_parallel:
-            if 'wrap_policy_num_params' in kwargs:
+            if 'transformer_layer_cls' in kwargs:
+                auto_wrap_policy = functools.partial(
+                    transformer_auto_wrap_policy,
+                    transformer_layer_cls= {
+                        kwargs['wrap_policy_num_params'],
+                    }
+                )
+            elif 'wrap_policy_num_params' in kwargs:
                 auto_wrap_policy = functools.partial(
                     size_based_auto_wrap_policy,
                     min_num_params=kwargs['wrap_policy_num_params']
@@ -63,11 +79,24 @@ class FsdpParallel(Parallel):
             else:
                 cpu_offload = None
 
+            if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+                mixed_precision = MixedPrecision(
+                    param_dtype=torch.bfloat16,
+                    # Gradient communication precision.
+                    reduce_dtype=torch.bfloat16,
+                    # Buffer precision.
+                    buffer_dtype=torch.bfloat16,
+                )
+            else:
+                mixed_precision = None
+
             self.raw_model = model
             self.model = FSDP(
                 model,
                 auto_wrap_policy=auto_wrap_policy,
-                cpu_offload=cpu_offload
+                mixed_precision=mixed_precision,
+                cpu_offload=cpu_offload,
+                device_id=torch.cuda.current_device()
             )
         else:
             self.model = model

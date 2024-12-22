@@ -38,11 +38,6 @@ def _submit_gen_task(eval_model, sign, epoch, batch, state_dict, prompt, max_pos
 
 
 def _save_model():
-    if isinstance(TrainerTools().parallel, FsdpParallel):
-        # 如果是fsdp模式，则需要等所有gpu本轮都完毕后才能保存
-        # use a barrier to make sure training is done on all ranks
-        dist.barrier()
-
     save_dir = os.environ['SAVE_DIR']
     if os.path.exists(f'{save_dir}modeling.pth'):
         if os.path.exists(f'{save_dir}modeling_bak.pth'):
@@ -50,7 +45,15 @@ def _save_model():
 
         os.rename(f'{save_dir}modeling.pth', f'{save_dir}modeling_bak.pth')
 
-    ckpt = {'model': TrainerTools().parallel.raw_model.state_dict()}
+    if isinstance(TrainerTools().parallel, FsdpParallel):
+        # 如果是fsdp模式，则需要等所有gpu本轮都完毕后才能保存
+        # use a barrier to make sure training is done on all ranks
+        dist.barrier()
+
+        ckpt = {'model': TrainerTools().parallel.model.state_dict()}
+    else:
+        ckpt = {'model': TrainerTools().parallel.raw_model.state_dict()}
+
     torch.save(ckpt, f'{save_dir}modeling.pth')
 
 

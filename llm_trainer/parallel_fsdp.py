@@ -52,9 +52,7 @@ class FsdpParallel(Parallel):
             if 'transformer_layer_cls' in kwargs:
                 auto_wrap_policy = functools.partial(
                     transformer_auto_wrap_policy,
-                    transformer_layer_cls= {
-                        kwargs['wrap_policy_num_params'],
-                    }
+                    transformer_layer_cls = kwargs['wrap_policy_num_params']
                 )
             elif 'wrap_policy_num_params' in kwargs:
                 auto_wrap_policy = functools.partial(

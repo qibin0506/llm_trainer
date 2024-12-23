@@ -2,7 +2,7 @@
 
 ```python
 from lm_trainer import TrainerTools
-from lama import LlamaConfig
+from llama import LlamaConfig
 from llm_trainer import TrainArgs, FsdpArgs, DataLoaderArgs
 from llm_trainer import train_fn
 import os

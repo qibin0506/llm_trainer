@@ -1,7 +1,7 @@
 from typing import Union, Optional
 import torch
-from pytorch.llm.llama import KVCache
-from pytorch.llm.llm_trainer.utils import TrainerTools
+from llama import KVCache
+from .utils import TrainerTools
 
 
 def _suppress_warper(logits: torch.Tensor, suppress_tokens: list[int]) -> torch.Tensor:

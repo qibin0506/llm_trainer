@@ -4,7 +4,7 @@ import torch
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from pytorch.llm.llm_trainer.parallel import Parallel
+from .parallel import Parallel
 
 
 # python3 -m torch.distributed.launch --nproc_per_node=2 --nnodes=1 gpt.py

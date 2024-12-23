@@ -2,7 +2,7 @@ from typing import Optional
 import torch
 from torch import nn
 
-from pytorch.llm.llm_trainer.parallel import Parallel
+from .parallel import Parallel
 
 class NoneParallel(Parallel):
     def __init__(self):

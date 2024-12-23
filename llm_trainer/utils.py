@@ -2,11 +2,11 @@ import os
 import torch
 from torch.nn.utils.rnn import pad_sequence
 import torch.nn.functional as F
-from pytorch.llm.llm_trainer.tokenizer import Tokenizer
-from pytorch.llm.llm_trainer.parallel import Parallel
-from pytorch.llm.llm_trainer.parallel_fsdp import FsdpParallel
-from pytorch.llm.llm_trainer.parallel_ddp import DdpParallel
-from pytorch.llm.llm_trainer.parallel_none import NoneParallel
+from .tokenizer import Tokenizer
+from .parallel import Parallel
+from .parallel_fsdp import FsdpParallel
+from .parallel_ddp import DdpParallel
+from .parallel_none import NoneParallel
 
 
 class TrainerTools:

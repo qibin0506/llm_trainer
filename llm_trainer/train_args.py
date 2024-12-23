@@ -1,7 +1,7 @@
 from typing import Optional
 from dataclasses import dataclass
 from torch import nn
-from pytorch.llm.llama import LlamaConfig
+from llama import LlamaConfig
 
 
 @dataclass

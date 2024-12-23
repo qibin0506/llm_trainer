@@ -22,7 +22,7 @@ from torch.distributed.fsdp.wrap import (
     wrap,
 )
 
-from pytorch.llm.llm_trainer.parallel import Parallel
+from .parallel import Parallel
 
 class FsdpParallel(Parallel):
     def __init__(self):

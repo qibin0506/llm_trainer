@@ -5,10 +5,11 @@ from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
     FullStateDictConfig
 )
-from pytorch.llm.llm_trainer.generate_utils import generate
-from pytorch.llm.llama import LlamaConfig
-from pytorch.llm.llm_trainer.parallel_fsdp import FsdpParallel
-from pytorch.llm.llm_trainer.utils import TrainerTools
+
+from llama import LlamaConfig
+from .generate_utils import generate
+from .parallel_fsdp import FsdpParallel
+from .utils import TrainerTools
 
 
 def _submit_gen_task(eval_model, tag, state_dict, prompt, max_position_embeddings, max_new_tokens):

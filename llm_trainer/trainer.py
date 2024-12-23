@@ -4,18 +4,18 @@ from torch.utils.data import Dataset
 import torch.distributed as dist
 import pickle
 
-from pytorch.llm.llama import LlamaModel
-from pytorch.llm.llm_trainer.scheduler import CosineAnnealingWarmupScheduler
-from pytorch.llm.llm_trainer.train_args import TrainArgs
-from pytorch.llm.llm_trainer.parallel_fsdp import FsdpParallel
-from pytorch.llm.llm_trainer.utils import (
+from llama import LlamaModel
+from .scheduler import CosineAnnealingWarmupScheduler
+from .train_args import TrainArgs
+from .parallel_fsdp import FsdpParallel
+from .utils import (
     TrainerTools,
     calc_loss,
     pretrain_padding_fn,
     sft_padding_fn,
 )
 
-from pytorch.llm.llm_trainer.trainer_log import (
+from .trainer_log import (
     on_batch,
     on_exception,
     on_epoch,

@@ -1,5 +1,5 @@
 from typing import Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from torch import nn
 from llama import LlamaConfig
 
@@ -26,8 +26,8 @@ class TrainArgs:
     llama_config: LlamaConfig
     is_sft: bool
     all_data_size: int
-    all_files: list[any]
+    all_files: list[any] = field(default_factory=list)
     gradient_accumulation_steps: int = 0
-    fsdp_args: FsdpArgs = FsdpArgs()
-    data_loader_args: DataLoaderArgs = DataLoaderArgs()
+    fsdp_args: FsdpArgs = field(default_factory=FsdpArgs)
+    data_loader_args: DataLoaderArgs = field(default_factory=DataLoaderArgs)
 

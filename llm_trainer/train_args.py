@@ -6,7 +6,7 @@ from llama import LlamaConfig
 
 @dataclass
 class FsdpArgs:
-    transformer_layer_cls: Optional[set[nn.Module]] = None,
+    transformer_layer_cls: Optional[Set[Type[nn.Module]]] = None,
     wrap_policy_num_params: int = -1
     cpu_offload: bool = False
     offload_params: bool = False

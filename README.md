@@ -1,10 +1,10 @@
 # llm_trainer
 
 ```python
-from pytorch.llm.llm_trainer import TrainerTools
-from pytorch.llm.llama import LlamaConfig
-from pytorch.llm.llm_trainer import TrainArgs, FsdpArgs, DataLoaderArgs
-from pytorch.llm.llm_trainer import train_fn
+from lm_trainer import TrainerTools
+from lama import LlamaConfig
+from llm_trainer import TrainArgs, FsdpArgs, DataLoaderArgs
+from llm_trainer import train_fn
 import os
 from glob import glob
 

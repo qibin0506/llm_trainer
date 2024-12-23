@@ -9,7 +9,11 @@ from torch.utils.data.distributed import DistributedSampler
 
 
 class Parallel:
-    def __init__(self, user_parallel: bool = True):
+    def __init__(
+            self,
+            user_parallel: bool = True,
+            init_process_group: bool = True
+    ):
         self._use_compile: bool = False
         self._global_rank: int = int(os.environ.get('RANK', -1))
         self._local_rank: int = int(os.environ.get('LOCAL_RANK', -1))
@@ -29,7 +33,8 @@ class Parallel:
             self.device_type: str = 'cuda'
             self._word_size = dist.get_world_size()
 
-            dist.init_process_group(backend='nccl', rank=self._local_rank, world_size=self._word_size)
+            if init_process_group:
+                dist.init_process_group(backend='nccl', rank=self._local_rank, world_size=self._word_size)
             torch.cuda.set_device(self.device)
 
             print(f'global_rank:{self._global_rank},local_rank:{self._local_rank}, world_size:{self._word_size}')

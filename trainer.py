@@ -55,12 +55,12 @@ def train(
 ):
     llama_config = train_args.llama_config
 
-    if isinstance(TrainerTools().parallel, FsdpParallel):
+    if isinstance(TrainerTools().parallel, FsdpParallel) and train_args.fsdp_args is not None:
         fsdp_kwargs = {
-            'transformer_layer_cls': train_args.transformer_layer_cls,
-            'wrap_policy_num_params': train_args.wrap_policy_num_params,
-            'cpu_offload': train_args.cpu_offload,
-            'offload_params': train_args.offload_params
+            'transformer_layer_cls': train_args.fsdp_args.transformer_layer_cls,
+            'wrap_policy_num_params': train_args.fsdp_args.wrap_policy_num_params,
+            'cpu_offload': train_args.fsdp_args.cpu_offload,
+            'offload_params': train_args.fsdp_args.offload_params
         }
     else:
         fsdp_kwargs = None
@@ -106,6 +106,8 @@ def train(
     optimizer = torch.optim.AdamW(llama.parameters(), lr=initial_lr, weight_decay=0.1)
     lr_scheduler = CosineAnnealingWarmupScheduler(optimizer, warmup_iters, initial_lr, min_lr, max_lr, train_iters)
 
+    dataloader_args = train_args.data_loader_args
+
     for epoch in range(train_args.n_epochs):
         loss_accumulation = torch.tensor(0.0, device=TrainerTools().parallel.device)
         llama.train()
@@ -115,16 +117,16 @@ def train(
 
             data_loader_kwargs = {
                 "batch_size": train_args.batch_size,
-                "pin_memory": train_args.data_loader_pin_memory,
+                "pin_memory": dataloader_args.data_loader_pin_memory,
                 "collate_fn": sft_padding_fn if train_args.is_sft else pretrain_padding_fn,
-                "num_workers": train_args.data_loader_num_workers,
-                "shuffle": train_args.data_loader_shuffle,
-                "drop_last": train_args.data_loader_drop_last,
+                "num_workers": dataloader_args.data_loader_num_workers,
+                "shuffle": dataloader_args.data_loader_shuffle,
+                "drop_last": dataloader_args.data_loader_drop_last,
             }
 
             sampler_kwargs = {
-                "shuffle": train_args.data_loader_shuffle,
-                "drop_last": train_args.data_loader_drop_last,
+                "shuffle": dataloader_args.data_loader_shuffle,
+                "drop_last": dataloader_args.data_loader_drop_last,
             }
 
             train_data_loader = TrainerTools().parallel.create_dataloader(

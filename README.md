@@ -3,7 +3,7 @@
 ```python
 from pytorch.llm.llm_trainer import TrainerTools
 from pytorch.llm.llama import LlamaConfig
-from pytorch.llm.llm_trainer import TrainArgs
+from pytorch.llm.llm_trainer import TrainArgs, FsdpArgs, DataLoaderArgs
 from pytorch.llm.llm_trainer import train_fn
 import os
 from glob import glob
@@ -43,10 +43,18 @@ def get_train_args(is_pretrain: bool) -> TrainArgs:
         all_data_size=0,
         all_files=[],
         gradient_accumulation_steps=32,
-        data_loader_pin_memory=True,
-        data_loader_num_workers=4,
-        data_loader_shuffle=False,
-        data_loader_drop_last=True
+        fsdp_args=FsdpArgs(
+            transformer_layer_cls=None,
+            wrap_policy_num_params=20000,
+            cpu_offload=True,
+            offload_params=True
+        ),
+        data_loader_args=DataLoaderArgs(
+            data_loader_pin_memory=True,
+            data_loader_num_workers=4,
+            data_loader_shuffle=False,
+            data_loader_drop_last=True
+        )
     )
 
     if is_pretrain:
@@ -63,6 +71,7 @@ def get_train_args(is_pretrain: bool) -> TrainArgs:
         train_args.all_files = glob('./data/train/sft.pkl')
 
     return train_args
+
 
 
 if __name__ == '__main__':

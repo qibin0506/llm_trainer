@@ -134,7 +134,7 @@ class Parallel:
         return loss.detach()
 
     @property
-    def parallel_train(self):
+    def parallel_train(self) -> bool:
         return self._use_parallel
 
     @property
@@ -145,6 +145,5 @@ class Parallel:
         return True
 
     @property
-    def world_size(self):
+    def world_size(self) -> int:
         return self._word_size
-

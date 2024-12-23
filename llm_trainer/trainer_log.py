@@ -1,15 +1,13 @@
 import os
 import threading
 import torch
-from torch.distributed.fsdp import (
-    FullyShardedDataParallel as FSDP,
-    FullStateDictConfig
-)
+from torch.distributed.checkpoint.state_dict import get_model_state_dict, set_model_state_dict
 
 from llama import LlamaConfig
 from .generate_utils import generate
 from .parallel_fsdp import FsdpParallel
-from .utils import TrainerTools
+from .parallel_ddp import DdpParallel
+from .train_tools import TrainerTools
 
 
 def _submit_gen_task(eval_model, tag, state_dict, prompt, max_position_embeddings, max_new_tokens):
@@ -21,7 +19,7 @@ def _submit_gen_task(eval_model, tag, state_dict, prompt, max_position_embedding
                 tf.write(item)
                 tf.flush()
 
-            eval_model.load_state_dict(state_dict)
+            set_model_state_dict(eval_model, state_dict)
             gen = generate(
                 eval_model,
                 prompt=prompt,
@@ -63,11 +61,9 @@ def _save_model(state_dict):
 
 
 def _get_model_state_dict():
-    if isinstance(TrainerTools().parallel, FsdpParallel):
-        fsdp_model = TrainerTools().parallel.model
-        full_state_dict_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with FSDP.state_dict_type(fsdp_model, 'FULL_STATE_DICT', full_state_dict_config):
-            state_dict = fsdp_model.state_dict()
+    if (isinstance(TrainerTools().parallel, FsdpParallel)
+            or isinstance(TrainerTools().parallel, DdpParallel)):
+        state_dict = get_model_state_dict(TrainerTools().parallel.model)
     else:
         state_dict = TrainerTools().parallel.raw_model.state_dict()
 
@@ -84,7 +80,6 @@ def on_batch(eval_model, epoch, batch, loss, need_update_grad, prompt, llama_con
 
             state_dict = _get_model_state_dict()
 
-            _save_model(state_dict)
             _submit_gen_task(
                 eval_model,
                 tag=f'sign:batch/epoch:{epoch}/batch:{batch}',
@@ -126,7 +121,6 @@ def on_exception(e, epoch, batch):
 def on_epoch(eval_model, epoch, loss_accumulation, all_batch, need_update_grad, prompt, llama_config: LlamaConfig):
     if TrainerTools().parallel.is_main_process:
         state_dict = _get_model_state_dict()
-        _save_model(state_dict)
 
         # test_loss = test_loop(model, test_data_loader)
         print(f'train_loss: {loss_accumulation.detach().item() / all_batch}')

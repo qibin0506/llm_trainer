@@ -11,13 +11,9 @@ class NoneParallel(Parallel):
     def process_model(
             self,
             model: nn.Module,
-            ckpt_path: str,
             kwargs: Optional[dict] = None
     ) -> nn.Module:
         model.to(self.device)
-
-        # 先load state, 再compile，最后DDP
-        self._load_ckpt(model, ckpt_path)
 
         if self._use_compile:
             model = torch.compile(model)

@@ -51,31 +51,30 @@ class Parallel:
     def process_model(
             self,
             model: nn.Module,
-            ckpt_path: str,
             kwargs: Optional[dict] = None
     ) -> nn.Module:
         raise NotImplementedError()
 
-    def _load_ckpt(self, model: nn.Module, ckpt_path: str):
-        # 先load state, 再compile，最后DDP
-        if self._use_parallel:
-            ddp_init_path = f'{ckpt_path}_parallel_init.pth'
-            if not os.path.exists(ckpt_path):
-                if self.is_main_process:
-                    ckpt = {'model': model.state_dict()}
-                    torch.save(ckpt, ddp_init_path)
-
-                dist.barrier(device_ids=[int(os.environ["LOCAL_RANK"])])
-                ckpt = torch.load(ddp_init_path, map_location=self.device)
-                model.load_state_dict(ckpt['model'])
-                print(f'load init ckpt for {self.device}')
-            else:
-                ckpt = torch.load(ckpt_path, map_location=self.device)
-                model.load_state_dict(ckpt['model'])
-        else:
-            if os.path.exists(ckpt_path):
-                ckpt = torch.load(ckpt_path, map_location=self.device)
-                model.load_state_dict(ckpt['model'])
+    # def _load_ckpt(self, model: nn.Module, ckpt_path: str):
+    #     # 先load state, 再compile，最后DDP
+    #     if self._use_parallel:
+    #         ddp_init_path = f'{ckpt_path}_parallel_init.pth'
+    #         if not os.path.exists(ckpt_path):
+    #             if self.is_main_process:
+    #                 ckpt = {'model': model.state_dict()}
+    #                 torch.save(ckpt, ddp_init_path)
+    #
+    #             dist.barrier(device_ids=[int(os.environ["LOCAL_RANK"])])
+    #             ckpt = torch.load(ddp_init_path, map_location=self.device)
+    #             model.load_state_dict(ckpt['model'])
+    #             print(f'load init ckpt for {self.device}')
+    #         else:
+    #             ckpt = torch.load(ckpt_path, map_location=self.device)
+    #             model.load_state_dict(ckpt['model'])
+    #     else:
+    #         if os.path.exists(ckpt_path):
+    #             ckpt = torch.load(ckpt_path, map_location=self.device)
+    #             model.load_state_dict(ckpt['model'])
 
 
     def create_dataloader(

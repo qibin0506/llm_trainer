@@ -1,41 +1,17 @@
-import os
 import torch
 from torch.nn.utils.rnn import pad_sequence
 import torch.nn.functional as F
-from .tokenizer import Tokenizer
-from .parallel import Parallel
-from .parallel_fsdp import FsdpParallel
-from .parallel_ddp import DdpParallel
-from .parallel_none import NoneParallel
+from .train_tools import TrainerTools
+import numpy as np
+import random
 
+def set_seed(seed=42):
+    torch.manual_seed(seed)
+    # 如果使用多 GPU
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
 
-class TrainerTools:
-    def __init__(self):
-        if not hasattr(TrainerTools, "_first_init"):
-            TrainerTools._first_init = True
-
-            parallel_type = os.environ.get('PARALLEL_TYPE', 'none')
-            if parallel_type == 'fsdp':
-                self.parallel: Parallel = FsdpParallel()
-            elif parallel_type == 'ddp':
-                self.parallel: Parallel = DdpParallel()
-            else:
-                self.parallel: Parallel = NoneParallel()
-
-            self.tokenizer = Tokenizer(int(os.environ.get('TOKENIZERS_TYPE', 0)))
-
-            self.use_amp = 'cuda' in self.parallel.device
-
-            self.dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
-
-            self.bot_token = self.tokenizer.encode_to_token('[BOT]', unsqueeze=False, covert_tensor=False)[0]
-
-
-    def __new__(cls, *args, **kwargs):
-        if not hasattr(TrainerTools, "_instance"):
-            TrainerTools._instance = object.__new__(cls)
-
-        return TrainerTools._instance
 
 def pretrain_padding_fn(batch_data):
     inputs = pad_sequence(batch_data, batch_first=True, padding_value=TrainerTools().tokenizer.pad)
@@ -86,4 +62,3 @@ def calc_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     targets = shift_labels.reshape(-1)
 
     return F.cross_entropy(logits, targets, ignore_index=-100)
-

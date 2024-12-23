@@ -8,8 +8,10 @@ from llama import LlamaModel
 from .scheduler import CosineAnnealingWarmupScheduler
 from .train_args import TrainArgs
 from .parallel_fsdp import FsdpParallel
+from .train_tools import TrainerTools
+from .app_state import save_dcp, load_dcp
 from .utils import (
-    TrainerTools,
+    set_seed,
     calc_loss,
     pretrain_padding_fn,
     sft_padding_fn,
@@ -53,6 +55,8 @@ def train(
         prompt_on_batch: str,
         prompt_on_epoch: str,
 ):
+    set_seed()
+
     llama_config = train_args.llama_config
 
     if isinstance(TrainerTools().parallel, FsdpParallel) and train_args.fsdp_args is not None:
@@ -67,7 +71,6 @@ def train(
 
     llama = TrainerTools().parallel.process_model(
         LlamaModel(llama_config),
-        f"{os.environ['SAVE_DIR']}modeling.pth",
         kwargs=fsdp_kwargs
     )
 
@@ -106,6 +109,7 @@ def train(
     optimizer = torch.optim.AdamW(llama.parameters(), lr=initial_lr, weight_decay=0.1)
     lr_scheduler = CosineAnnealingWarmupScheduler(optimizer, warmup_iters, initial_lr, min_lr, max_lr, train_iters)
 
+    load_dcp(llama, optimizer)
     dataloader_args = train_args.data_loader_args
 
     for epoch in range(train_args.n_epochs):
@@ -188,6 +192,9 @@ def train(
 
                     loss_accumulation += loss.detach()
 
+                    if (batch + 1) % 100 == 0:
+                        save_dcp(llama, optimizer)
+
                     if gradient_accumulation_steps > 1:
                         on_batch(
                             eval_model,
@@ -227,6 +234,8 @@ def train(
             dist.all_reduce(loss_accumulation, dist.ReduceOp.AVG)
 
         TrainerTools().parallel.on_epoch_end(epoch)
+        save_dcp(llama, optimizer)
+
         on_epoch(
             eval_model,
             epoch,

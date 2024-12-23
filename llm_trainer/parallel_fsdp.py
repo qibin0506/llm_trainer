@@ -31,12 +31,11 @@ class FsdpParallel(Parallel):
     def process_model(
             self,
             model: nn.Module,
-            ckpt_path: str,
             kwargs: Optional[dict] = None
     ) -> nn.Module:
         """
         :param model:
-        :param ckpt_path:
+        :param optimizer:
         :param kwargs:
             "wrap_policy_num_params" int size_based_auto_wrap_policy的最小参数量
             "cpu_offload" bool 是否使用cpu卸载
@@ -45,9 +44,6 @@ class FsdpParallel(Parallel):
         """
 
         model.to(self.device)
-
-        # 先load state, 再compile，最后DDP
-        self._load_ckpt(model, ckpt_path)
 
         if self._use_compile:
             model = torch.compile(model)

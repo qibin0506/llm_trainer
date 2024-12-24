@@ -25,7 +25,8 @@ def save_checkpoint(model: nn.Module, optimizer: Optional[Optimizer] = None):
     if isinstance(model, FSDP):
         if TrainerTools().parallel.is_main_process:
             # 未经过测试 参考：https://doc.hfai.high-flyer.cn/haiscale/haiscale_fsdp.html
-            with FSDP.summon_full_params(module=model):
+            # 是否使用rank0_only=True？
+            with FSDP.summon_full_params(module=model, rank0_only=True):
                 states = model.state_dict()
                 checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_DIR)
                 ckpt = {'model_state_dict': states}
@@ -38,9 +39,10 @@ def save_checkpoint(model: nn.Module, optimizer: Optional[Optimizer] = None):
         #     ckpt = {'model_state_dict': states}
         #     torch.save(ckpt, checkpoint_name)
     else:
-        checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_DIR)
-        ckpt = {'model_state_dict': TrainerTools().parallel.raw_model.state_dict()}
-        torch.save(ckpt, checkpoint_name)
+        if TrainerTools().parallel.is_main_process:
+            checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_DIR)
+            ckpt = {'model_state_dict': TrainerTools().parallel.raw_model.state_dict()}
+            torch.save(ckpt, checkpoint_name)
 
 
     # if TrainerTools().parallel.is_main_process:

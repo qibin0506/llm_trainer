@@ -30,7 +30,7 @@ def save_checkpoint(model: nn.Module, optimizer: Optional[Optimizer] = None):
             torch.save(ckpt, checkpoint_name)
     else:
         checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_DIR)
-        ckpt = {'model': TrainerTools().parallel.raw_model.state_dict()}
+        ckpt = {'model_state_dict': TrainerTools().parallel.raw_model.state_dict()}
         torch.save(ckpt, checkpoint_name)
 
 

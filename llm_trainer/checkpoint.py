@@ -23,11 +23,20 @@ DEFAULT_CHECKPOINT_DIR = "checkpoint"
 
 def save_checkpoint(model: nn.Module, optimizer: Optional[Optimizer] = None):
     if isinstance(model, FSDP):
-        states = model.state_dict()
         if TrainerTools().parallel.is_main_process:
-            checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_DIR)
-            ckpt = {'model_state_dict': states}
-            torch.save(ckpt, checkpoint_name)
+            # 未经过测试 参考：https://doc.hfai.high-flyer.cn/haiscale/haiscale_fsdp.html
+            with FSDP.summon_full_params(module=model):
+                states = model.state_dict()
+                checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_DIR)
+                ckpt = {'model_state_dict': states}
+                torch.save(ckpt, checkpoint_name)
+
+        # 经过测试过
+        # states = model.state_dict()
+        # if TrainerTools().parallel.is_main_process:
+        #     checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_DIR)
+        #     ckpt = {'model_state_dict': states}
+        #     torch.save(ckpt, checkpoint_name)
     else:
         checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_DIR)
         ckpt = {'model_state_dict': TrainerTools().parallel.raw_model.state_dict()}
@@ -62,8 +71,14 @@ def load_checkpoint(
 ):
     checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_DIR)
     if os.path.exists(checkpoint_name):
-        state_dict = torch.load(checkpoint_name, weights_only=True, map_location=device)
-        model.load_state_dict(state_dict['model_state_dict'])
+        # 未经过测试，else的逻辑经过测试在fsdp下也没问题
+        if isinstance(model, FSDP):
+            with FSDP.summon_full_params(module=model):
+                state_dict = torch.load(checkpoint_name, weights_only=True, map_location=device)
+                model.load_state_dict(state_dict['model_state_dict'])
+        else:
+            state_dict = torch.load(checkpoint_name, weights_only=True, map_location=device)
+            model.load_state_dict(state_dict['model_state_dict'])
 
 # class AppState(Stateful):
 #     def __init__(self, model: nn.Module, optimizer: Optional[Optimizer] = None):

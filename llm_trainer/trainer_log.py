@@ -2,6 +2,8 @@ import os
 import threading
 import torch
 
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
 from llama import LlamaConfig
 from .generate_utils import generate
 from .train_tools import TrainerTools
@@ -16,7 +18,22 @@ def _submit_gen_task(eval_model: torch.nn.Module, tag, prompt, max_position_embe
             def write_temp(item):
                 tf.write(item)
                 tf.flush()
-
+            
+            # 当eval_model不是独立model时可以尝试这个
+            # if isinstance(eval_model, FSDP):
+            #     with FSDP.summon_full_params(module=eval_model, writeback=False, recurse=False):
+            #         gen = generate(
+            #             eval_model,
+            #             prompt=prompt,
+            #             max_position_embeddings=max_position_embeddings,
+            #             max_new_tokens=max_new_tokens,
+            #             # temperature=None,
+            #             # k=None,
+            #             # p=None,
+            #             device='cpu',
+            #             item_callback=lambda item: write_temp(item)
+            #         )
+                
             load_checkpoint(eval_model, device='cpu')
             gen = generate(
                 eval_model,

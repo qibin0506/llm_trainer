@@ -9,7 +9,8 @@ from .scheduler import CosineAnnealingWarmupScheduler
 from .train_args import TrainArgs
 from .parallel_fsdp import FsdpParallel
 from .train_tools import TrainerTools
-from .app_state import save_dcp, load_dcp
+from .checkpoint import load_checkpoint, save_checkpoint
+# from .app_state import save_dcp, load_dcp
 from .utils import (
     set_seed,
     calc_loss,
@@ -75,6 +76,7 @@ def train(
     )
 
     if TrainerTools().parallel.is_main_process:
+        # eval_model = llama
         eval_model = LlamaModel(llama_config).to('cpu')
     else:
         eval_model = None
@@ -109,7 +111,8 @@ def train(
     optimizer = torch.optim.AdamW(llama.parameters(), lr=initial_lr, weight_decay=0.1)
     lr_scheduler = CosineAnnealingWarmupScheduler(optimizer, warmup_iters, initial_lr, min_lr, max_lr, train_iters)
 
-    load_dcp(llama, optimizer)
+    load_checkpoint(llama, device=TrainerTools().parallel.device, optimizer=optimizer)
+    # load_dcp(llama, optimizer)
     dataloader_args = train_args.data_loader_args
 
     for epoch in range(train_args.n_epochs):
@@ -193,7 +196,8 @@ def train(
                     loss_accumulation += loss.detach()
 
                     if (batch + 1) % 100 == 0:
-                        save_dcp(llama, optimizer)
+                        save_checkpoint(model=llama, optimizer=optimizer)
+                        # save_dcp(llama, optimizer)
 
                     if gradient_accumulation_steps > 1:
                         on_batch(
@@ -234,7 +238,10 @@ def train(
             dist.all_reduce(loss_accumulation, dist.ReduceOp.AVG)
 
         TrainerTools().parallel.on_epoch_end(epoch)
-        save_dcp(llama, optimizer)
+
+        save_checkpoint(model=llama, optimizer=optimizer)
+        dist.barrier()
+        # save_dcp(llama, optimizer)
 
         on_epoch(
             eval_model,

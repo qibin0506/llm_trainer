@@ -98,15 +98,16 @@ def train(
 
     if gradient_accumulation_steps > 1:
         batch_count = batch_count // gradient_accumulation_steps
+    print(f"batch count: {batch_count}")
 
     train_iters = batch_count * train_args.n_epochs
 
-    warmup_iters = int(0.2 * train_iters)
+    warmup_iters = int(train_args.lr_scheduler_args.warmup_iters_ratio * train_iters)
     # 学习率要根据GPU的数量进行倍增：
     # 在训练的过程中，损失梯度决定下降的方向，学习率决定下降的步长。如果有两块gpu，前进的综合步长为：平均学习率*2
-    initial_lr = 1e-5 * TrainerTools().parallel.world_size
-    min_lr = 0.1 * initial_lr
-    max_lr = 5e-4 * TrainerTools().parallel.world_size
+    initial_lr = train_args.lr_scheduler_args.initial_lr * TrainerTools().parallel.world_size
+    min_lr = train_args.lr_scheduler_args.min_lr_ratio * initial_lr
+    max_lr = train_args.lr_scheduler_args.max_lr * TrainerTools().parallel.world_size
 
     optimizer = torch.optim.AdamW(llama.parameters(), lr=initial_lr, weight_decay=0.1)
     lr_scheduler = CosineAnnealingWarmupScheduler(optimizer, warmup_iters, initial_lr, min_lr, max_lr, train_iters)

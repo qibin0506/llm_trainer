@@ -18,7 +18,7 @@ def _submit_gen_task(eval_model: torch.nn.Module, tag, prompt, max_position_embe
             def write_temp(item):
                 tf.write(item)
                 tf.flush()
-            
+
             # 当eval_model不是独立model时可以尝试这个
             # if isinstance(eval_model, FSDP):
             #     with FSDP.summon_full_params(module=eval_model, writeback=False, recurse=False):
@@ -33,7 +33,7 @@ def _submit_gen_task(eval_model: torch.nn.Module, tag, prompt, max_position_embe
             #             device='cpu',
             #             item_callback=lambda item: write_temp(item)
             #         )
-                
+
             load_checkpoint(eval_model, device='cpu')
             gen = generate(
                 eval_model,
@@ -87,19 +87,19 @@ def _submit_gen_task(eval_model: torch.nn.Module, tag, prompt, max_position_embe
 
 def on_batch(eval_model, epoch, batch, loss, need_update_grad, prompt, llama_config: LlamaConfig):
     if TrainerTools().parallel.is_main_process:
-        if (batch + 1) % 100 == 0:
-            save_dir = os.environ['SAVE_DIR']
-            print(f"epoch: {epoch}, batch: {batch}")
-            with open(f'{save_dir}batch.txt', 'a') as f:
-                f.write(f"epoch: {epoch}, batch: {batch}, loss: {loss}, need_update_grad: {need_update_grad}\n")
+        save_dir = os.environ['SAVE_DIR']
+        print(f"epoch: {epoch}, batch: {batch}")
+        with open(f'{save_dir}batch.txt', 'a') as f:
+            f.write(f"epoch: {epoch}, batch: {batch}, loss: {loss}, need_update_grad: {need_update_grad}\n")
 
-            _submit_gen_task(
-                eval_model,
-                tag=f'sign:batch/epoch:{epoch}/batch:{batch}',
-                prompt=prompt,
-                max_position_embeddings=llama_config.max_position_embeddings,
-                max_new_tokens=100
-            )
+        _submit_gen_task(
+            eval_model,
+            tag=f'sign:batch/epoch:{epoch}/batch:{batch}',
+            prompt=prompt,
+            max_position_embeddings=llama_config.max_position_embeddings,
+            max_new_tokens=100
+        )
+
 
 
 def on_file(eval_model, epoch, batch, prompt, llama_config: LlamaConfig):

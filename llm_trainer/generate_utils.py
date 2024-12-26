@@ -30,7 +30,7 @@ def _temperature_warper(logits: torch.Tensor, temperature: float) -> torch.Tenso
     return logits
 
 
-def _top_k_warper(logits: torch.Tensor, k: float, device: Union[str, torch.device, int] = None) -> torch.Tensor:
+def _top_k_warper(logits: torch.Tensor, k: int, device: Union[str, torch.device, int] = None) -> torch.Tensor:
     """
     top k采样
     :param logits:

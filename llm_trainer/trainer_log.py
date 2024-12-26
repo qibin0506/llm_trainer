@@ -2,8 +2,6 @@ import os
 import threading
 import torch
 
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-
 from llama import LlamaConfig
 from .generate_utils import generate
 from .train_tools import TrainerTools

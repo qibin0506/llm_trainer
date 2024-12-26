@@ -200,26 +200,26 @@ def train(
                         save_checkpoint(model=llama, optimizer=optimizer)
                         # save_dcp(llama, optimizer)
 
-                    if gradient_accumulation_steps > 1:
-                        on_batch(
-                            eval_model,
-                            epoch,
-                            batch,
-                            loss.detach().item() * gradient_accumulation_steps,
-                            need_update_grad,
-                            prompt_on_batch,
-                            llama_config
-                        )
-                    else:
-                        on_batch(
-                            eval_model,
-                            epoch,
-                            batch,
-                            loss.detach().item(),
-                            need_update_grad,
-                            prompt_on_batch,
-                            llama_config
-                        )
+                        if gradient_accumulation_steps > 1:
+                            on_batch(
+                                eval_model,
+                                epoch,
+                                batch,
+                                loss.detach().item() * gradient_accumulation_steps,
+                                need_update_grad,
+                                prompt_on_batch,
+                                llama_config
+                            )
+                        else:
+                            on_batch(
+                                eval_model,
+                                epoch,
+                                batch,
+                                loss.detach().item(),
+                                need_update_grad,
+                                prompt_on_batch,
+                                llama_config
+                            )
 
                     del loss
                 except KeyboardInterrupt as e:
@@ -241,7 +241,7 @@ def train(
         TrainerTools().parallel.on_epoch_end(epoch)
 
         save_checkpoint(model=llama, optimizer=optimizer)
-        dist.barrier()
+        # dist.barrier()
         # save_dcp(llama, optimizer)
 
         on_epoch(

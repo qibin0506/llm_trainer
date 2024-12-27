@@ -8,7 +8,6 @@ from llm_trainer import train_fn
 import os
 from glob import glob
 
-
 def init_env():
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -17,34 +16,37 @@ def init_env():
 
     os.environ['SAVE_DIR'] = './'
 
-    os.environ['PARALLEL_TYPE'] = 'fsdp' # or 'ddp'
+    os.environ['PARALLEL_TYPE'] = 'fsdp'  # or 'ddp'
+
+    os.environ['ENABLE_DCP'] = '1'
+    os.environ['CHECKPOINT_NAME'] = 'ckpt.pth'
+    os.environ['DCP_DIR'] = 'ckpt_dir'
+    # os.environ['CHECKPOINT_DIR'] = 'ckpt_dir'
 
 
 def get_config():
-    config = LlamaConfig(
+    return LlamaConfig(
         vocab_size=TrainerTools().tokenizer.vocab_size,
-        hidden_size=768,
-        intermediate_size=3072,
-        num_hidden_layers=12,
-        num_attention_heads=12,
-        num_key_value_heads=4,
+        hidden_size=1024,
+        intermediate_size=4096,
+        num_hidden_layers=22,
+        num_attention_heads=32,
+        num_key_value_heads=8,
         max_position_embeddings=1024
     )
 
-    return config
 
-
-def get_train_args(is_pretrain: bool) -> TrainArgs:
+def get_train_config(is_sft: bool):
     train_args = TrainArgs(
-        n_epochs=0,
-        batch_size=0,
+        n_epochs=1,
+        batch_size=1,
         llama_config=get_config(),
         is_sft=False,
-        all_data_size=0,
-        all_files=[],
+        all_data_size=64131,
+        all_files=glob('./data/pretrain/*.pkl'),
         gradient_accumulation_steps=32,
         fsdp_args=FsdpArgs(
-            transformer_layer_cls=None,
+            transformer_layer_cls={ LlamaDecoderLayer },
             wrap_policy_num_params=20000,
             cpu_offload=True,
             offload_params=True
@@ -57,18 +59,18 @@ def get_train_args(is_pretrain: bool) -> TrainArgs:
         )
     )
 
-    if is_pretrain:
-        train_args.n_epochs = 5
-        train_args.batch_size = 5
-        train_args.is_sft = False
-        train_args.all_data_size = 92230
-        train_args.all_files = glob('./data/train/pretrain.pkl')
-    else:
-        train_args.n_epochs = 5
+    if is_sft:
+        train_args.n_epochs = 2
         train_args.batch_size = 5
         train_args.is_sft = True
-        train_args.all_data_size = 9968
+        train_args.all_data_size = 10000
         train_args.all_files = glob('./data/train/sft.pkl')
+    else:
+        train_args.n_epochs =1
+        train_args.batch_size = 6
+        train_args.is_sft = False
+        train_args.all_data_size = 70073
+        train_args.all_files = glob('./data/pretrain/pretrain_chunks.pkl')
 
     return train_args
 

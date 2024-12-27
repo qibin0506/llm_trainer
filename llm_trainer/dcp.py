@@ -41,13 +41,16 @@ def load_dcp(model: nn.Module, optimizer: Optional[Optimizer] = None):
     checkpoint_id = os.environ.get('DCP_DIR', DEFAULT_DCP_DIR)
     if os.path.exists(checkpoint_id):
         if isinstance(model, FSDP):
-            # since no progress group is initialized, DCP will disable any collectives.
             state_dict = {'app': AppState(model, optimizer)}
+            # AppState帮助加载到state_dict中, 然后加载到model中
             dcp.load(state_dict=state_dict, checkpoint_id=checkpoint_id)
         else:
             state_dict = {
                 "model_state_dict": model.state_dict(),
             }
+
+            # since no progress group is initialized, DCP will disable any collectives.
+            # 加载到state_dict中，然后通过model.load_state_dict加载到model中
             dcp.load(
                 state_dict=state_dict,
                 checkpoint_id=checkpoint_id,

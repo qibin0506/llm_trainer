@@ -112,7 +112,7 @@ def train(
     optimizer = torch.optim.AdamW(llama.parameters(), lr=initial_lr, weight_decay=0.1)
     lr_scheduler = CosineAnnealingWarmupScheduler(optimizer, warmup_iters, initial_lr, min_lr, max_lr, train_iters)
 
-    load_checkpoint(llama, device=TrainerTools().parallel.device, optimizer=optimizer)
+    load_checkpoint(llama, optimizer=optimizer, device=TrainerTools().parallel.device)
     # load_dcp(llama, optimizer)
     dataloader_args = train_args.data_loader_args
 

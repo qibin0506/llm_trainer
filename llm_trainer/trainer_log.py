@@ -39,7 +39,11 @@ def _submit_gen_task(eval_model: torch.nn.Module, tag, prompt, max_position_embe
             #             item_callback=lambda item: write_temp(item)
             #         )
 
+            # ---------
+
             load_checkpoint(eval_model, device='cpu')
+
+
             gen = generate(
                 eval_model,
                 prompt=prompt,

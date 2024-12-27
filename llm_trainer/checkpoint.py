@@ -4,13 +4,13 @@ import torch
 from torch import nn
 from torch.optim import Optimizer
 from .train_tools import TrainerTools
-from .dcp import save_dcp, load_dcp
+from .dcp import save_dcp, load_dcp, convert_dcp_to_pth
 
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 # https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html
 
-DEFAULT_CHECKPOINT_DIR = "checkpoint"
+DEFAULT_CHECKPOINT_NAME = "checkpoint.pth"
 
 def save_checkpoint(model: nn.Module, optimizer: Optional[Optimizer] = None):
     if os.environ.get('ENABLE_DCP', '1') == '1':
@@ -27,7 +27,7 @@ def save_checkpoint(model: nn.Module, optimizer: Optional[Optimizer] = None):
                 offload_to_cpu=True):
             if TrainerTools().parallel.is_main_process:
                 states = model.state_dict()
-                checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_DIR)
+                checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)
                 ckpt = {'model_state_dict': states}
                 torch.save(ckpt, checkpoint_name)
 
@@ -40,7 +40,7 @@ def save_checkpoint(model: nn.Module, optimizer: Optional[Optimizer] = None):
         #         torch.save(ckpt, checkpoint_name)
     else:
         if TrainerTools().parallel.is_main_process:
-            checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_DIR)
+            checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)
             ckpt = {'model_state_dict': TrainerTools().parallel.raw_model.state_dict()}
             torch.save(ckpt, checkpoint_name)
 
@@ -68,14 +68,26 @@ def save_checkpoint(model: nn.Module, optimizer: Optional[Optimizer] = None):
 
 def load_checkpoint(
         model: nn.Module,
-        device: Optional[Union[torch.device, str]] = None,
-        optimizer: Optional[Optimizer] = None
+        optimizer: Optional[Optimizer] = None,
+        device: Optional[Union[torch.device, str]] = None
 ):
+    checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)
+
     if os.environ.get('ENABLE_DCP', '1') == '1':
-        load_dcp(model, optimizer)
+        if isinstance(model, FSDP):
+            load_dcp(model, optimizer)
+        else:
+            # load_dcp方式在cpu上会报错，所以改为先将ckpt转换为pth，然后再加载pth
+            # load_dcp(model, optimizer)
+            if os.path.exists(checkpoint_name):
+                os.remove(checkpoint_name)
+
+            convert_dcp_to_pth(checkpoint_name)
+            ckpt = torch.load(checkpoint_name, map_location=device, weights_only=True)
+            model_state_dict = ckpt['app']['model_state_dict']
+            model.load_state_dict(model_state_dict)
         return
 
-    checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_DIR)
     if os.path.exists(checkpoint_name):
         # 未经过测试，else的逻辑经过测试在fsdp下也没问题
         if isinstance(model, FSDP):

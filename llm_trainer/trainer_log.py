@@ -8,9 +8,16 @@ from .train_tools import TrainerTools
 from .checkpoint import load_checkpoint
 
 
+def _get_save_dir() -> str:
+    save_dir = os.environ['SAVE_DIR']
+    if not os.path.exists(save_dir):
+        os.mkdir(save_dir)
+
+    return save_dir
+
 def _submit_gen_task(eval_model: torch.nn.Module, tag, prompt, max_position_embeddings, max_new_tokens):
     def task():
-        save_dir = os.environ['SAVE_DIR']
+        save_dir = _get_save_dir()
 
         with open(f'{save_dir}gen_temp.txt', 'w') as tf:
             def write_temp(item):
@@ -52,7 +59,7 @@ def _submit_gen_task(eval_model: torch.nn.Module, tag, prompt, max_position_embe
 
 
 # def _save_model(state_dict):
-#     save_dir = os.environ['SAVE_DIR']
+#     save_dir = _get_save_dir()
 #     if os.path.exists(f'{save_dir}modeling.pth'):
 #         if os.path.exists(f'{save_dir}modeling_bak.pth'):
 #             os.remove(f'{save_dir}modeling_bak.pth')
@@ -85,7 +92,7 @@ def _submit_gen_task(eval_model: torch.nn.Module, tag, prompt, max_position_embe
 
 def on_batch(eval_model, epoch, batch, loss, need_update_grad, prompt, llama_config: LlamaConfig):
     if TrainerTools().parallel.is_main_process:
-        save_dir = os.environ['SAVE_DIR']
+        save_dir = _get_save_dir()
         print(f"epoch: {epoch}, batch: {batch}")
         with open(f'{save_dir}batch.txt', 'a') as f:
             f.write(f"epoch: {epoch}, batch: {batch}, loss: {loss}, need_update_grad: {need_update_grad}\n")
@@ -119,7 +126,7 @@ def on_exception(e, epoch, batch):
             exit(0)
     elif isinstance(e, torch.OutOfMemoryError):
         if TrainerTools().parallel.is_main_process:
-            save_dir = os.environ['SAVE_DIR']
+            save_dir = _get_save_dir()
             with open(f'{save_dir}batch.txt', 'a') as f:
                 exception_file = e.__traceback__.tb_frame.f_globals["__file__"]
                 exception_line = e.__traceback__.tb_lineno
@@ -134,7 +141,7 @@ def on_epoch(eval_model, epoch, loss_accumulation, all_batch, need_update_grad, 
         # test_loss = test_loop(model, test_data_loader)
         print(f'train_loss: {loss_accumulation.detach().item() / all_batch}')
 
-        save_dir = os.environ['SAVE_DIR']
+        save_dir = _get_save_dir()
         with open(f'{save_dir}batch.txt', 'a') as f:
             f.write(
                 f"epoch: {epoch},"

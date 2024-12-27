@@ -18,8 +18,8 @@ class AppState(Stateful):
     def state_dict(self) -> Dict[str, Any]:
         model_state_dict, optimizer_state_dict = get_state_dict(self.model, self.optimizer)
         return {
-            'model': model_state_dict,
-            'optim': optimizer_state_dict
+            'model_state_dict': model_state_dict,
+            'optim_state_dict': optimizer_state_dict
         }
 
     def load_state_dict(self, state_dict: Dict[str, Any]):

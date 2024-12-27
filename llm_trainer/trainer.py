@@ -145,6 +145,7 @@ def train(
 
             train_loader_len = len(train_data_loader)
             TrainerTools().parallel.on_epoch_start(epoch)
+            last_ckpt_batch = 0
 
             for batch, (inputs, labels) in enumerate(train_data_loader):
                 # 是否需要更新梯度
@@ -196,9 +197,9 @@ def train(
 
                     loss_accumulation += loss.detach()
 
-                    if (batch + 1) % 100 == 0:
+                    if need_update_grad and (batch - last_ckpt_batch) >= 100:
+                        last_ckpt_batch = batch
                         save_checkpoint(model=llama, optimizer=optimizer)
-                        # save_dcp(llama, optimizer)
 
                         if gradient_accumulation_steps > 1:
                             on_batch(

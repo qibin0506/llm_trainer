@@ -1,4 +1,4 @@
-import os
+from contextlib import nullcontext
 import torch
 from torch.utils.data import Dataset
 import torch.distributed as dist
@@ -58,8 +58,6 @@ def train(
 ):
     set_seed()
 
-    llama_config = train_args.llama_config
-
     if isinstance(TrainerTools().parallel, FsdpParallel) and train_args.fsdp_args is not None:
         fsdp_kwargs = {
             'transformer_layer_cls': train_args.fsdp_args.transformer_layer_cls,
@@ -70,19 +68,27 @@ def train(
     else:
         fsdp_kwargs = None
 
+    llama_config = train_args.llama_config
+
     llama = TrainerTools().parallel.process_model(
         LlamaModel(llama_config),
         kwargs=fsdp_kwargs
     )
+
+    if TrainerTools().use_amp:
+        ctx = torch.autocast(
+            device_type=TrainerTools().parallel.device_type,
+            dtype=TrainerTools().dtype,
+            enabled=TrainerTools().use_amp
+        )
+    else:
+        ctx = nullcontext()
 
     if TrainerTools().parallel.is_main_process:
         # eval_model = llama
         eval_model = LlamaModel(llama_config).to('cpu')
     else:
         eval_model = None
-
-    # initialize a GradScaler. If enabled=False scaler is a no-op
-    scalar = torch.GradScaler(enabled=TrainerTools().use_amp)
 
     if TrainerTools().parallel.is_main_process:
         total_params = sum(p.numel() for p in llama.parameters())
@@ -91,6 +97,9 @@ def train(
         total_size_bytes = total_params * 4
         total_size_mb = total_size_bytes / (1024 * 1024)
         print(f"Total size of the model: {total_size_mb:.2f} MB")
+
+    # initialize a GradScaler. If enabled=False scaler is a no-op
+    scalar = torch.GradScaler(enabled=TrainerTools().use_amp)
 
     # 梯度累积步数
     gradient_accumulation_steps = train_args.gradient_accumulation_steps
@@ -117,6 +126,7 @@ def train(
     dataloader_args = train_args.data_loader_args
 
     for epoch in range(train_args.n_epochs):
+        batch_count_per_epoch = 0
         loss_accumulation = torch.tensor(0.0, device=TrainerTools().parallel.device)
         llama.train()
 
@@ -143,14 +153,16 @@ def train(
                 sampler_kwargs=sampler_kwargs
             )
 
-            train_loader_len = len(train_data_loader)
+            batch_count_per_file = len(train_data_loader)
+            batch_count_per_epoch += batch_count_per_file
+
             TrainerTools().parallel.on_epoch_start(epoch)
             last_ckpt_batch = 0
 
             for batch, (inputs, labels) in enumerate(train_data_loader):
                 # 是否需要更新梯度
                 if gradient_accumulation_steps > 1:
-                    need_update_grad = (batch + 1) % gradient_accumulation_steps == 0 or batch == train_loader_len - 1
+                    need_update_grad = (batch + 1) % gradient_accumulation_steps == 0 or batch == batch_count_per_file - 1
                     if TrainerTools().parallel.is_main_process and need_update_grad:
                         print(f"need_update_grad: {batch}")
                 else:
@@ -167,8 +179,7 @@ def train(
                         # looking at the source of that context manager, it just toggles this variable
                         llama.require_backward_grad_sync = need_update_grad
 
-                    with torch.autocast(device_type=TrainerTools().parallel.device_type,
-                                        dtype=TrainerTools().dtype, enabled=TrainerTools().use_amp):
+                    with ctx:
                         logits, _ = llama(inputs, attention_mask=attention_mask)
                         # calc loss
                         loss = calc_loss(logits, labels)
@@ -201,26 +212,17 @@ def train(
                         last_ckpt_batch = batch
                         save_checkpoint(model=llama, optimizer=optimizer)
 
-                        if gradient_accumulation_steps > 1:
-                            on_batch(
-                                eval_model,
-                                epoch,
-                                batch,
-                                loss.detach().item() * gradient_accumulation_steps,
-                                need_update_grad,
-                                prompt_on_batch,
-                                llama_config
-                            )
-                        else:
-                            on_batch(
-                                eval_model,
-                                epoch,
-                                batch,
-                                loss.detach().item(),
-                                need_update_grad,
-                                prompt_on_batch,
-                                llama_config
-                            )
+                        loss_item = loss.detach().item()
+                        on_batch(
+                            eval_model,
+                            epoch,
+                            batch,
+                            batch_count_per_file,
+                            loss_item * gradient_accumulation_steps if gradient_accumulation_steps > 1 else loss_item,
+                            need_update_grad,
+                            prompt_on_batch,
+                            llama_config.max_position_embeddings
+                        )
 
                     del loss
                 except KeyboardInterrupt as e:
@@ -231,16 +233,14 @@ def train(
             on_file(
                 eval_model,
                 epoch,
-                batch,
                 TrainerTools().tokenizer.decode_to_text(dataset.get_first()),
-                llama_config
+                llama_config.max_position_embeddings
             )
 
         if TrainerTools().parallel.parallel_train:
             dist.all_reduce(loss_accumulation, dist.ReduceOp.AVG)
 
         TrainerTools().parallel.on_epoch_end(epoch)
-
         save_checkpoint(model=llama, optimizer=optimizer)
         # dist.barrier()
         # save_dcp(llama, optimizer)
@@ -248,11 +248,10 @@ def train(
         on_epoch(
             eval_model,
             epoch,
-            loss_accumulation,
-            batch_count,
+            loss_accumulation.detach().item() / batch_count_per_epoch,
             need_update_grad,
             prompt_on_epoch,
-            llama_config
+            llama_config.max_position_embeddings
         )
 
     TrainerTools().parallel.destroy()

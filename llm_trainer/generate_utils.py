@@ -1,4 +1,5 @@
 from typing import Union, Optional
+from contextlib import nullcontext
 import torch
 from llama import KVCache
 from .train_tools import TrainerTools
@@ -122,13 +123,18 @@ def generate_text(
     use_kv_cache = True
 
     enable_autocast = 'cuda' in device
+    if enable_autocast:
+        ctx = torch.autocast(device_type=device, dtype=TrainerTools().dtype, enabled=enable_autocast)
+    else:
+        ctx = nullcontext()
+
     kv_cache: Optional[KVCache] = None
     generate_tokens = tokens.clone()
 
     for _ in range(max_new_tokens):
         t = tokens[:, -max_position_embeddings:]
         with torch.no_grad():
-            with torch.autocast(device_type=device, dtype=TrainerTools().dtype, enabled=enable_autocast):
+            with ctx:
                 # logits (batch, seq_len, vocab_size)
                 logits, kv_cache = model(t, past_key_values=kv_cache, use_cache=use_kv_cache)
 

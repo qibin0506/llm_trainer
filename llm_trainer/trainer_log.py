@@ -1,8 +1,8 @@
 import os
 import threading
+from multiprocessing import Process
 import torch
 
-from llama import LlamaConfig
 from .generate_utils import generate
 from .train_tools import TrainerTools
 from .checkpoint import load_checkpoint
@@ -15,51 +15,53 @@ def _get_save_dir() -> str:
 
     return save_dir
 
-def _submit_gen_task(eval_model: torch.nn.Module, tag, prompt, max_position_embeddings, max_new_tokens):
-    def task():
-        save_dir = _get_save_dir()
+def _eval_task(eval_model, tag, prompt, max_position_embeddings, is_new_process):
+    save_dir = _get_save_dir()
+    ident = os.getpid() if is_new_process else threading.current_thread().ident
 
-        with open(f'{save_dir}gen_temp.txt', 'w') as tf:
-            def write_temp(item):
-                tf.write(item)
-                tf.flush()
+    with open(f'{save_dir}gen_temp_{ident}.txt', 'w') as tf:
+        def write_temp(item):
+            tf.write(item)
+            tf.flush()
 
-            # 当eval_model不是独立model时可以尝试这个
-            # if isinstance(eval_model, FSDP):
-            #     with FSDP.summon_full_params(module=eval_model, writeback=False, recurse=False):
-            #         gen = generate(
-            #             eval_model,
-            #             prompt=prompt,
-            #             max_position_embeddings=max_position_embeddings,
-            #             max_new_tokens=max_new_tokens,
-            #             # temperature=None,
-            #             # k=None,
-            #             # p=None,
-            #             device='cpu',
-            #             item_callback=lambda item: write_temp(item)
-            #         )
+        # 当eval_model不是独立model时可以尝试这个
+        # if isinstance(eval_model, FSDP):
+        #     with FSDP.summon_full_params(module=eval_model, writeback=False, recurse=False):
+        #         gen = generate(
+        #             eval_model,
+        #             prompt=prompt,
+        #             max_position_embeddings=max_position_embeddings,
+        #             max_new_tokens=max_new_tokens,
+        #             # temperature=None,
+        #             # k=None,
+        #             # p=None,
+        #             device='cpu',
+        #             item_callback=lambda item: write_temp(item)
+        #         )
 
-            # ---------
+        # ---------
 
-            load_checkpoint(eval_model, device='cpu')
+        load_checkpoint(eval_model, device='cpu')
+
+        gen = generate(
+            eval_model,
+            prompt=prompt,
+            max_position_embeddings=max_position_embeddings,
+            max_new_tokens=100,
+            temperature=0.7,
+            k=3,
+            p=None,
+            device='cpu',
+            item_callback=lambda item: write_temp(item)
+        )
+
+    with open(f'{save_dir}gen.txt', 'a') as f:
+        f.write(f"{tag}, gen->{gen}\n")
 
 
-            gen = generate(
-                eval_model,
-                prompt=prompt,
-                max_position_embeddings=max_position_embeddings,
-                max_new_tokens=max_new_tokens,
-                # temperature=None,
-                # k=None,
-                # p=None,
-                device='cpu',
-                item_callback=lambda item: write_temp(item)
-            )
-
-        with open(f'{save_dir}gen.txt', 'a') as f:
-            f.write(f"{tag}, gen->{gen}\n")
-
-    threading.Thread(target=task).start()
+def _submit_gen_task(eval_model: torch.nn.Module, tag, prompt, max_position_embeddings):
+    Process(target=_eval_task, args=(eval_model, tag, prompt, max_position_embeddings, True)).start()
+    # threading.Thread(target=_eval_task, args=(eval_model, tag, prompt, max_position_embeddings, False)).start()
 
 
 def on_batch(
@@ -82,10 +84,8 @@ def on_batch(
             eval_model,
             tag=f'sign:batch/epoch:{epoch}/batch:{batch}',
             prompt=prompt,
-            max_position_embeddings=max_position_embeddings,
-            max_new_tokens=100
+            max_position_embeddings=max_position_embeddings
         )
-
 
 
 def on_file(
@@ -99,18 +99,12 @@ def on_file(
             eval_model,
             tag=f'sign:file/epoch:{epoch}',
             prompt=prompt,
-            max_position_embeddings=max_position_embeddings,
-            max_new_tokens=100
+            max_position_embeddings=max_position_embeddings
         )
 
 
 def on_exception(e, epoch, batch):
-    if isinstance(e, KeyboardInterrupt):
-        if TrainerTools().parallel.is_main_process:
-            # ddp_helper.raw_model.train()
-            # save_model()
-            exit(0)
-    elif isinstance(e, torch.OutOfMemoryError):
+    if isinstance(e, torch.OutOfMemoryError):
         if TrainerTools().parallel.is_main_process:
             save_dir = _get_save_dir()
             with open(f'{save_dir}batch.txt', 'a') as f:
@@ -145,6 +139,5 @@ def on_epoch(
             eval_model,
             tag=f'sign:epoch/epoch:{epoch}',
             prompt=prompt,
-            max_position_embeddings=max_position_embeddings,
-            max_new_tokens=100
+            max_position_embeddings=max_position_embeddings
         )

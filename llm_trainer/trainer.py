@@ -226,8 +226,6 @@ def train(
                         )
 
                     del loss
-                except KeyboardInterrupt as e:
-                    on_exception(e, epoch, batch)
                 except Exception as e:
                     on_exception(e, epoch, batch)
 
@@ -256,3 +254,9 @@ def train(
         )
 
     TrainerTools().parallel.destroy()
+
+"""
+todo: 
+1. 调用fsdp2
+2. inference使用缓存model，每个进程缓存一个
+"""

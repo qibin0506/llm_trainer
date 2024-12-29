@@ -105,9 +105,10 @@ def train(
     gradient_accumulation_steps = train_args.gradient_accumulation_steps
     batch_count = train_args.all_data_size // TrainerTools().parallel.world_size // train_args.batch_size
 
+    print(f"real batch count: {batch_count}")
+
     if gradient_accumulation_steps > 1:
         batch_count = batch_count // gradient_accumulation_steps
-    print(f"batch count: {batch_count}")
 
     train_iters = batch_count * train_args.n_epochs
 

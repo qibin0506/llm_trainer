@@ -5,7 +5,8 @@ import torch.distributed as dist
 import pickle
 
 from llama import LlamaModel
-from .scheduler import CosineAnnealingWarmupScheduler
+
+from .scheduler import CosineAnnealingWarmupLRScheduler, NoneLRScheduler
 from .train_args import TrainArgs
 from .parallel_fsdp import FsdpParallel
 from .train_tools import TrainerTools
@@ -110,23 +111,38 @@ def train(
     if gradient_accumulation_steps > 1:
         batch_count = batch_count // gradient_accumulation_steps
 
-    train_iters = batch_count * train_args.n_epochs
-
-    warmup_iters = int(train_args.lr_scheduler_args.warmup_iters_ratio * train_iters)
     # 学习率要根据GPU的数量进行倍增：
     # 在训练的过程中，损失梯度决定下降的方向，学习率决定下降的步长。如果有两块gpu，前进的综合步长为：平均学习率*2
     initial_lr = train_args.lr_scheduler_args.initial_lr * TrainerTools().parallel.world_size
-    min_lr = train_args.lr_scheduler_args.min_lr_ratio * initial_lr
-    max_lr = train_args.lr_scheduler_args.max_lr * TrainerTools().parallel.world_size
-
     optimizer = torch.optim.AdamW(llama.parameters(), lr=initial_lr, weight_decay=0.1)
-    lr_scheduler = CosineAnnealingWarmupScheduler(optimizer, warmup_iters, initial_lr, min_lr, max_lr, train_iters)
+
+    if train_args.lr_scheduler_args.enable_lr_scheduler:
+        train_iters = batch_count * train_args.n_epochs
+        warmup_iters = int(train_args.lr_scheduler_args.warmup_iters_ratio * train_iters)
+        min_lr = train_args.lr_scheduler_args.min_lr_ratio * initial_lr
+        max_lr = train_args.lr_scheduler_args.max_lr * TrainerTools().parallel.world_size
+
+        lr_scheduler = CosineAnnealingWarmupLRScheduler(
+            optimizer=optimizer,
+            warmup_iters=warmup_iters,
+            initial_lr=initial_lr,
+            min_lr=min_lr,
+            max_lr=max_lr,
+            total_iters=train_iters
+        )
+    else:
+        lr_scheduler = NoneLRScheduler()
 
     criterion = LMLoss()
     kd_loss = KDLoss() if train_args.kd_args is not None else None
 
-    load_checkpoint(llama, optimizer=optimizer, device=TrainerTools().parallel.device)
-    # load_dcp(llama, optimizer)
+    load_checkpoint(
+        llama,
+        optimizer=optimizer,
+        lr_scheduler=lr_scheduler,
+        device=TrainerTools().parallel.device
+    )
+
     dataloader_args = train_args.data_loader_args
 
     for epoch in range(train_args.n_epochs):
@@ -136,7 +152,6 @@ def train(
 
         for file in train_args.all_files:
             dataset = LLMDataset(llama_config.max_position_embeddings, file)
-
             data_loader_kwargs = {
                 "batch_size": train_args.batch_size,
                 "pin_memory": dataloader_args.data_loader_pin_memory,
@@ -145,7 +160,6 @@ def train(
                 "shuffle": dataloader_args.data_loader_shuffle,
                 "drop_last": dataloader_args.data_loader_drop_last,
             }
-
             sampler_kwargs = {
                 "shuffle": dataloader_args.data_loader_shuffle,
                 "drop_last": dataloader_args.data_loader_drop_last,
@@ -220,7 +234,7 @@ def train(
 
                     if need_update_grad and (batch - last_ckpt_batch) >= 100:
                         last_ckpt_batch = batch
-                        save_checkpoint(model=llama, optimizer=optimizer)
+                        save_checkpoint(model=llama, optimizer=optimizer, lr_scheduler=lr_scheduler)
 
                         loss_item = loss.detach().item()
                         on_batch(
@@ -242,16 +256,15 @@ def train(
                 eval_model,
                 epoch,
                 TrainerTools().tokenizer.decode_to_text(dataset.get_first()),
-                llama_config.max_position_embeddings
+                llama_config.max_position_embeddings,
+                file
             )
 
         if TrainerTools().parallel.parallel_train:
             dist.all_reduce(loss_accumulation, dist.ReduceOp.AVG)
 
         TrainerTools().parallel.on_epoch_end(epoch)
-        save_checkpoint(model=llama, optimizer=optimizer)
-        # dist.barrier()
-        # save_dcp(llama, optimizer)
+        save_checkpoint(model=llama, optimizer=optimizer, lr_scheduler=lr_scheduler)
 
         on_epoch(
             eval_model,

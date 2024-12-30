@@ -92,7 +92,8 @@ def on_file(
         eval_model,
         epoch,
         prompt,
-        max_position_embeddings
+        max_position_embeddings,
+        file_name
 ):
     if TrainerTools().parallel.is_main_process:
         _submit_gen_task(
@@ -101,6 +102,9 @@ def on_file(
             prompt=prompt,
             max_position_embeddings=max_position_embeddings
         )
+
+        with open(f'{_get_save_dir()}batch.txt', 'a') as f:
+            f.write(f"epoch: {epoch}, {file_name} train finish.\n")
 
 
 def on_exception(e, epoch, batch):

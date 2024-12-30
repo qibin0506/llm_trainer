@@ -48,6 +48,8 @@ class LrSchedulerArgs:
     """
     lr scheduler配置项
     Args:
+        enable_lr_scheduler (`bool`, default is True)
+            是否启动lr scheduler
         initial_lr (`float`, *optional*, default is 1e-4):
             初始化lr
         max_lr (`float`, *optional*, default is 5e-4)
@@ -57,6 +59,7 @@ class LrSchedulerArgs:
         min_lr_ratio (`float`, default is 0.1)
             最小lr的比例，最小lr=min_lr_ratio*initial_lr
     """
+    enable_lr_scheduler: bool = True
     initial_lr: float = 1e-4
     max_lr: float = 5e-4
     warmup_iters_ratio: float = 0.2

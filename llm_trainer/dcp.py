@@ -11,7 +11,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 DEFAULT_DCP_DIR = "checkpoint"
 
 class AppState(Stateful):
-    def __init__(self, model: nn.Module, optimizer: Optional[Optimizer] = None):
+    def __init__(self, model: nn.Module, optimizer: Optimizer):
         self.model = model
         self.optimizer = optimizer
 
@@ -31,7 +31,7 @@ class AppState(Stateful):
         )
 
 
-def save_dcp(model: nn.Module, optimizer: Optional[Optimizer] = None):
+def save_dcp(model: nn.Module, optimizer: Optimizer):
     checkpoint_id = os.environ.get('DCP_DIR', DEFAULT_DCP_DIR)
     state_dict = {'app': AppState(model, optimizer)}
     dcp.save(state_dict=state_dict, checkpoint_id=checkpoint_id)
@@ -45,9 +45,10 @@ def load_dcp(model: nn.Module, optimizer: Optional[Optimizer] = None):
             # AppState帮助加载到state_dict中, 然后加载到model中
             dcp.load(state_dict=state_dict, checkpoint_id=checkpoint_id)
         else:
-            state_dict = {
-                "model_state_dict": model.state_dict(),
-            }
+            state_dict = {"model_state_dict": model.state_dict()}
+
+            if optimizer is not None:
+                state_dict.update({'optim_state_dict': optimizer.state_dict()})
 
             # since no progress group is initialized, DCP will disable any collectives.
             # 加载到state_dict中，然后通过model.load_state_dict加载到model中
@@ -55,7 +56,10 @@ def load_dcp(model: nn.Module, optimizer: Optional[Optimizer] = None):
                 state_dict=state_dict,
                 checkpoint_id=checkpoint_id,
             )
+
             model.load_state_dict(state_dict["model_state_dict"])
+            if optimizer is not None:
+                optimizer.load_state_dict(state_dict["optim_state_dict"])
 
 def convert_dcp_to_pth(pth_path: str):
     # convert dcp model to torch.save (assumes checkpoint was generated as above)

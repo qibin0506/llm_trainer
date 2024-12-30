@@ -1,16 +1,32 @@
 import torch
 import math
 
+class LRScheduler:
+    @property
+    def cur_steps(self):
+        raise NotImplementedError()
 
-class CosineAnnealingWarmupScheduler:
+    def update_steps(self, steps):
+        raise NotImplementedError()
+
+    def step(self):
+        raise NotImplementedError()
+
+    def can_clip_grad(self):
+        raise NotImplementedError()
+
+
+
+class CosineAnnealingWarmupLRScheduler(LRScheduler):
     def __init__(
             self,
+            *,
             optimizer: torch.optim.Optimizer,
             warmup_iters,
             initial_lr,
             min_lr,
             max_lr,
-            total_iters
+            total_iters,
     ):
         super().__init__()
 
@@ -30,8 +46,14 @@ class CosineAnnealingWarmupScheduler:
               f'total_iters: {self.total_iters},'
               f'lr_increment: {self.lr_increment}')
 
+    @property
+    def cur_steps(self):
+        return self.steps
+
     def update_steps(self, steps):
+        print(f'update step to {steps}')
         self.steps = steps
+        self._update_lr()
 
     def step(self):
         self.steps += 1
@@ -51,3 +73,18 @@ class CosineAnnealingWarmupScheduler:
 
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = lr
+
+
+class NoneLRScheduler(LRScheduler):
+    @property
+    def cur_steps(self):
+        return -1
+
+    def update_steps(self, steps):
+        pass
+
+    def step(self):
+        pass
+
+    def can_clip_grad(self):
+        return True

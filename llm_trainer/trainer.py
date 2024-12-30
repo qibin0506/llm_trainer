@@ -11,9 +11,9 @@ from .parallel_fsdp import FsdpParallel
 from .train_tools import TrainerTools
 from .checkpoint import load_checkpoint, save_checkpoint
 # from .app_state import save_dcp, load_dcp
+from .loss import LMLoss, KDLoss
 from .utils import (
     set_seed,
-    calc_loss,
     pretrain_padding_fn,
     sft_padding_fn,
 )
@@ -122,6 +122,9 @@ def train(
     optimizer = torch.optim.AdamW(llama.parameters(), lr=initial_lr, weight_decay=0.1)
     lr_scheduler = CosineAnnealingWarmupScheduler(optimizer, warmup_iters, initial_lr, min_lr, max_lr, train_iters)
 
+    criterion = LMLoss()
+    kd_loss = KDLoss() if train_args.kd_args is not None else None
+
     load_checkpoint(llama, optimizer=optimizer, device=TrainerTools().parallel.device)
     # load_dcp(llama, optimizer)
     dataloader_args = train_args.data_loader_args
@@ -183,7 +186,13 @@ def train(
                     with ctx:
                         logits, _ = llama(inputs, attention_mask=attention_mask)
                         # calc loss
-                        loss = calc_loss(logits, labels)
+                        loss = criterion(logits, labels)
+
+                        # 知识蒸馏loss
+                        if kd_loss is not None:
+                            teacher_logits = train_args.kd_args.teacher_logits_provider(inputs, attention_mask)
+                            distil_loss = kd_loss(logits, teacher_logits, labels)
+                            loss = (1 - train_args.kd_args.kd_coef) * loss + train_args.kd_args.kd_coef * distil_loss
 
                         if gradient_accumulation_steps > 1:
                             loss = loss / gradient_accumulation_steps
@@ -255,8 +264,13 @@ def train(
 
     TrainerTools().parallel.destroy()
 
+
+
+
 """
 todo: 
-1. 调用fsdp2
+1. 调研fsdp2
 2. inference使用缓存model，每个进程缓存一个
+3. DPO
+4. 蒸馏
 """

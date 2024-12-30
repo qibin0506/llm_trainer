@@ -1,6 +1,5 @@
 import torch
 from torch.nn.utils.rnn import pad_sequence
-import torch.nn.functional as F
 from .train_tools import TrainerTools
 import numpy as np
 import random
@@ -43,22 +42,3 @@ def sft_padding_fn(batch_data):
         labels[batch, :bot_idx] = torch.tensor([-100] * bot_idx)
 
     return inputs, labels
-
-
-# def pretrain_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-#     logits = logits.reshape(-1, logits.shape[-1])
-#     targets = labels.reshape(-1)
-#
-#     return F.cross_entropy(logits, targets, ignore_index=-100)
-
-
-def calc_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    # logits shape (batch, seq_len, vocab_size)
-    # labels shape (batch, seq_len)
-    shift_logits = logits[..., :-1, :].contiguous()
-    shift_labels = labels[..., 1:].contiguous()
-
-    logits = shift_logits.reshape(-1, logits.shape[-1])
-    targets = shift_labels.reshape(-1)
-
-    return F.cross_entropy(logits, targets, ignore_index=-100)

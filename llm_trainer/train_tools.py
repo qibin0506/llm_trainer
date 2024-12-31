@@ -20,7 +20,7 @@ class TrainerTools:
             else:
                 self.parallel: Parallel = NoneParallel()
 
-            self.tokenizer = Tokenizer(int(os.environ.get('TOKENIZERS_TYPE', 0)))
+            self.tokenizer = Tokenizer(os.environ.get('TOKENIZERS_TYPE', 'bert'))
 
             self.use_amp = 'cuda' in self.parallel.device
 

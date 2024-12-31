@@ -32,7 +32,9 @@ def get_config():
         num_hidden_layers=22,
         num_attention_heads=32,
         num_key_value_heads=8,
-        max_position_embeddings=1024
+        max_position_embeddings=1024,
+        num_experts=6,
+        slots_per_expert=1
     )
 
 

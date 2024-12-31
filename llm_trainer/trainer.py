@@ -282,8 +282,11 @@ def train(
 
 """
 todo: 
-1. 调研fsdp2
-2. inference使用缓存model，每个进程缓存一个
-3. DPO
-4. 蒸馏
+1. 调研fsdp2 没有太多资料
+2. 蒸馏 完成
+3. Yarn和phi3的Phi3LongRoPEScaledRotaryEmbedding调研
+4. MLA调研
+5. DPO调研
+6. inference使用缓存model，每个进程缓存一个
+7. 多模态
 """

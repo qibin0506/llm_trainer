@@ -34,6 +34,9 @@ class AppState(Stateful):
 def save_dcp(model: nn.Module, optimizer: Optimizer):
     checkpoint_id = os.environ.get('DCP_DIR', DEFAULT_DCP_DIR)
     state_dict = {'app': AppState(model, optimizer)}
+
+    # fs_storage_writer = dcp.FileSystemWriter(checkpoint_id, overwrite=True)
+    # dcp.save(state_dict=state_dict, storage_writer=fs_storage_writer)
     dcp.save(state_dict=state_dict, checkpoint_id=checkpoint_id)
 
 

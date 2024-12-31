@@ -20,6 +20,7 @@ def init_env():
 
     os.environ['ENABLE_DCP'] = '1'
     os.environ['CHECKPOINT_NAME'] = 'ckpt.pth'
+    os.environ['EVAL_CHECKPOINT_NAME'] = 'eval_ckpt.pth'
     os.environ['DCP_DIR'] = 'ckpt_dir'
     # os.environ['CHECKPOINT_DIR'] = 'ckpt_dir'
 

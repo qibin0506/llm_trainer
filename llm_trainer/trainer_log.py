@@ -60,8 +60,8 @@ def _eval_task(eval_model, tag, prompt, max_position_embeddings, is_new_process)
 
 
 def _submit_gen_task(eval_model: torch.nn.Module, tag, prompt, max_position_embeddings):
-    threading.Thread(target=_eval_task, args=(eval_model, tag, prompt, max_position_embeddings, False)).start()
-    # Process(target=_eval_task, args=(eval_model, tag, prompt, max_position_embeddings, True)).start()
+    # threading.Thread(target=_eval_task, args=(eval_model, tag, prompt, max_position_embeddings, False)).start()
+    Process(target=_eval_task, args=(eval_model, tag, prompt, max_position_embeddings, True)).start()
 
 
 def on_batch(

@@ -67,4 +67,4 @@ def convert_dcp_to_pth(pth_path: str):
 
 def convert_pth_to_dcp(pth_path: str):
     # converts the torch.save model back to DCP
-    dcp_to_torch_save(pth_path, os.environ.get('DCP_DIR', DEFAULT_DCP_DIR))
+    torch_save_to_dcp(pth_path, os.environ.get('DCP_DIR', DEFAULT_DCP_DIR))

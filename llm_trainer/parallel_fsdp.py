@@ -2,6 +2,7 @@ from typing import Optional
 import functools
 import torch
 from torch import nn
+from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
     MixedPrecision,
@@ -85,12 +86,15 @@ class FsdpParallel(Parallel):
                 mixed_precision = None
 
             self.raw_model = model
+
+            device_mesh = init_device_mesh("cuda", (self.world_size,))
             self.model = FSDP(
                 model,
                 auto_wrap_policy=auto_wrap_policy,
                 mixed_precision=mixed_precision,
                 cpu_offload=cpu_offload,
-                device_id=torch.cuda.current_device()
+                device_id=torch.cuda.current_device(),
+                device_mesh=device_mesh
             )
         else:
             self.model = model

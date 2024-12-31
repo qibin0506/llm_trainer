@@ -17,7 +17,7 @@ def _get_save_dir() -> str:
 
 def _eval_task(eval_model, tag, prompt, max_position_embeddings, is_new_process):
     save_dir = _get_save_dir()
-    ident = os.getpid() if is_new_process else threading.current_thread().ident
+    ident = os.getpid() if is_new_process else 'thread'
 
     with open(f'{save_dir}gen_temp_{ident}.txt', 'w') as tf:
         def write_temp(item):

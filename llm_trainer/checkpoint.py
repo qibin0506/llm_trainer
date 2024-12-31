@@ -96,5 +96,5 @@ def load_checkpoint(
     if lr_scheduler is not None:
         lr_checkpoint_name = f"{os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)}.lr.steps"
         if os.path.exists(lr_checkpoint_name):
-            lr_checkpoint = torch.load(lr_checkpoint_name)
+            lr_checkpoint = torch.load(lr_checkpoint_name, weights_only=True)
             lr_scheduler.update_steps(lr_checkpoint['lr_steps'])

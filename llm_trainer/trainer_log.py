@@ -66,7 +66,7 @@ def _submit_gen_task(eval_model: torch.nn.Module, tag, prompt, max_position_embe
     # Process(target=_eval_task, args=(eval_model, tag, prompt, max_position_embeddings, True)).start()
 
 
-def on_batch(
+def on_batch_end(
         eval_model,
         epoch,
         batch,
@@ -92,7 +92,12 @@ def on_batch(
         )
 
 
-def on_file(
+def on_file_start(epoch, file_name):
+    if TrainerTools().parallel.is_main_process:
+        log(f"epoch: {epoch}, {file_name} train start.\n", f'{_get_save_dir()}batch.txt')
+
+
+def on_file_end(
         eval_model,
         epoch,
         prompt,
@@ -123,7 +128,7 @@ def on_exception(e, epoch, batch):
         raise e
 
 
-def on_epoch(
+def on_epoch_end(
         eval_model,
         epoch,
         loss,

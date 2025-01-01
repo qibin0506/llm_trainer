@@ -21,10 +21,11 @@ from .utils import (
 )
 
 from .trainer_log import (
-    on_batch,
+    on_batch_end,
     on_exception,
-    on_epoch,
-    on_file,
+    on_epoch_end,
+    on_file_start,
+    on_file_end,
 )
 
 
@@ -178,6 +179,8 @@ def train(
             TrainerTools().parallel.on_epoch_start(epoch)
             last_ckpt_batch = 0
 
+            on_file_start(epoch, file)
+
             for batch, (inputs, labels) in enumerate(train_data_loader):
                 # 是否需要更新梯度
                 if gradient_accumulation_steps > 1:
@@ -238,7 +241,7 @@ def train(
                         save_checkpoint(model=llama, optimizer=optimizer, lr_scheduler=lr_scheduler)
 
                         loss_item = loss.detach().item()
-                        on_batch(
+                        on_batch_end(
                             eval_model,
                             epoch,
                             batch,
@@ -253,7 +256,7 @@ def train(
                 except Exception as e:
                     on_exception(e, epoch, batch)
 
-            on_file(
+            on_file_end(
                 eval_model,
                 epoch,
                 TrainerTools().tokenizer.decode_to_text(dataset.get_first()),
@@ -267,7 +270,7 @@ def train(
         TrainerTools().parallel.on_epoch_end(epoch)
         save_checkpoint(model=llama, optimizer=optimizer, lr_scheduler=lr_scheduler)
 
-        on_epoch(
+        on_epoch_end(
             eval_model,
             epoch,
             loss_accumulation.detach().item() / batch_count_per_epoch,

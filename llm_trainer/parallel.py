@@ -6,6 +6,7 @@ from torch import nn
 import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from .utils import log
 
 
 class Parallel:
@@ -38,7 +39,7 @@ class Parallel:
 
             torch.cuda.set_device(self.device)
 
-            print(f'global_rank:{self._global_rank},local_rank:{self._local_rank}, world_size:{self._word_size}')
+            log(f'global_rank:{self._global_rank},local_rank:{self._local_rank}, world_size:{self._word_size}')
         else:
             device = "cpu"
             if torch.cuda.is_available():

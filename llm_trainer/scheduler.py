@@ -1,5 +1,6 @@
 import torch
 import math
+from .utils import log
 
 class LRScheduler:
     @property
@@ -39,7 +40,7 @@ class CosineAnnealingWarmupLRScheduler(LRScheduler):
         self.lr_increment = (max_lr - initial_lr) / warmup_iters
         self.steps = -1
 
-        print(f'warmup_iters: {self.warmup_iters},'
+        log(f'warmup_iters: {self.warmup_iters},'
               f' initial_lr: {self.initial_lr},'
               f' min_lr: {self.min_lr},'
               f' max_lr: {self.max_lr},'
@@ -51,7 +52,7 @@ class CosineAnnealingWarmupLRScheduler(LRScheduler):
         return self.steps
 
     def update_steps(self, steps):
-        print(f'update step to {steps}')
+        log(f'update step to {steps}')
         self.steps = steps
         self._update_lr()
 

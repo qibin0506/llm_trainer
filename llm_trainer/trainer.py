@@ -17,6 +17,7 @@ from .utils import (
     set_seed,
     pretrain_padding_fn,
     sft_padding_fn,
+    log
 )
 
 from .trainer_log import (
@@ -93,11 +94,11 @@ def train(
 
     if TrainerTools().parallel.is_main_process:
         total_params = sum(p.numel() for p in llama.parameters())
-        print(f"Total number of parameters: {total_params:,}")
+        log(f"Total number of parameters: {total_params:,}")
 
         total_size_bytes = total_params * 4
         total_size_mb = total_size_bytes / (1024 * 1024)
-        print(f"Total size of the model: {total_size_mb:.2f} MB")
+        log(f"Total size of the model: {total_size_mb:.2f} MB")
 
     # initialize a GradScaler. If enabled=False scaler is a no-op
     scalar = torch.GradScaler(enabled=TrainerTools().use_amp)
@@ -106,7 +107,7 @@ def train(
     gradient_accumulation_steps = train_args.gradient_accumulation_steps
     batch_count = train_args.all_data_size // TrainerTools().parallel.world_size // train_args.batch_size
 
-    print(f"real batch count: {batch_count}")
+    log(f"real batch count: {batch_count}")
 
     if gradient_accumulation_steps > 1:
         batch_count = batch_count // gradient_accumulation_steps
@@ -182,7 +183,7 @@ def train(
                 if gradient_accumulation_steps > 1:
                     need_update_grad = (batch + 1) % gradient_accumulation_steps == 0 or batch == batch_count_per_file - 1
                     if TrainerTools().parallel.is_main_process and need_update_grad:
-                        print(f"need_update_grad: {batch}")
+                        log(f"need_update_grad: {batch}")
                 else:
                     need_update_grad = True
 

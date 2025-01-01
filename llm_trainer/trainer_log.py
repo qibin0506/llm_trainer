@@ -7,6 +7,7 @@ import torch
 from .generate_utils import generate
 from .train_tools import TrainerTools
 from .checkpoint import load_checkpoint
+from .utils import log
 
 
 def _get_save_dir() -> str:
@@ -77,10 +78,11 @@ def on_batch(
 ):
     if TrainerTools().parallel.is_main_process:
         save_dir = _get_save_dir()
-        print(f"epoch: {epoch}, batch: {batch}/{batch_count}")
-        with open(f'{save_dir}batch.txt', 'a') as f:
-            cur_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-            f.write(f"({cur_time}) epoch: {epoch}, batch: {batch}/{batch_count}, loss: {loss}, need_update_grad: {need_update_grad}\n")
+        log(f"epoch: {epoch}, batch: {batch}/{batch_count}")
+        log(
+            f"epoch: {epoch}, batch: {batch}/{batch_count}, loss: {loss}, need_update_grad: {need_update_grad}\n",
+            f'{save_dir}batch.txt'
+        )
 
         _submit_gen_task(
             eval_model,
@@ -105,18 +107,18 @@ def on_file(
             max_position_embeddings=max_position_embeddings
         )
 
-        with open(f'{_get_save_dir()}batch.txt', 'a') as f:
-            f.write(f"epoch: {epoch}, {file_name} train finish.\n")
-
+        log(f"epoch: {epoch}, {file_name} train finish.\n", f'{_get_save_dir()}batch.txt')
 
 def on_exception(e, epoch, batch):
     if isinstance(e, torch.OutOfMemoryError):
         if TrainerTools().parallel.is_main_process:
             save_dir = _get_save_dir()
-            with open(f'{save_dir}batch.txt', 'a') as f:
-                exception_file = e.__traceback__.tb_frame.f_globals["__file__"]
-                exception_line = e.__traceback__.tb_lineno
-                f.write(f"epoch: {epoch}, batch: {batch}, {e} at {exception_file} line {exception_line}\n")
+            exception_file = e.__traceback__.tb_frame.f_globals["__file__"]
+            exception_line = e.__traceback__.tb_lineno
+            log(
+                f"epoch: {epoch}, batch: {batch}, {e} at {exception_file} line {exception_line}\n",
+                f'{save_dir}batch.txt'
+            )
     else:
         raise e
 
@@ -132,12 +134,12 @@ def on_epoch(
     if TrainerTools().parallel.is_main_process:
 
         # test_loss = test_loop(model, test_data_loader)
-        print(f'train_loss: {loss}')
-
         save_dir = _get_save_dir()
-        with open(f'{save_dir}batch.txt', 'a') as f:
-            cur_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-            f.write(f"({cur_time}) epoch: {epoch}, loss: {loss}, need_update_grad:{need_update_grad}\n")
+        log(f'train_loss: {loss}')
+        log(
+            f"(epoch: {epoch}, loss: {loss}, need_update_grad:{need_update_grad}\n",
+            f'{save_dir}batch.txt'
+        )
 
         _submit_gen_task(
             eval_model,

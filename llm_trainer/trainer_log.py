@@ -92,7 +92,7 @@ def on_batch_end(
 
 def on_file_start(epoch, file_name):
     if TrainerTools().parallel.is_main_process:
-        log(f"epoch: {epoch}, {file_name} train start.\n", f'{_get_save_dir()}batch.txt')
+        log(f"epoch: {epoch}, start train {file_name}\n", f'{_get_save_dir()}batch.txt')
 
 
 def on_file_end(
@@ -110,7 +110,7 @@ def on_file_end(
             max_position_embeddings=max_position_embeddings
         )
 
-        log(f"epoch: {epoch}, {file_name} train finish.\n", f'{_get_save_dir()}batch.txt')
+        log(f"epoch: {epoch}, finish train {file_name}\n", f'{_get_save_dir()}batch.txt')
 
 def on_exception(e, epoch, batch):
     if isinstance(e, torch.OutOfMemoryError):

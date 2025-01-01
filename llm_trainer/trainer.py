@@ -236,7 +236,10 @@ def train(
 
                     loss_accumulation += loss.detach()
 
-                    if need_update_grad and (batch - last_ckpt_batch) >= 100:
+                except Exception as e:
+                    on_exception(e, epoch, batch)
+                finally:
+                    if need_update_grad and (batch - last_ckpt_batch) >= 50:
                         last_ckpt_batch = batch
                         save_checkpoint(model=llama, optimizer=optimizer, lr_scheduler=lr_scheduler)
 
@@ -253,8 +256,6 @@ def train(
                         )
 
                     del loss
-                except Exception as e:
-                    on_exception(e, epoch, batch)
 
             on_file_end(
                 eval_model,

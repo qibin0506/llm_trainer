@@ -114,14 +114,13 @@ def on_file_end(
 
 def on_exception(e, epoch, batch):
     if isinstance(e, torch.OutOfMemoryError):
-        if TrainerTools().parallel.is_main_process:
-            save_dir = _get_save_dir()
-            exception_file = e.__traceback__.tb_frame.f_globals["__file__"]
-            exception_line = e.__traceback__.tb_lineno
-            log(
-                f"epoch: {epoch}, batch: {batch}, {e} at {exception_file} line {exception_line}\n",
-                f'{save_dir}log.txt'
-            )
+        save_dir = _get_save_dir()
+        exception_file = e.__traceback__.tb_frame.f_globals["__file__"]
+        exception_line = e.__traceback__.tb_lineno
+        log(
+            f"epoch: {epoch}, batch: {batch}, {e} at {exception_file} line {exception_line}\n",
+            f'{save_dir}log.txt'
+        )
     else:
         raise e
 

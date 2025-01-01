@@ -6,7 +6,7 @@ from torch import nn
 import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from .utils import log
+from .log import log
 
 
 class Parallel:

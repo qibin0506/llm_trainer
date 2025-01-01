@@ -1,13 +1,11 @@
 import os
 import threading
-import time
-from multiprocessing import Process
 import torch
 
 from .generate_utils import generate
 from .train_tools import TrainerTools
 from .checkpoint import load_checkpoint
-from .utils import log
+from .log import log
 
 
 def _get_save_dir() -> str:

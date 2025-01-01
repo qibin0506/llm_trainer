@@ -1,6 +1,6 @@
 import torch
 import math
-from .utils import log
+from .log import log
 
 class LRScheduler:
     @property

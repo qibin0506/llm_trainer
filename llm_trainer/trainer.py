@@ -13,11 +13,11 @@ from .train_tools import TrainerTools
 from .checkpoint import load_checkpoint, save_checkpoint
 # from .app_state import save_dcp, load_dcp
 from .loss import LMLoss, KDLoss
+from .log import log
 from .utils import (
     set_seed,
     pretrain_padding_fn,
     sft_padding_fn,
-    log
 )
 
 from .trainer_log import (

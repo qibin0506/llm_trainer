@@ -1,4 +1,3 @@
-import time
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from .train_tools import TrainerTools
@@ -43,12 +42,3 @@ def sft_padding_fn(batch_data):
         labels[batch, :bot_idx] = torch.tensor([-100] * bot_idx)
 
     return inputs, labels
-
-
-def log(msg: str, log_file=None):
-    cur_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-    if log_file is None:
-        print(f'({cur_time}) msg')
-    else:
-        with open(log_file, 'a') as f:
-            f.write(f"({cur_time}) {msg}")

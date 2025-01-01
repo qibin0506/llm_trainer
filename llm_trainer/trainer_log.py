@@ -79,7 +79,7 @@ def on_batch_end(
         log(f"epoch: {epoch}, batch: {batch}/{batch_count}")
         log(
             f"epoch: {epoch}, batch: {batch}/{batch_count}, loss: {loss}, need_update_grad: {need_update_grad}\n",
-            f'{save_dir}batch.txt'
+            f'{save_dir}log.txt'
         )
 
         _submit_gen_task(
@@ -92,7 +92,7 @@ def on_batch_end(
 
 def on_file_start(epoch, file_name):
     if TrainerTools().parallel.is_main_process:
-        log(f"epoch: {epoch}, start train {file_name}\n", f'{_get_save_dir()}batch.txt')
+        log(f"epoch: {epoch}, start train {file_name}\n", f'{_get_save_dir()}log.txt')
 
 
 def on_file_end(
@@ -110,7 +110,7 @@ def on_file_end(
             max_position_embeddings=max_position_embeddings
         )
 
-        log(f"epoch: {epoch}, finish train {file_name}\n", f'{_get_save_dir()}batch.txt')
+        log(f"epoch: {epoch}, finish train {file_name}\n", f'{_get_save_dir()}log.txt')
 
 def on_exception(e, epoch, batch):
     if isinstance(e, torch.OutOfMemoryError):
@@ -120,7 +120,7 @@ def on_exception(e, epoch, batch):
             exception_line = e.__traceback__.tb_lineno
             log(
                 f"epoch: {epoch}, batch: {batch}, {e} at {exception_file} line {exception_line}\n",
-                f'{save_dir}batch.txt'
+                f'{save_dir}log.txt'
             )
     else:
         raise e
@@ -141,7 +141,7 @@ def on_epoch_end(
         log(f'train_loss: {loss}')
         log(
             f"(epoch: {epoch}, loss: {loss}, need_update_grad:{need_update_grad}\n",
-            f'{save_dir}batch.txt'
+            f'{save_dir}log.txt'
         )
 
         _submit_gen_task(

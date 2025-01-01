@@ -1,5 +1,6 @@
 import os
 import threading
+import time
 from multiprocessing import Process
 import torch
 
@@ -78,7 +79,8 @@ def on_batch(
         save_dir = _get_save_dir()
         print(f"epoch: {epoch}, batch: {batch}/{batch_count}")
         with open(f'{save_dir}batch.txt', 'a') as f:
-            f.write(f"epoch: {epoch}, batch: {batch}/{batch_count}, loss: {loss}, need_update_grad: {need_update_grad}\n")
+            cur_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            f.write(f"({cur_time}) epoch: {epoch}, batch: {batch}/{batch_count}, loss: {loss}, need_update_grad: {need_update_grad}\n")
 
         _submit_gen_task(
             eval_model,
@@ -134,10 +136,8 @@ def on_epoch(
 
         save_dir = _get_save_dir()
         with open(f'{save_dir}batch.txt', 'a') as f:
-            f.write(
-                f"epoch: {epoch},"
-                f" loss: {loss},"
-                f" need_update_grad:{need_update_grad}\n")
+            cur_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            f.write(f"({cur_time}) epoch: {epoch}, loss: {loss}, need_update_grad:{need_update_grad}\n")
 
         _submit_gen_task(
             eval_model,

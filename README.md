@@ -9,6 +9,13 @@ import os
 from glob import glob
 
 def init_env():
+    #  Of the allocated memory 33.98 GiB is allocated by PyTorch,
+    #  and 8.89 GiB is reserved by PyTorch but unallocated.
+    #  If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.
+    #  See documentation for Memory Management
+    #  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
     os.environ['TOKENIZERS_TYPE'] = '1'

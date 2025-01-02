@@ -255,7 +255,10 @@ def train(
                             llama_config.max_position_embeddings
                         )
 
-                    del loss
+                    try:
+                        del loss
+                    except UnboundLocalError:
+                        pass
 
             on_file_end(
                 eval_model,

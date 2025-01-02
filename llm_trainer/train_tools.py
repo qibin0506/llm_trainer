@@ -5,6 +5,7 @@ from .parallel import Parallel
 from .parallel_fsdp import FsdpParallel
 from .parallel_ddp import DdpParallel
 from .parallel_none import NoneParallel
+from .log import log
 
 
 class TrainerTools:
@@ -21,12 +22,11 @@ class TrainerTools:
                 self.parallel: Parallel = NoneParallel()
 
             self.tokenizer = Tokenizer(os.environ.get('TOKENIZERS_TYPE', 'bert'))
-
             self.use_amp = 'cuda' in self.parallel.device
-
             self.dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
-
             self.bot_token = self.tokenizer.encode_to_token('[BOT]', unsqueeze=False, covert_tensor=False)[0]
+
+            log(f'use_amp={self.use_amp}, dtype={self.dtype}')
 
     def __new__(cls, *args, **kwargs):
         if not hasattr(TrainerTools, "_instance"):

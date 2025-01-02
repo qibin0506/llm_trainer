@@ -1,4 +1,5 @@
 import os
+import gc
 import threading
 import torch
 
@@ -121,6 +122,9 @@ def on_exception(e, epoch, batch):
             f"epoch: {epoch}, batch: {batch}, {e} at {exception_file} line {exception_line}\n",
             f'{save_dir}log.txt'
         )
+
+        torch.cuda.empty_cache()
+        gc.collect()
     else:
         raise e
 

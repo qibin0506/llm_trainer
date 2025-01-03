@@ -98,6 +98,8 @@ class TrainArgs:
             所有训练文件
         gradient_accumulation_steps (`int`, *Optional*, default is 0)
             梯度累积步数，为0时不使用梯度累积
+        eval_batch_interval (`int`, default is 100)
+            每隔多少个batch进行模型eval
         lr_scheduler_args (`LrSchedulerArgs`)
             lr scheduler配置项
         fsdp_args: (`FsdpArgs`)
@@ -114,6 +116,7 @@ class TrainArgs:
     all_data_size: int
     all_files: list[any] = field(default_factory=list)
     gradient_accumulation_steps: int = 0
+    eval_batch_interval: int = 100
     lr_scheduler_args: LrSchedulerArgs = field(default_factory=LrSchedulerArgs)
     fsdp_args: FsdpArgs = field(default_factory=FsdpArgs)
     data_loader_args: DataLoaderArgs = field(default_factory=DataLoaderArgs),

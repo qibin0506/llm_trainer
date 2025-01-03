@@ -239,7 +239,7 @@ def train(
                 except Exception as e:
                     on_exception(e, epoch, batch)
                 finally:
-                    if need_update_grad and (batch - last_ckpt_batch) >= 50:
+                    if need_update_grad and (batch - last_ckpt_batch) >= train_args.eval_batch_interval:
                         last_ckpt_batch = batch
                         save_checkpoint(model=llama, optimizer=optimizer, lr_scheduler=lr_scheduler)
 

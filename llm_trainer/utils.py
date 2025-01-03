@@ -5,11 +5,12 @@ import numpy as np
 import random
 
 def set_seed(seed=42):
-    torch.manual_seed(seed)
-    # 如果使用多 GPU
-    torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
+    set_seed(seed)
     random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
 def pretrain_padding_fn(batch_data):

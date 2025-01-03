@@ -18,46 +18,39 @@ def _get_save_dir() -> str:
 
 def _eval_task(eval_model, tag, prompt, max_position_embeddings, is_new_process):
     save_dir = _get_save_dir()
-    ident = os.getpid() if is_new_process else 'thread'
 
-    with open(f'{save_dir}gen_temp_{ident}.txt', 'w') as tf:
-        def write_temp(item):
-            tf.write(item)
-            tf.flush()
+    # 当eval_model不是独立model时可以尝试这个
+    # if isinstance(eval_model, FSDP):
+    #     with FSDP.summon_full_params(module=eval_model, writeback=False, recurse=False):
+    #         gen = generate(
+    #             eval_model,
+    #             prompt=prompt,
+    #             max_position_embeddings=max_position_embeddings,
+    #             max_new_tokens=max_new_tokens,
+    #             # temperature=None,
+    #             # k=None,
+    #             # p=None,
+    #             device='cpu',
+    #             item_callback=lambda item: write_temp(item)
+    #         )
 
-        # 当eval_model不是独立model时可以尝试这个
-        # if isinstance(eval_model, FSDP):
-        #     with FSDP.summon_full_params(module=eval_model, writeback=False, recurse=False):
-        #         gen = generate(
-        #             eval_model,
-        #             prompt=prompt,
-        #             max_position_embeddings=max_position_embeddings,
-        #             max_new_tokens=max_new_tokens,
-        #             # temperature=None,
-        #             # k=None,
-        #             # p=None,
-        #             device='cpu',
-        #             item_callback=lambda item: write_temp(item)
-        #         )
+    # ---------
 
-        # ---------
+    load_checkpoint(eval_model, device='cpu')
 
-        load_checkpoint(eval_model, device='cpu')
-
-        gen = generate(
-            eval_model,
-            prompt=prompt,
-            max_position_embeddings=max_position_embeddings,
-            max_new_tokens=100,
-            temperature=0.6,
-            k=3,
-            p=None,
-            device='cpu',
-            item_callback=lambda item: write_temp(item)
-        )
+    gen_result = generate(
+        eval_model,
+        prompt=prompt,
+        max_position_embeddings=max_position_embeddings,
+        max_new_tokens=100,
+        temperature=0.6,
+        k=3,
+        p=None,
+        device='cpu'
+    )
 
     with open(f'{save_dir}gen.txt', 'a') as f:
-        f.write(f"{tag}, gen->{gen}\n")
+        f.write(f"{tag}, gen->{gen_result}\n")
 
 
 def _submit_gen_task(eval_model: torch.nn.Module, tag, prompt, max_position_embeddings):

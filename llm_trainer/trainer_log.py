@@ -143,7 +143,7 @@ def on_epoch_end(
         save_dir = _get_save_dir()
         log(f'train_loss: {loss}')
         log(
-            f"(epoch: {epoch}, loss: {loss}, need_update_grad:{need_update_grad}\n",
+            f"epoch: {epoch}, loss: {loss}, need_update_grad:{need_update_grad}\n",
             f'{save_dir}log.txt'
         )
 

@@ -1,5 +1,5 @@
 import os
-from typing import Optional, Union
+from typing import Optional, Union, Tuple
 import torch
 from torch import nn
 from torch.optim import Optimizer
@@ -15,8 +15,7 @@ DEFAULT_CHECKPOINT_NAME = "checkpoint.pth"
 
 def save_checkpoint(
         model: nn.Module,
-        optimizer: Optional[Optimizer] = None,
-        lr_scheduler: Optional[LRScheduler] = None
+        optimizer: Optional[Optimizer] = None
 ):
     if os.environ.get('ENABLE_DCP', '1') == '1':
         save_dcp(model, optimizer)
@@ -48,16 +47,10 @@ def save_checkpoint(
 
                 torch.save(ckpt, checkpoint_name)
 
-    # 暂时只保存主进程的
-    if lr_scheduler is not None and TrainerTools().parallel.is_main_process:
-        lr_checkpoint_name = f"{os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)}.lr.steps"
-        torch.save({'lr_steps': lr_scheduler.cur_steps}, lr_checkpoint_name)
-
 
 def load_checkpoint(
         model: nn.Module,
         optimizer: Optional[Optimizer] = None,
-        lr_scheduler: Optional[LRScheduler] = None,
         device: Optional[Union[torch.device, str]] = None
 ):
     checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)
@@ -94,8 +87,22 @@ def load_checkpoint(
                 if optimizer is not None:
                     optimizer.load_state_dict(state_dict['optim_state_dict'])
 
-    if lr_scheduler is not None:
-        lr_checkpoint_name = f"{os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)}.lr.steps"
-        if os.path.exists(lr_checkpoint_name):
-            lr_checkpoint = torch.load(lr_checkpoint_name, weights_only=True)
-            lr_scheduler.update_steps(lr_checkpoint['lr_steps'])
+
+def save_steps(global_steps: int, lr_scheduler: Optional[LRScheduler] = None):
+    # 暂时只保存主进程的
+    if TrainerTools().parallel.is_main_process:
+        steps_checkpoint_name = f"{os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)}.steps"
+        ckpt = {'global_steps': global_steps, 'lr_steps': lr_scheduler.cur_steps}
+        torch.save(ckpt, steps_checkpoint_name)
+
+
+def load_steps(
+        default_global_steps: int = 0,
+        default_lr_steps: int = 0
+) -> Tuple[Optional[int], Optional[int]]:
+    steps_checkpoint_name = f"{os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)}.steps"
+    if os.path.exists(steps_checkpoint_name):
+        ckpt = torch.load(steps_checkpoint_name, weights_only=True)
+        return ckpt['global_steps'], ckpt['lr_steps']
+
+    return default_global_steps, default_lr_steps

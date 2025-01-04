@@ -10,10 +10,15 @@ from .scheduler import CosineAnnealingWarmupLRScheduler, NoneLRScheduler
 from .train_args import TrainArgs
 from .parallel_fsdp import FsdpParallel
 from .train_tools import TrainerTools
-from .checkpoint import load_checkpoint, save_checkpoint
-# from .app_state import save_dcp, load_dcp
 from .loss import LMLoss, KDLoss
 from .log import log
+
+from .checkpoint import (
+    load_checkpoint,
+    save_checkpoint,
+    load_steps,
+    save_steps
+)
 from .utils import (
     set_seed,
     pretrain_padding_fn,
@@ -53,6 +58,34 @@ class LLMDataset(Dataset):
         return torch.tensor(inputs).long()
 
 
+def _convert_train_args(train_args: TrainArgs):
+    if isinstance(TrainerTools().parallel, FsdpParallel) and train_args.fsdp_args is not None:
+        parallel_kwargs = {
+            'transformer_layer_cls': train_args.fsdp_args.transformer_layer_cls,
+            'wrap_policy_num_params': train_args.fsdp_args.wrap_policy_num_params,
+            'cpu_offload': train_args.fsdp_args.cpu_offload,
+            'offload_params': train_args.fsdp_args.offload_params
+        }
+    else:
+        parallel_kwargs = None
+
+    dataloader_args = train_args.data_loader_args
+    data_loader_kwargs = {
+        "batch_size": train_args.batch_size,
+        "pin_memory": dataloader_args.data_loader_pin_memory,
+        "collate_fn": sft_padding_fn if train_args.is_sft else pretrain_padding_fn,
+        "num_workers": dataloader_args.data_loader_num_workers,
+        "shuffle": dataloader_args.data_loader_shuffle,
+        "drop_last": dataloader_args.data_loader_drop_last,
+    }
+    sampler_kwargs = {
+        "shuffle": dataloader_args.data_loader_shuffle,
+        "drop_last": dataloader_args.data_loader_drop_last,
+    }
+
+    return parallel_kwargs, data_loader_kwargs, sampler_kwargs
+
+
 def train(
         *,
         train_args: TrainArgs,
@@ -61,22 +94,21 @@ def train(
 ):
     set_seed()
 
-    if isinstance(TrainerTools().parallel, FsdpParallel) and train_args.fsdp_args is not None:
-        fsdp_kwargs = {
-            'transformer_layer_cls': train_args.fsdp_args.transformer_layer_cls,
-            'wrap_policy_num_params': train_args.fsdp_args.wrap_policy_num_params,
-            'cpu_offload': train_args.fsdp_args.cpu_offload,
-            'offload_params': train_args.fsdp_args.offload_params
-        }
-    else:
-        fsdp_kwargs = None
-
     llama_config = train_args.llama_config
+    parallel_kwargs, data_loader_kwargs, sampler_kwargs = _convert_train_args(train_args)
 
     llama = TrainerTools().parallel.process_model(
         LlamaModel(llama_config),
-        kwargs=fsdp_kwargs
+        kwargs=parallel_kwargs
     )
+
+    if TrainerTools().parallel.is_main_process:
+        total_params = sum(p.numel() for p in llama.parameters())
+        log(f"Total number of parameters: {total_params:,}")
+
+        total_size_bytes = total_params * 4
+        total_size_mb = total_size_bytes / (1024 * 1024)
+        log(f"Total size of the model: {total_size_mb:.2f} MB")
 
     if TrainerTools().use_amp:
         ctx = torch.autocast(
@@ -92,14 +124,6 @@ def train(
         eval_model = LlamaModel(llama_config).to('cpu')
     else:
         eval_model = None
-
-    if TrainerTools().parallel.is_main_process:
-        total_params = sum(p.numel() for p in llama.parameters())
-        log(f"Total number of parameters: {total_params:,}")
-
-        total_size_bytes = total_params * 4
-        total_size_mb = total_size_bytes / (1024 * 1024)
-        log(f"Total size of the model: {total_size_mb:.2f} MB")
 
     # initialize a GradScaler. If enabled=False scaler is a no-op
     scalar = torch.GradScaler(enabled=TrainerTools().use_amp)
@@ -141,11 +165,17 @@ def train(
     load_checkpoint(
         llama,
         optimizer=optimizer,
-        lr_scheduler=lr_scheduler,
         device=TrainerTools().parallel.device
     )
 
-    dataloader_args = train_args.data_loader_args
+    global_steps = 0
+    last_global_steps, last_lr_steps = load_steps(0, -1)
+    log(f'last_global_steps={last_global_steps}, last_lr_steps={last_lr_steps}')
+
+    if last_lr_steps != -1:
+        lr_scheduler.update_steps(last_lr_steps)
+
+    skipping_train = False
 
     for epoch in range(train_args.n_epochs):
         batch_count_per_epoch = 0
@@ -154,34 +184,27 @@ def train(
 
         for file in train_args.all_files:
             dataset = LLMDataset(llama_config.max_position_embeddings, file)
-            data_loader_kwargs = {
-                "batch_size": train_args.batch_size,
-                "pin_memory": dataloader_args.data_loader_pin_memory,
-                "collate_fn": sft_padding_fn if train_args.is_sft else pretrain_padding_fn,
-                "num_workers": dataloader_args.data_loader_num_workers,
-                "shuffle": dataloader_args.data_loader_shuffle,
-                "drop_last": dataloader_args.data_loader_drop_last,
-            }
-            sampler_kwargs = {
-                "shuffle": dataloader_args.data_loader_shuffle,
-                "drop_last": dataloader_args.data_loader_drop_last,
-            }
-
             train_data_loader = TrainerTools().parallel.create_dataloader(
                 dataset=dataset,
                 data_loader_kwargs=data_loader_kwargs,
                 sampler_kwargs=sampler_kwargs
             )
 
+            last_ckpt_batch = 0
             batch_count_per_file = len(train_data_loader)
             batch_count_per_epoch += batch_count_per_file
 
             TrainerTools().parallel.on_epoch_start(epoch)
-            last_ckpt_batch = 0
-
             on_file_start(epoch, file)
 
             for batch, (inputs, labels) in enumerate(train_data_loader):
+                global_steps += 1
+                if global_steps < last_global_steps:
+                    skipping_train = True
+                    continue
+
+                skipping_train = False
+
                 # 是否需要更新梯度
                 if gradient_accumulation_steps > 1:
                     need_update_grad = (batch + 1) % gradient_accumulation_steps == 0 or batch == batch_count_per_file - 1
@@ -241,7 +264,8 @@ def train(
                 finally:
                     if need_update_grad and (batch - last_ckpt_batch) >= train_args.eval_batch_interval:
                         last_ckpt_batch = batch
-                        save_checkpoint(model=llama, optimizer=optimizer, lr_scheduler=lr_scheduler)
+                        save_checkpoint(model=llama, optimizer=optimizer)
+                        save_steps(global_steps=global_steps, lr_scheduler=lr_scheduler)
 
                         loss_item = loss.detach().item()
                         on_batch_end(
@@ -260,28 +284,33 @@ def train(
                     except UnboundLocalError:
                         pass
 
-            on_file_end(
+                    global_steps += 1
+
+            if not skipping_train:
+                on_file_end(
+                    eval_model,
+                    epoch,
+                    TrainerTools().tokenizer.decode_to_text(dataset.get_first()),
+                    llama_config.max_position_embeddings,
+                    file
+                )
+
+        if not skipping_train:
+            if TrainerTools().parallel.parallel_train:
+                dist.all_reduce(loss_accumulation, dist.ReduceOp.AVG)
+
+            TrainerTools().parallel.on_epoch_end(epoch)
+            save_checkpoint(model=llama, optimizer=optimizer)
+            save_steps(global_steps=global_steps, lr_scheduler=lr_scheduler)
+
+            on_epoch_end(
                 eval_model,
                 epoch,
-                TrainerTools().tokenizer.decode_to_text(dataset.get_first()),
-                llama_config.max_position_embeddings,
-                file
+                loss_accumulation.detach().item() / batch_count_per_epoch,
+                need_update_grad,
+                prompt_on_epoch,
+                llama_config.max_position_embeddings
             )
-
-        if TrainerTools().parallel.parallel_train:
-            dist.all_reduce(loss_accumulation, dist.ReduceOp.AVG)
-
-        TrainerTools().parallel.on_epoch_end(epoch)
-        save_checkpoint(model=llama, optimizer=optimizer, lr_scheduler=lr_scheduler)
-
-        on_epoch_end(
-            eval_model,
-            epoch,
-            loss_accumulation.detach().item() / batch_count_per_epoch,
-            need_update_grad,
-            prompt_on_epoch,
-            llama_config.max_position_embeddings
-        )
 
     TrainerTools().parallel.destroy()
 

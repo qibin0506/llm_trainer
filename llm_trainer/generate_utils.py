@@ -1,7 +1,8 @@
 from typing import Union, Optional
+from contextlib import nullcontext
 import torch
-from pytorch.llm.llama import KVCache
-from pytorch.llm.llm_trainer.utils import TrainConfig
+from llama import KVCache
+from .train_tools import TrainerTools
 
 
 def _suppress_warper(logits: torch.Tensor, suppress_tokens: list[int]) -> torch.Tensor:
@@ -30,7 +31,7 @@ def _temperature_warper(logits: torch.Tensor, temperature: float) -> torch.Tenso
     return logits
 
 
-def _top_k_warper(logits: torch.Tensor, k: float, device: Union[str, torch.device, int] = None) -> torch.Tensor:
+def _top_k_warper(logits: torch.Tensor, k: int, device: Union[str, torch.device, int] = None) -> torch.Tensor:
     """
     top k采样
     :param logits:
@@ -91,7 +92,7 @@ def _top_p_warper(logits: torch.Tensor, p: float, min_tokens_to_keep: int = 1) -
     return scores_processed
 
 
-def generate_text(
+def _generate_text(
         model: torch.nn.Module,
         *,
         tokens: torch.Tensor,
@@ -101,8 +102,7 @@ def generate_text(
         k: Optional[int],
         p: Optional[float],
         suppress_tokens: Optional[list[int]] = None,
-        device: Union[str, torch.device, int],
-        token_item_callback
+        device: Union[str, torch.device, int]
 ):
     """
     :param model:
@@ -114,21 +114,25 @@ def generate_text(
     :param p: top p参数，设置为None不生效top p
     :param suppress_tokens: 要抑制的tokens
     :param device:
-    :param token_item_callback:
 
     如果内容质量底，需要减小temperature、k、p
     如果temperature很大但内容单一，需要增大k、p
     """
     use_kv_cache = True
-
     enable_autocast = 'cuda' in device
+
+    if enable_autocast:
+        ctx = torch.autocast(device_type=device, dtype=TrainerTools().dtype, enabled=enable_autocast)
+    else:
+        ctx = nullcontext()
+
     kv_cache: Optional[KVCache] = None
     generate_tokens = tokens.clone()
 
     for _ in range(max_new_tokens):
         t = tokens[:, -max_position_embeddings:]
         with torch.no_grad():
-            with torch.autocast(device_type=device, dtype=TrainConfig().dtype, enabled=enable_autocast):
+            with ctx:
                 # logits (batch, seq_len, vocab_size)
                 logits, kv_cache = model(t, past_key_values=kv_cache, use_cache=use_kv_cache)
 
@@ -157,8 +161,8 @@ def generate_text(
             # 返回下标
             next_token = logits.argmax(dim=-1, keepdim=True)
 
-        if token_item_callback is not None:
-            token_item_callback(next_token)
+        # token, is_full_result
+        yield next_token, False
 
         if use_kv_cache:
             tokens = next_token
@@ -166,10 +170,72 @@ def generate_text(
         else:
             tokens = torch.cat((tokens, next_token), dim=-1)
 
-        if next_token.item() == TrainConfig().tokenizer.eot:
+        if next_token.item() == TrainerTools().tokenizer.eot:
             break
 
-    return tokens if not use_kv_cache else generate_tokens
+    # token, is_full_result
+    yield tokens if not use_kv_cache else generate_tokens, True
+
+
+def _streaming_generate(
+        model: torch.nn.Module,
+        *,
+        prompt: str,
+        max_position_embeddings: int,
+        max_new_tokens: int,
+        temperature: Optional[float] = 1.0,
+        k: Optional[int] = 50,
+        p: Optional[float] = 1.0,
+        suppress_tokens: Optional[list[int]] = None,
+        device: Union[str, torch.device, int] = None,
+):
+    model.eval()
+    device = TrainerTools().parallel.device if device is None else device
+    encoded_tokens = TrainerTools().tokenizer.encode_to_token(prompt).to(device)
+
+    generate_text_iterator = _generate_text(
+        model=model,
+        tokens=encoded_tokens,
+        max_position_embeddings=max_position_embeddings,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        k=k,
+        p=p,
+        device=device,
+        suppress_tokens=suppress_tokens
+    )
+
+    for (token, is_full_result) in generate_text_iterator:
+        yield TrainerTools().tokenizer.decode_to_text(token), is_full_result
+
+
+def streaming_generate(
+        model: torch.nn.Module,
+        *,
+        prompt: str,
+        max_position_embeddings: int,
+        max_new_tokens: int,
+        temperature: Optional[float] = 1.0,
+        k: Optional[int] = 50,
+        p: Optional[float] = 1.0,
+        suppress_tokens: Optional[list[int]] = None,
+        device: Union[str, torch.device, int] = None,
+):
+    generate_text_iterator = _streaming_generate(
+        model=model,
+        prompt=prompt,
+        max_position_embeddings=max_position_embeddings,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        k=k,
+        p=p,
+        device=device,
+        suppress_tokens=suppress_tokens
+    )
+
+    for (token, is_full_result) in generate_text_iterator:
+        if not is_full_result:
+            yield TrainerTools().tokenizer.decode_to_text(token)
 
 
 def generate(
@@ -183,31 +249,20 @@ def generate(
         p: Optional[float] = 1.0,
         suppress_tokens: Optional[list[int]] = None,
         device: Union[str, torch.device, int] = None,
-        item_callback = None,
 ):
-    model.eval()
-
-    if item_callback is not None:
-        token_item_callback = lambda token: item_callback(TrainConfig().tokenizer.decode_to_text(token))
-    else:
-        token_item_callback = None
-
-    device = TrainConfig().ddp_helper.device if device is None else device
-    encoded_tokens = TrainConfig().tokenizer.encode_to_token(prompt).to(device)
-
-    output = generate_text(
+    generate_text_iterator = _streaming_generate(
         model=model,
-        tokens=encoded_tokens,
+        prompt=prompt,
         max_position_embeddings=max_position_embeddings,
         max_new_tokens=max_new_tokens,
         temperature=temperature,
         k=k,
         p=p,
         device=device,
-        suppress_tokens=suppress_tokens,
-        token_item_callback=token_item_callback
+        suppress_tokens=suppress_tokens
     )
 
-    decoded = TrainConfig().tokenizer.decode_to_text(output)
+    for (token, is_full_result) in generate_text_iterator:
+        if is_full_result:
+            return TrainerTools().tokenizer.decode_to_text(token)
 
-    return decoded

@@ -1,45 +1,52 @@
 # llm_trainer
 
-``` python
-from llm_trainer import TrainerTools, TrainArgs, FsdpArgs, DataLoaderArgs
+```python
+from lm_trainer import TrainerTools
 from llama import LlamaConfig
-from llama import LlamaDecoderLayer
+from llm_trainer import TrainArgs, FsdpArgs, DataLoaderArgs
+from llm_trainer import train_fn
 import os
 from glob import glob
 
 def init_env():
+    #  Of the allocated memory 33.98 GiB is allocated by PyTorch,
+    #  and 8.89 GiB is reserved by PyTorch but unallocated.
+    #  If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.
+    #  See documentation for Memory Management
+    #  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
     os.environ['TOKENIZERS_TYPE'] = '1'
     os.environ['TOKEN_DIR'] = './tokens/'
 
-    os.environ['SAVE_DIR'] = './log/'
+    os.environ['SAVE_DIR'] = './'
 
     os.environ['PARALLEL_TYPE'] = 'fsdp'  # or 'ddp'
 
     os.environ['ENABLE_DCP'] = '1'
     os.environ['CHECKPOINT_NAME'] = 'ckpt.pth'
+    os.environ['EVAL_CHECKPOINT_NAME'] = 'eval_ckpt.pth'
     os.environ['DCP_DIR'] = 'ckpt_dir'
+    # os.environ['CHECKPOINT_DIR'] = 'ckpt_dir'
 
 
 def get_config():
     return LlamaConfig(
         vocab_size=TrainerTools().tokenizer.vocab_size,
-        hidden_size=2048,
-        intermediate_size=11008,
-        num_hidden_layers=16,
-        num_attention_heads=16,
+        hidden_size=1024,
+        intermediate_size=4096,
+        num_hidden_layers=22,
+        num_attention_heads=32,
         num_key_value_heads=8,
-        max_position_embeddings=512
+        max_position_embeddings=1024,
+        num_experts=6,
+        slots_per_expert=1
     )
 
 
 def get_train_config(is_sft: bool):
-    desire_batch_size = 32
-    real_batch_size = 8
-    assert desire_batch_size % real_batch_size == 0
-    gradient_accumulation_steps = desire_batch_size // real_batch_size
-
     train_args = TrainArgs(
         n_epochs=1,
         batch_size=1,
@@ -47,7 +54,7 @@ def get_train_config(is_sft: bool):
         is_sft=False,
         all_data_size=64131,
         all_files=glob('./data/pretrain/*.pkl'),
-        gradient_accumulation_steps=gradient_accumulation_steps,
+        gradient_accumulation_steps=32,
         fsdp_args=FsdpArgs(
             transformer_layer_cls={ LlamaDecoderLayer },
             wrap_policy_num_params=20000,
@@ -64,17 +71,28 @@ def get_train_config(is_sft: bool):
 
     if is_sft:
         train_args.n_epochs = 2
-        train_args.batch_size = real_batch_size
+        train_args.batch_size = 5
         train_args.is_sft = True
         train_args.all_data_size = 10000
         train_args.all_files = glob('./data/train/sft.pkl')
     else:
-        train_args.n_epochs = 1
-        train_args.batch_size = real_batch_size
+        train_args.n_epochs =1
+        train_args.batch_size = 6
         train_args.is_sft = False
-        train_args.all_data_size = 806244
-        train_args.all_files = glob('./data/skypile/raw/*.pkl')
+        train_args.all_data_size = 70073
+        train_args.all_files = glob('./data/pretrain/pretrain_chunks.pkl')
 
     return train_args
+
+
+
+if __name__ == '__main__':
+    init_env()
+
+    train_fn(
+        train_args=get_train_args(is_pretrain=True),
+        prompt_on_batch="半瓶香水 涩涩的香味\n往事在泪水中回味\n",
+        prompt_on_epoch="某年某月的某一天\n就象一张破碎的脸\n"
+    )
 
 ```

@@ -4,14 +4,14 @@ from transformers import Qwen2TokenizerFast
 from transformers import AddedToken
 import torch
 
-TOKEN_TYPE_BERT = 0
-TOKEN_TYPE_QWEN = 1
+TOKEN_TYPE_BERT = 'bert'
+TOKEN_TYPE_QWEN = 'qwen'
 
 AVAILABLE_TOKEN_TYPES = [TOKEN_TYPE_BERT, TOKEN_TYPE_QWEN]
 
 
 class Tokenizer:
-    def __init__(self, token_type: int = TOKEN_TYPE_QWEN):
+    def __init__(self, token_type: str = TOKEN_TYPE_QWEN):
         super().__init__()
 
         assert token_type in AVAILABLE_TOKEN_TYPES, 'token type is unavailable'

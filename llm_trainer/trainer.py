@@ -319,6 +319,7 @@ def train(
 
 """
 todo: 
+0. 处理异常重启
 1. 调研fsdp2 没有太多资料
 2. 蒸馏 完成
 3. Yarn和phi3的Phi3LongRoPEScaledRotaryEmbedding调研

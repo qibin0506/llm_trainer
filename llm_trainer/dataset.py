@@ -9,9 +9,9 @@ class BaseDataset(Dataset):
 
 
 class LLMDataset(BaseDataset):
-    def __init__(self, ctx_len, file_path):
+    def __init__(self, file_path):
         super().__init__()
-        self.ctx_len = ctx_len
+        # self.ctx_len = ctx_len
 
         self.tokens = []
         with open(file_path, 'rb') as f:
@@ -23,10 +23,10 @@ class LLMDataset(BaseDataset):
 
     def __getitem__(self, item):
         inputs = self.tokens[item]
-        inputs = inputs[:self.ctx_len]
+        # inputs = inputs[:self.ctx_len]
         return torch.tensor(inputs).long()
 
     def get_first(self):
         inputs = self.tokens[0]
-        inputs = inputs[:self.ctx_len]
+        # inputs = inputs[:self.ctx_len]
         return torch.tensor(inputs).long()

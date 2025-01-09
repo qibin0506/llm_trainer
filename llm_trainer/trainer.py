@@ -175,7 +175,7 @@ class Trainer:
         return False
 
     def _create_dataset(self, file) -> BaseDataset:
-        return LLMDataset(self.train_args.llama_config.max_position_embeddings, file)
+        return LLMDataset(file)
 
     def _calc_loss(self, inputs, attention_mask, logits, labels):
         # calc loss

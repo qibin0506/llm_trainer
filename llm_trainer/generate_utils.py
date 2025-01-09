@@ -130,6 +130,7 @@ def _generate_text(
     generate_tokens = tokens.clone()
 
     for _ in range(max_new_tokens):
+        # 是否需要截取？？
         t = tokens[:, -max_position_embeddings:]
         with torch.no_grad():
             with ctx:

@@ -221,7 +221,7 @@ def streaming_generate(
         suppress_tokens: Optional[list[int]] = None,
         device: Union[str, torch.device, int] = None,
 ):
-    generate_text_iterator = _streaming_generate(
+    text_iterator = _streaming_generate(
         model=model,
         prompt=prompt,
         max_position_embeddings=max_position_embeddings,
@@ -233,9 +233,9 @@ def streaming_generate(
         suppress_tokens=suppress_tokens
     )
 
-    for (token, is_full_result) in generate_text_iterator:
+    for (text, is_full_result) in text_iterator:
         if not is_full_result:
-            yield TrainerTools().tokenizer.decode_to_text(token)
+            yield text
 
 
 def generate(
@@ -250,7 +250,7 @@ def generate(
         suppress_tokens: Optional[list[int]] = None,
         device: Union[str, torch.device, int] = None,
 ):
-    generate_text_iterator = _streaming_generate(
+    text_iterator = _streaming_generate(
         model=model,
         prompt=prompt,
         max_position_embeddings=max_position_embeddings,
@@ -262,7 +262,7 @@ def generate(
         suppress_tokens=suppress_tokens
     )
 
-    for (token, is_full_result) in generate_text_iterator:
+    for (text, is_full_result) in text_iterator:
         if is_full_result:
-            return TrainerTools().tokenizer.decode_to_text(token)
+            return text
 

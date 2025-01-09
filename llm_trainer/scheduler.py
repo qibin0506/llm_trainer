@@ -17,7 +17,6 @@ class LRScheduler:
         raise NotImplementedError()
 
 
-
 class CosineAnnealingWarmupLRScheduler(LRScheduler):
     def __init__(
             self,
@@ -77,6 +76,7 @@ class CosineAnnealingWarmupLRScheduler(LRScheduler):
 
 
 class NoneLRScheduler(LRScheduler):
+
     @property
     def cur_steps(self):
         return -1

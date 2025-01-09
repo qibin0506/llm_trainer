@@ -33,7 +33,8 @@ class Tokenizer:
                 merges_file=f"{os.environ['TOKEN_DIR']}qwen_merges.txt",
                 unk_token=self.unk_text,
                 eos_token=self.eot_text,
-                pad_token=self.pad_text)
+                pad_token=self.pad_text
+            )
             self.eot = self.tokenizer.eos_token_id
             self.pad = self.tokenizer.pad_token_id
             self.unk = self.tokenizer.unk_token_id

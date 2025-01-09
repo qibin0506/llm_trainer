@@ -123,8 +123,6 @@ class TrainArgs:
                 每个batch的大小
             llama_config (`LlamaConfig`):
                 llama模型的配置
-            is_sft (`bool`):
-                是否sft训练
             all_data_size (`int`):
                 所有训练数据大小
             all_files (`list`):
@@ -149,7 +147,6 @@ class TrainArgs:
             batch_size: int,
             *,
             llama_config: LlamaConfig,
-            is_sft: bool,
             all_data_size: int,
             all_files: Optional[list[any]] = None,
             gradient_accumulation_steps: int = 0,
@@ -162,7 +159,6 @@ class TrainArgs:
         self.n_epochs = n_epochs
         self.batch_size = batch_size
         self.llama_config = llama_config
-        self.is_sft = is_sft
         self.all_data_size = all_data_size
         self.all_files = all_files
         self.gradient_accumulation_steps = gradient_accumulation_steps

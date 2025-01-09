@@ -65,9 +65,12 @@ def load_dcp(model: nn.Module, optimizer: Optional[Optimizer] = None):
                 optimizer.load_state_dict(state_dict["optim_state_dict"])
 
 def convert_dcp_to_pth(pth_path: str):
-    # convert dcp model to torch.save (assumes checkpoint was generated as above)
-    dcp_to_torch_save(os.environ.get('DCP_DIR', DEFAULT_DCP_DIR), pth_path)
+    dcp_path = os.environ.get('DCP_DIR', DEFAULT_DCP_DIR)
+    if os.path.exists(dcp_path):
+        # convert dcp model to torch.save (assumes checkpoint was generated as above)
+        dcp_to_torch_save(dcp_path, pth_path)
 
 def convert_pth_to_dcp(pth_path: str):
-    # converts the torch.save model back to DCP
-    torch_save_to_dcp(pth_path, os.environ.get('DCP_DIR', DEFAULT_DCP_DIR))
+    if os.path.exists(pth_path):
+        # converts the torch.save model back to DCP
+        torch_save_to_dcp(pth_path, os.environ.get('DCP_DIR', DEFAULT_DCP_DIR))

@@ -1,8 +1,7 @@
-from .trainer import train
+from .trainer import Trainer
+from .sft_trainer import SFTTrainer
 from .train_tools import TrainerTools
 from .generate_utils import generate, streaming_generate
 from .train_args import TrainArgs, FsdpArgs, DataLoaderArgs, LrSchedulerArgs, KDArgs
 from .checkpoint import load_checkpoint
 from .dcp import load_dcp, convert_dcp_to_pth
-
-train_fn = train

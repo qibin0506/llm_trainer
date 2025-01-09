@@ -62,14 +62,16 @@ def load_checkpoint(
             # load_dcp(model, optimizer)
             pth_name = os.environ.get('EVAL_CHECKPOINT_NAME', checkpoint_name)
             convert_dcp_to_pth(pth_name)
-            ckpt = torch.load(pth_name, map_location=device, weights_only=True)
-            model.load_state_dict(ckpt['app']['model_state_dict'])
-            if optimizer is not None:
-                optimizer.load_state_dict(ckpt['app']['optim_state_dict'])
 
-            # 使用完删除
             if os.path.exists(pth_name):
+                ckpt = torch.load(pth_name, map_location=device, weights_only=True)
+                model.load_state_dict(ckpt['app']['model_state_dict'])
+                if optimizer is not None:
+                    optimizer.load_state_dict(ckpt['app']['optim_state_dict'])
+
+                # 使用完删除
                 os.remove(pth_name)
+
     else:
         if os.path.exists(checkpoint_name):
             # 未经过测试，else的逻辑经过测试在fsdp下也没问题

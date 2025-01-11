@@ -12,7 +12,7 @@ def set_seed(seed=42):
     torch.cuda.manual_seed_all(seed)
 
 
-def pretrain_padding_fn(batch_data):
+def pretrain_collate_fn(batch_data):
     inputs = pad_sequence(batch_data, batch_first=True, padding_value=TrainerTools().tokenizer.pad)
     # crossEntropy默认的ignore_index是-100
     labels = pad_sequence(batch_data, batch_first=True, padding_value=-100)
@@ -20,7 +20,7 @@ def pretrain_padding_fn(batch_data):
     return inputs, labels
 
 
-def sft_padding_fn(batch_data):
+def sft_collate_fn(batch_data):
     """
      如果是sft，则不计算prompt部分的loss, 例如：
     logits: [USER]:你好[BOT]:我好[SEP]
@@ -33,7 +33,7 @@ def sft_padding_fn(batch_data):
         * [BOT]后的:暂时不考虑，后续可以把prompt里的：去掉
         * mask=-100和pad一样
     """
-    inputs, labels = pretrain_padding_fn(batch_data)
+    inputs, labels = pretrain_collate_fn(batch_data)
     batch_size = len(labels)
     batch_bot_idx = torch.nonzero(torch.eq(labels, TrainerTools().bot_token), as_tuple=True)[1]
 

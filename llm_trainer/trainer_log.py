@@ -89,23 +89,6 @@ def on_file_start(epoch, file_name):
         log(f"epoch: {epoch}, start train {file_name}\n", f'{_get_save_dir()}log.txt')
 
 
-def on_file_end(
-        eval_model,
-        epoch,
-        prompt,
-        max_position_embeddings,
-        file_name
-):
-    if TrainerTools().parallel.is_main_process:
-        _submit_gen_task(
-            eval_model,
-            tag=f'sign:file/epoch:{epoch}',
-            prompt=prompt,
-            max_position_embeddings=max_position_embeddings
-        )
-
-        log(f"epoch: {epoch}, finish train {file_name}\n", f'{_get_save_dir()}log.txt')
-
 def on_exception(e, epoch, batch):
     if isinstance(e, torch.OutOfMemoryError):
         save_dir = _get_save_dir()

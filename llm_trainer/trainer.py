@@ -4,6 +4,7 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 import torch.distributed as dist
+from torch.utils.data import Dataset
 from llama import LlamaModel
 
 from .train_args import TrainArgs
@@ -11,7 +12,7 @@ from .parallel_fsdp import FsdpParallel
 from .train_tools import TrainerTools
 from .loss import LMLoss, KDLoss
 from .log import log
-from .dataset import BaseDataset, LLMDataset
+from .dataset import TextDataset
 
 from .scheduler import (
     LRScheduler,
@@ -27,8 +28,7 @@ from .checkpoint import (
 )
 from .utils import (
     set_seed,
-    pretrain_padding_fn,
-    sft_padding_fn,
+    pretrain_collate_fn,
 )
 
 from .trainer_log import (
@@ -36,7 +36,6 @@ from .trainer_log import (
     on_exception,
     on_epoch_end,
     on_file_start,
-    on_file_end,
 )
 
 
@@ -158,7 +157,7 @@ class Trainer:
         data_loader_kwargs = {
             "batch_size": self.train_args.batch_size,
             "pin_memory": dataloader_args.data_loader_pin_memory,
-            "collate_fn": sft_padding_fn if self._is_sft else pretrain_padding_fn,
+            "collate_fn": pretrain_collate_fn,
             "num_workers": dataloader_args.data_loader_num_workers,
             "shuffle": dataloader_args.data_loader_shuffle,
             "drop_last": dataloader_args.data_loader_drop_last,
@@ -170,12 +169,9 @@ class Trainer:
 
         return parallel_kwargs, data_loader_kwargs, sampler_kwargs
 
-    @property
-    def _is_sft(self) -> bool:
-        return False
-
-    def _create_dataset(self, file) -> BaseDataset:
-        return LLMDataset(file)
+    def _create_dataset(self, file_path) -> Dataset:
+        max_position_embeddings = self.train_args.llama_config.max_position_embeddings
+        return TextDataset(file_path, max_position_embeddings, max_position_embeddings)
 
     def _calc_loss(self, inputs, attention_mask, logits, labels):
         # calc loss
@@ -211,15 +207,6 @@ class Trainer:
             self.train_args.llama_config.max_position_embeddings
         )
 
-    def _on_file_end(self, epoch: int, prompt: str, file: str):
-        on_file_end(
-            self.eval_model,
-            epoch,
-            prompt,
-            self.train_args.llama_config.max_position_embeddings,
-            file
-        )
-
     def _on_epoch_end(self, epoch: int, loss, need_update_grad: bool):
         on_epoch_end(
             self.eval_model,
@@ -240,8 +227,8 @@ class Trainer:
             loss_accumulation = torch.tensor(0.0, device=TrainerTools().parallel.device)
             self.train_model.train()
 
-            for file in self.train_args.all_files:
-                dataset = self._create_dataset(file)
+            for file_path in self.train_args.all_files:
+                dataset = self._create_dataset(file_path)
                 train_data_loader = TrainerTools().parallel.create_dataloader(
                     dataset=dataset,
                     data_loader_kwargs=self.data_loader_kwargs,
@@ -253,7 +240,7 @@ class Trainer:
                 batch_count_per_epoch += batch_count_per_file
 
                 TrainerTools().parallel.on_epoch_start(epoch)
-                on_file_start(epoch, file)
+                on_file_start(epoch, file_path)
 
                 for batch, (inputs, labels) in enumerate(train_data_loader):
                     global_steps += 1
@@ -331,13 +318,6 @@ class Trainer:
                             pass
 
                         global_steps += 1
-
-                if not skipping_train:
-                    self._on_file_end(
-                        epoch,
-                        TrainerTools().tokenizer.decode_to_text(dataset.get_first()),
-                        file
-                    )
 
             if not skipping_train:
                 if TrainerTools().parallel.parallel_train:

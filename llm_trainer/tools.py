@@ -24,9 +24,8 @@ class TrainerTools:
             self.tokenizer = Tokenizer(os.environ.get('TOKENIZERS_TYPE', 'bert'))
             self.use_amp = 'cuda' in self.parallel.device
             self.dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
-            self.bot_token = self.tokenizer.encode_to_token('[BOT]', unsqueeze=False, covert_tensor=False)[0]
 
-            log(f'use_amp={self.use_amp}, dtype={self.dtype}')
+            log(f'word_size={self.parallel.world_size}, use_amp={self.use_amp}, dtype={self.dtype}')
 
     def __new__(cls, *args, **kwargs):
         if not hasattr(TrainerTools, "_instance"):

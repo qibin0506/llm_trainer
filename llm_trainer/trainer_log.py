@@ -1,6 +1,7 @@
 import os
-import gc
 import threading
+import time
+
 import torch
 
 from .generate_utils import generate
@@ -99,10 +100,9 @@ def on_exception(e, epoch, batch):
             f'{save_dir}log.txt'
         )
 
-        torch.cuda.empty_cache()
-        gc.collect()
-    else:
-        raise e
+        time.sleep(1)
+
+    raise e
 
 
 def on_epoch_end(

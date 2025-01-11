@@ -35,7 +35,7 @@ def sft_collate_fn(batch_data):
     """
     inputs, labels = pretrain_collate_fn(batch_data)
     batch_size = len(labels)
-    batch_bot_idx = torch.nonzero(torch.eq(labels, TrainerTools().bot_token), as_tuple=True)[1]
+    batch_bot_idx = torch.nonzero(torch.eq(labels, TrainerTools().tokenizer.bot), as_tuple=True)[1]
 
     for batch in range(batch_size):
         bot_idx = batch_bot_idx[batch].item() + 1

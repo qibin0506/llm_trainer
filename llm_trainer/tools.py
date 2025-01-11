@@ -33,3 +33,30 @@ class TrainerTools:
             TrainerTools._instance = object.__new__(cls)
 
         return TrainerTools._instance
+
+
+def estimate_data_size(
+        all_files: list[str],
+        max_position_embeddings: int,
+        is_sft: bool
+) -> int:
+    """
+    估计数据集大小
+    """
+    from .dataset import TextDataset, LineByLineTextDataset
+    data_size = 0
+
+    if not is_sft:
+        for file_path in all_files:
+            dataset = TextDataset(
+                file_path,
+                max_position_embeddings,
+                max_position_embeddings
+            )
+            data_size += len(dataset)
+    else:
+        for file_path in all_files:
+            dataset = LineByLineTextDataset(file_path)
+            data_size += len(dataset)
+
+    return data_size

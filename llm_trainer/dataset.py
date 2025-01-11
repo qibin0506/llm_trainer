@@ -32,15 +32,14 @@ class LineByLineTextDataset(Dataset):
     def __init__(self, file_path):
         super().__init__()
 
-        self.tokens = []
+        self.input_ids = []
         with open(file_path, 'rb') as f:
             tokens = pickle.load(f)
-            self.tokens.extend(tokens)
+            self.input_ids = tokens
 
     def __len__(self):
-        return len(self.tokens)
+        return len(self.input_ids)
 
     def __getitem__(self, item):
-        inputs = self.tokens[item]
         # inputs = inputs[:self.ctx_len]
-        return torch.tensor(inputs).long()
+        return torch.tensor(self.input_ids[item]).long()

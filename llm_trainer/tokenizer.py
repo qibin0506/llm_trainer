@@ -49,14 +49,14 @@ class Tokenizer:
         self.vocab_size = len(self.tokenizer)
 
     def encode_to_token(self, text: str, unsqueeze=True, covert_tensor=True):
-        # [1, 2]
+        # [x,x,x]
         encoded = self.tokenizer.encode(text, add_special_tokens=False)
 
         if unsqueeze:
-            # tensor: [[1, 2]]
+            # tensor: [[x,x,x]]
             return torch.tensor(encoded).long().unsqueeze(0)
         else:
-            # tensor: [1, 2]
+            # tensor: # [x,x,x]
             if covert_tensor:
                 return torch.tensor(encoded).long()
 

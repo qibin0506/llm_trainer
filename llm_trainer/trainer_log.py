@@ -4,7 +4,7 @@ import threading
 import torch
 
 from .generate_utils import generate
-from .train_tools import TrainerTools
+from .tools import TrainerTools
 from .checkpoint import load_checkpoint
 from .log import log
 

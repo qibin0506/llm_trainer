@@ -107,7 +107,7 @@ class Parallel:
         return DataLoader(dataset=dataset, **data_loader_kwargs)
 
     def on_epoch_start(self, epoch):
-        if self._sampler is not None:
+        if self._sampler:
             self._sampler.set_epoch(epoch)
 
     def on_epoch_end(self, epoch):

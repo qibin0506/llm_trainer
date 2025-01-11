@@ -140,18 +140,18 @@ def _generate_text(
         # (batch, vocab_size)
         logits = logits[:, -1, :]
         # 抑制特殊token输出
-        if suppress_tokens is not None and len(suppress_tokens) != 0:
+        if suppress_tokens and len(suppress_tokens) != 0:
             logits = _suppress_warper(logits, suppress_tokens)
 
         multinomial = False
-        if temperature is not None and temperature > 0:
+        if temperature and temperature > 0:
             multinomial = True
             logits = _temperature_warper(logits, temperature)
 
-        if k is not None and k != 0:
+        if k and k != 0:
             logits = _top_k_warper(logits, k, device)
 
-        if p is not None and p < 1:
+        if p and p < 1:
             logits = _top_p_warper(logits, p)
 
         if multinomial:
@@ -191,7 +191,7 @@ def _streaming_generate(
         device: Union[str, torch.device, int] = None,
 ):
     model.eval()
-    device = TrainerTools().parallel.device if device is None else device
+    device = TrainerTools().parallel.device if not device else device
     encoded_tokens = TrainerTools().tokenizer.encode_to_token(prompt).to(device)
 
     generate_text_iterator = _generate_text(

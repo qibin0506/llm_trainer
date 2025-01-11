@@ -62,7 +62,7 @@ class Trainer:
         self.eval_model: Optional[nn.Module] = self._init_eval_model()
 
         self.criterion = LMLoss()
-        self.kd_loss = KDLoss() if train_args.kd_args is not None else None
+        self.kd_loss = KDLoss() if train_args.kd_args else None
 
         self.ctx = torch.autocast(
             device_type=TrainerTools().parallel.device_type,
@@ -144,7 +144,7 @@ class Trainer:
         return NoneLRScheduler()
 
     def _convert_train_args(self) -> Tuple[dict, dict, dict]:
-        if isinstance(TrainerTools().parallel, FsdpParallel) and self.train_args.fsdp_args is not None:
+        if isinstance(TrainerTools().parallel, FsdpParallel) and self.train_args.fsdp_args:
             parallel_kwargs = {
                 'transformer_layer_cls': self.train_args.fsdp_args.transformer_layer_cls,
                 'wrap_policy_num_params': self.train_args.fsdp_args.wrap_policy_num_params,
@@ -182,7 +182,7 @@ class Trainer:
         loss = self.criterion(logits, labels)
 
         # 知识蒸馏loss
-        if self.kd_loss is not None:
+        if self.kd_loss:
             teacher_logits = self.train_args.kd_args.teacher_logits_provider(inputs, attention_mask)
             distil_loss = self.kd_loss(logits, teacher_logits, labels)
             loss = (1 - self.train_args.kd_args.kd_coef) * loss + self.train_args.kd_args.kd_coef * distil_loss
@@ -272,8 +272,7 @@ class Trainer:
                         need_update_grad = True
 
                     try:
-                        inputs, labels = inputs.to(TrainerTools().parallel.device), labels.to(
-                            TrainerTools().parallel.device)
+                        inputs, labels = inputs.to(TrainerTools().parallel.device), labels.to(TrainerTools().parallel.device)
                         attention_mask = inputs != TrainerTools().tokenizer.pad
 
                         if TrainerTools().parallel.parallel_train:
@@ -357,9 +356,9 @@ class Trainer:
 
 """
 todo: 
-0. 处理异常重启
-1. 调研fsdp2 没有太多资料
-2. 蒸馏 完成
+0. 实现按照token数据确定batch大小，不固定batch的方案
+1. 处理异常重启
+2. 调研fsdp2 没有太多资料
 3. Yarn和phi3的Phi3LongRoPEScaledRotaryEmbedding调研
 4. MLA调研
 5. DPO调研

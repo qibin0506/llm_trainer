@@ -33,7 +33,7 @@ def save_checkpoint(
                     checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)
                     ckpt = {'model_state_dict': model.state_dict()}
 
-                    if optimizer is not None:
+                    if optimizer:
                         ckpt.update({'optim_state_dict': optimizer.state_dict()})
 
                     torch.save(ckpt, checkpoint_name)
@@ -42,7 +42,7 @@ def save_checkpoint(
                 checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)
                 ckpt = {'model_state_dict': TrainerTools().parallel.raw_model.state_dict()}
 
-                if optimizer is not None:
+                if optimizer:
                     ckpt.update({'optim_state_dict': optimizer.state_dict()})
 
                 torch.save(ckpt, checkpoint_name)
@@ -66,7 +66,7 @@ def load_checkpoint(
             if os.path.exists(pth_name):
                 ckpt = torch.load(pth_name, map_location=device, weights_only=True)
                 model.load_state_dict(ckpt['app']['model_state_dict'])
-                if optimizer is not None:
+                if optimizer:
                     optimizer.load_state_dict(ckpt['app']['optim_state_dict'])
 
                 # 使用完删除
@@ -80,13 +80,13 @@ def load_checkpoint(
                     state_dict = torch.load(checkpoint_name, weights_only=True, map_location=device)
                     model.load_state_dict(state_dict['model_state_dict'])
 
-                    if optimizer is not None:
+                    if optimizer:
                         optimizer.load_state_dict(state_dict['optim_state_dict'])
             else:
                 state_dict = torch.load(checkpoint_name, weights_only=True, map_location=device)
                 model.load_state_dict(state_dict['model_state_dict'])
 
-                if optimizer is not None:
+                if optimizer:
                     optimizer.load_state_dict(state_dict['optim_state_dict'])
 
 

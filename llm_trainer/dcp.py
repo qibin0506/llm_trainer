@@ -50,7 +50,7 @@ def load_dcp(model: nn.Module, optimizer: Optional[Optimizer] = None):
         else:
             state_dict = {"model_state_dict": model.state_dict()}
 
-            if optimizer is not None:
+            if optimizer:
                 state_dict.update({'optim_state_dict': optimizer.state_dict()})
 
             # since no progress group is initialized, DCP will disable any collectives.
@@ -61,7 +61,7 @@ def load_dcp(model: nn.Module, optimizer: Optional[Optimizer] = None):
             )
 
             model.load_state_dict(state_dict["model_state_dict"])
-            if optimizer is not None:
+            if optimizer:
                 optimizer.load_state_dict(state_dict["optim_state_dict"])
 
 def convert_dcp_to_pth(pth_path: str):

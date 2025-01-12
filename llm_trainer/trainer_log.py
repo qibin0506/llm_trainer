@@ -59,24 +59,28 @@ def _submit_gen_task(eval_model: torch.nn.Module, tag, prompt, max_position_embe
     # Process(target=_eval_task, args=(eval_model, tag, prompt, max_position_embeddings, True)).start()
 
 
+def log_loss(
+        epoch: int,
+        batch: int,
+        batch_count: int,
+        loss
+):
+    if TrainerTools().parallel.is_main_process:
+        save_dir = _get_save_dir()
+        log(f"epoch: {epoch}, batch: {batch}/{batch_count}, loss: {loss}")
+        log(
+            f"epoch: {epoch}, batch: {batch}/{batch_count}, loss: {loss}\n",
+            f'{save_dir}log.txt'
+        )
+
 def on_batch_end(
         eval_model,
         epoch,
         batch,
-        batch_count,
-        loss,
-        need_update_grad,
         prompt,
         max_position_embeddings
 ):
     if TrainerTools().parallel.is_main_process:
-        save_dir = _get_save_dir()
-        log(f"epoch: {epoch}, batch: {batch}/{batch_count}")
-        log(
-            f"epoch: {epoch}, batch: {batch}/{batch_count}, loss: {loss}, need_update_grad: {need_update_grad}\n",
-            f'{save_dir}log.txt'
-        )
-
         _submit_gen_task(
             eval_model,
             tag=f'sign:batch/epoch:{epoch}/batch:{batch}',
@@ -108,21 +112,10 @@ def on_exception(e, epoch, batch):
 def on_epoch_end(
         eval_model,
         epoch,
-        loss,
-        need_update_grad,
         prompt,
         max_position_embeddings
 ):
     if TrainerTools().parallel.is_main_process:
-
-        # test_loss = test_loop(model, test_data_loader)
-        save_dir = _get_save_dir()
-        log(f'train_loss: {loss}')
-        log(
-            f"epoch: {epoch}, loss: {loss}, need_update_grad:{need_update_grad}\n",
-            f'{save_dir}log.txt'
-        )
-
         _submit_gen_task(
             eval_model,
             tag=f'sign:epoch/epoch:{epoch}',

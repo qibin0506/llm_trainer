@@ -36,6 +36,7 @@ from .trainer_log import (
     on_exception,
     on_epoch_end,
     on_file_start,
+    log_loss
 )
 
 
@@ -185,6 +186,15 @@ class Trainer:
 
         return loss
 
+    def _log_loss(
+            self,
+            epoch: int,
+            batch: int,
+            batch_count: int,
+            loss
+    ):
+        log_loss(epoch, batch, batch_count, loss)
+
     def _on_exception(self, e: Exception, epoch: int, batch: int):
         on_exception(e, epoch, batch)
 
@@ -192,27 +202,19 @@ class Trainer:
             self,
             epoch: int,
             batch: int,
-            batch_count_per_file: int,
-            loss,
-            need_update_grad: bool
     ):
         on_batch_end(
             self.eval_model,
             epoch,
             batch,
-            batch_count_per_file,
-            loss,
-            need_update_grad,
             self.prompt_on_batch,
             self.train_args.llama_config.max_position_embeddings
         )
 
-    def _on_epoch_end(self, epoch: int, loss, need_update_grad: bool):
+    def _on_epoch_end(self, epoch: int):
         on_epoch_end(
             self.eval_model,
             epoch,
-            loss,
-            need_update_grad,
             self.prompt_on_epoch,
             self.train_args.llama_config.max_position_embeddings
         )
@@ -220,11 +222,10 @@ class Trainer:
     def train(self):
         gradient_accumulation_steps = self.train_args.gradient_accumulation_steps
         global_steps = 0
+        loss_accumulation = 0.0
         skipping_train = False
 
         for epoch in range(self.train_args.n_epochs):
-            batch_count_per_epoch = 0
-            loss_accumulation = torch.tensor(0.0, device=TrainerTools().parallel.device)
             self.train_model.train()
 
             for file_path in self.train_args.all_files:
@@ -237,7 +238,6 @@ class Trainer:
 
                 last_ckpt_batch = 0
                 batch_count_per_file = len(train_data_loader)
-                batch_count_per_epoch += batch_count_per_file
 
                 TrainerTools().parallel.on_epoch_start(epoch)
                 on_file_start(epoch, file_path)
@@ -253,8 +253,6 @@ class Trainer:
                     # 是否需要更新梯度
                     if gradient_accumulation_steps > 1:
                         need_update_grad = (batch + 1) % gradient_accumulation_steps == 0 or batch == batch_count_per_file - 1
-                        if TrainerTools().parallel.is_main_process and need_update_grad:
-                            log(f"need_update_grad: {batch}")
                     else:
                         need_update_grad = True
 
@@ -274,9 +272,16 @@ class Trainer:
                             # calc loss
                             loss = self._calc_loss(inputs, attention_mask, logits, labels)
 
+                        if gradient_accumulation_steps > 1:
+                            loss = loss / gradient_accumulation_steps
+
+                        loss_accumulation += loss.detach()
                         self.scalar.scale(loss).backward()
 
                         if need_update_grad:
+                            if TrainerTools().parallel.parallel_train:
+                                dist.all_reduce(loss_accumulation, dist.ReduceOp.AVG)
+
                             # clip grad
                             self.scalar.unscale_(self.optimizer)
 
@@ -284,53 +289,36 @@ class Trainer:
                                 torch.nn.utils.clip_grad_norm_(self.train_model.parameters(), 1.0)
 
                             self.lr_scheduler.step()
-
                             self.scalar.step(self.optimizer)
                             # optimizer.step()
                             self.scalar.update()
                             # flush the gradients as soon as we can, no need for this memory anymore
                             self.optimizer.zero_grad(set_to_none=True)
-
                             TrainerTools().parallel.synchronize()
 
-                        loss_accumulation += loss.detach()
-
+                            self._log_loss(epoch, batch, batch_count_per_file, loss_accumulation.item())
+                            # reset to default
+                            loss_accumulation = 0.0
                     except Exception as e:
                         self._on_exception(e, epoch, batch)
                     finally:
                         if need_update_grad and (batch - last_ckpt_batch) >= self.train_args.eval_batch_interval:
-                            last_ckpt_batch = batch
                             save_checkpoint(model=self.train_model, optimizer=self.optimizer)
                             save_steps(global_steps=global_steps, lr_scheduler=self.lr_scheduler)
-
-                            loss_item = loss.detach().item()
-                            self._on_batch_end(
-                                epoch,
-                                batch,
-                                batch_count_per_file,
-                                loss_item * gradient_accumulation_steps if gradient_accumulation_steps > 1 else loss_item,
-                                need_update_grad
-                            )
+                            last_ckpt_batch = batch
+                            self._on_batch_end(epoch, batch)
 
                         try:
                             del loss
                         except UnboundLocalError:
                             pass
 
-                        global_steps += 1
-
+            # end epoch
             if not skipping_train:
-                if TrainerTools().parallel.parallel_train:
-                    dist.all_reduce(loss_accumulation, dist.ReduceOp.AVG)
-
-                TrainerTools().parallel.on_epoch_end(epoch)
                 save_checkpoint(model=self.train_model, optimizer=self.optimizer)
                 save_steps(global_steps=global_steps, lr_scheduler=self.lr_scheduler)
-                self._on_epoch_end(
-                    epoch,
-                    loss_accumulation.detach().item() / batch_count_per_epoch,
-                    need_update_grad
-                )
+                TrainerTools().parallel.on_epoch_end(epoch)
+                self._on_epoch_end(epoch)
 
         TrainerTools().parallel.destroy()
 

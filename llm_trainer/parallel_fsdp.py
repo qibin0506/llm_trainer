@@ -19,6 +19,7 @@ from torch.distributed.fsdp.fully_sharded_data_parallel import (
 from torch.distributed.fsdp.wrap import (
     size_based_auto_wrap_policy,
     transformer_auto_wrap_policy,
+    always_wrap_policy,
     enable_wrap,
     wrap,
 )

@@ -43,26 +43,30 @@ def save_dcp(model: nn.Module, optimizer: Optimizer):
 def load_dcp(model: nn.Module, optimizer: Optional[Optimizer] = None):
     checkpoint_id = os.environ.get('DCP_DIR', DEFAULT_DCP_DIR)
     if os.path.exists(checkpoint_id):
-        if isinstance(model, FSDP):
-            state_dict = {'app': AppState(model, optimizer)}
-            # AppState帮助加载到state_dict中, 然后加载到model中
-            dcp.load(state_dict=state_dict, checkpoint_id=checkpoint_id)
-        else:
-            state_dict = {"model_state_dict": model.state_dict()}
+        state_dict = {'app': AppState(model, optimizer)}
+        # AppState帮助加载到state_dict中, 然后加载到model中
+        dcp.load(state_dict=state_dict, checkpoint_id=checkpoint_id)
 
-            if optimizer:
-                state_dict.update({'optim_state_dict': optimizer.state_dict()})
-
-            # since no progress group is initialized, DCP will disable any collectives.
-            # 加载到state_dict中，然后通过model.load_state_dict加载到model中
-            dcp.load(
-                state_dict=state_dict,
-                checkpoint_id=checkpoint_id,
-            )
-
-            model.load_state_dict(state_dict["model_state_dict"])
-            if optimizer:
-                optimizer.load_state_dict(state_dict["optim_state_dict"])
+        # if isinstance(model, FSDP):
+        #     state_dict = {'app': AppState(model, optimizer)}
+        #     # AppState帮助加载到state_dict中, 然后加载到model中
+        #     dcp.load(state_dict=state_dict, checkpoint_id=checkpoint_id)
+        # else:
+        #     state_dict = {"model_state_dict": model.state_dict()}
+        #
+        #     if optimizer:
+        #         state_dict.update({'optim_state_dict': optimizer.state_dict()})
+        #
+        #     # since no progress group is initialized, DCP will disable any collectives.
+        #     # 加载到state_dict中，然后通过model.load_state_dict加载到model中
+        #     dcp.load(
+        #         state_dict=state_dict,
+        #         checkpoint_id=checkpoint_id,
+        #     )
+        #
+        #     model.load_state_dict(state_dict["model_state_dict"])
+        #     if optimizer:
+        #         optimizer.load_state_dict(state_dict["optim_state_dict"])
 
 def convert_dcp_to_pth(pth_path: str):
     dcp_path = os.environ.get('DCP_DIR', DEFAULT_DCP_DIR)

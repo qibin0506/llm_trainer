@@ -324,7 +324,8 @@ class Trainer:
 
 """
 todo: 
-0. 实现按照token数据确定batch大小，不固定batch的方案
+调研deepspeed，fsdp方式训练不收敛
+0. 实现按照token数据确定batch大小，不固定batch的方案 done
 1. 处理异常重启
 2. 调研fsdp2 没有太多资料
 3. Yarn和phi3的Phi3LongRoPEScaledRotaryEmbedding调研

@@ -55,23 +55,7 @@ def load_checkpoint(
 ):
     checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)
     if os.environ.get('ENABLE_DCP', '1') == '1':
-        if isinstance(model, FSDP):
-            load_dcp(model, optimizer)
-        else:
-            # load_dcp方式在cpu上会报错，所以改为先将ckpt转换为pth，然后再加载pth
-            # load_dcp(model, optimizer)
-            pth_name = os.environ.get('EVAL_CHECKPOINT_NAME', checkpoint_name)
-            convert_dcp_to_pth(pth_name)
-
-            if os.path.exists(pth_name):
-                ckpt = torch.load(pth_name, map_location=device, weights_only=True)
-                model.load_state_dict(ckpt['app']['model_state_dict'])
-                if optimizer:
-                    optimizer.load_state_dict(ckpt['app']['optim_state_dict'])
-
-                # 使用完删除
-                os.remove(pth_name)
-
+        load_dcp(model, optimizer)
     else:
         if os.path.exists(checkpoint_name):
             # 未经过测试，else的逻辑经过测试在fsdp下也没问题
@@ -89,6 +73,26 @@ def load_checkpoint(
                 if optimizer:
                     optimizer.load_state_dict(state_dict['optim_state_dict'])
 
+
+def load_checkpoint_for_eval(
+        model: nn.Module,
+        device: Optional[Union[torch.device, str]] = None
+):
+    if os.environ.get('ENABLE_DCP', '1') == '1':
+        checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)
+
+        # load_dcp方式在cpu上会报错，所以改为先将ckpt转换为pth，然后再加载pth
+        # load_dcp(model, optimizer)
+        pth_name = os.environ.get('EVAL_CHECKPOINT_NAME', checkpoint_name)
+        convert_dcp_to_pth(pth_name)
+
+        if os.path.exists(pth_name):
+            ckpt = torch.load(pth_name, map_location=device, weights_only=True)
+            model.load_state_dict(ckpt['app']['model_state_dict'])
+            # 使用完删除
+            os.remove(pth_name)
+    else:
+        load_checkpoint(model, None, device)
 
 def save_steps(global_steps: int, lr_scheduler: Optional[LRScheduler] = None):
     # 暂时只保存主进程的

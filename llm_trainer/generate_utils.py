@@ -1,6 +1,7 @@
 from typing import Union, Optional
 from contextlib import nullcontext
 import torch
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from llama import KVCache
 from .tools import TrainerTools
 
@@ -122,7 +123,13 @@ def _generate_text(
     enable_autocast = 'cuda' in device
 
     if enable_autocast:
-        ctx = torch.autocast(device_type=device, dtype=TrainerTools().dtype, enabled=enable_autocast)
+        ctx = torch.autocast(
+            device_type=device,
+            dtype=TrainerTools().dtype,
+            enabled=enable_autocast,
+            # fsdp模式，需要将cache_enabled设置为false
+            cache_enabled=False if isinstance(model, FSDP) else None
+        )
     else:
         ctx = nullcontext()
 

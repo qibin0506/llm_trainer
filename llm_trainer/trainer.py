@@ -4,6 +4,7 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 import torch.distributed as dist
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.utils.data import Dataset
 from llama import LlamaModel
 
@@ -67,7 +68,10 @@ class Trainer:
         self.ctx = torch.autocast(
             device_type=TrainerTools().parallel.device_type,
             dtype=TrainerTools().dtype,
-            enabled=TrainerTools().use_amp
+            enabled=TrainerTools().use_amp,
+            # fsdp模式，需要将cache_enabled设置为false
+            # https://www.zhihu.com/question/642793891
+            cache_enabled=False if isinstance(self.train_model, FSDP) else None
         ) if TrainerTools().use_amp else nullcontext()
 
         # initialize a GradScaler. If enabled=False scaler is a no-op

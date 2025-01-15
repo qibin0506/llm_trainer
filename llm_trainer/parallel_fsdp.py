@@ -100,10 +100,10 @@ class FsdpParallel(Parallel):
                 cpu_offload=cpu_offload,
                 device_id=torch.cuda.current_device(),
                 process_group=None,
-                use_orig_params=True,
-                backward_prefetch=BackwardPrefetch.BACKWARD_PRE,  # bit faster async comms, bit higher memory
-                limit_all_gathers=False,
-                forward_prefetch=True,
+                # use_orig_params=True,
+                # backward_prefetch=BackwardPrefetch.BACKWARD_PRE,  # bit faster async comms, bit higher memory
+                # limit_all_gathers=False,
+                # forward_prefetch=True,
             )
         else:
             self.model = model

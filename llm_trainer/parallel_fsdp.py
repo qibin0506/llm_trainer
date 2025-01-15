@@ -2,20 +2,14 @@ from typing import Optional
 import functools
 import torch
 from torch import nn
-from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
     MixedPrecision,
-    BackwardPrefetch,
     ShardingStrategy,
-    FullStateDictConfig,
-    StateDictType,
+    BackwardPrefetch,
+    CPUOffload,
 )
 
-from torch.distributed.fsdp.fully_sharded_data_parallel import (
-    CPUOffload,
-    BackwardPrefetch,
-)
 from torch.distributed.fsdp.wrap import (
     size_based_auto_wrap_policy,
     transformer_auto_wrap_policy,
@@ -88,14 +82,28 @@ class FsdpParallel(Parallel):
 
             self.raw_model = model
 
-            device_mesh = init_device_mesh("cuda", (self.world_size,))
+            # device_mesh = init_device_mesh("cuda", (self.world_size,))
+            # self.model = FSDP(
+            #     model,
+            #     auto_wrap_policy=auto_wrap_policy,
+            #     mixed_precision=mixed_precision,
+            #     cpu_offload=cpu_offload,
+            #     device_id=torch.cuda.current_device(),
+            #     device_mesh=device_mesh
+            # )
+
             self.model = FSDP(
                 model,
+                sharding_strategy=ShardingStrategy.FULL_SHARD,
                 auto_wrap_policy=auto_wrap_policy,
                 mixed_precision=mixed_precision,
                 cpu_offload=cpu_offload,
                 device_id=torch.cuda.current_device(),
-                device_mesh=device_mesh
+                process_group=None,
+                use_orig_params=True,
+                backward_prefetch=BackwardPrefetch.BACKWARD_PRE,  # bit faster async comms, bit higher memory
+                limit_all_gathers=False,
+                forward_prefetch=True,
             )
         else:
             self.model = model

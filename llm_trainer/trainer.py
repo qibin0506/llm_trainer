@@ -286,10 +286,9 @@ class Trainer:
                             if TrainerTools().parallel.parallel_train:
                                 dist.all_reduce(loss_accumulation, dist.ReduceOp.AVG)
 
-                            # clip grad
-                            self.scalar.unscale_(self.optimizer)
-
                             if self.lr_scheduler.can_clip_grad():
+                                # clip grad
+                                self.scalar.unscale_(self.optimizer)
                                 torch.nn.utils.clip_grad_norm_(self.train_model.parameters(), 1.0)
 
                             self.lr_scheduler.step()

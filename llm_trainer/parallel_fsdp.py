@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Tuple
 import functools
 import torch
 from torch import nn
@@ -24,11 +24,12 @@ class FsdpParallel(Parallel):
     def __init__(self):
         super().__init__()
 
-    def process_model(
+    def process(
             self,
             model: nn.Module,
+            optimizer: torch.optim.Optimizer,
             kwargs: Optional[dict] = None
-    ) -> nn.Module:
+    ) -> Tuple[nn.Module, torch.optim.Optimizer]:
         """
         :param model:
         :param optimizer:
@@ -48,7 +49,7 @@ class FsdpParallel(Parallel):
             if 'transformer_layer_cls' in kwargs:
                 auto_wrap_policy = functools.partial(
                     transformer_auto_wrap_policy,
-                    transformer_layer_cls = kwargs['transformer_layer_cls']
+                    transformer_layer_cls=kwargs['transformer_layer_cls']
                 )
             elif 'wrap_policy_num_params' in kwargs:
                 auto_wrap_policy = functools.partial(
@@ -109,6 +110,6 @@ class FsdpParallel(Parallel):
             self.model = model
             self.raw_model = model
 
-        return self.model
+        return self.model, optimizer
 
 

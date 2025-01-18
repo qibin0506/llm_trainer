@@ -3,7 +3,7 @@ from torch import nn
 from llama import LlamaConfig
 
 
-class FsdpArgs:
+class FsdpConfig:
     """
         fsdp训练模式配置项
         Args:
@@ -31,7 +31,7 @@ class FsdpArgs:
         self.offload_params = offload_params
 
 
-class DataLoaderArgs:
+class DataLoaderConfig:
     """
         data loader配置项
         Args:
@@ -59,7 +59,7 @@ class DataLoaderArgs:
         self.data_loader_drop_last = data_loader_drop_last
 
 
-class LrSchedulerArgs:
+class LrSchedulerConfig:
     """
         lr scheduler配置项
 
@@ -91,7 +91,7 @@ class LrSchedulerArgs:
         self.warmup_iters_ratio = warmup_iters_ratio
         self.min_lr_ratio = min_lr_ratio
 
-class KDArgs:
+class KDConfig:
     """
         知识蒸馏模式配置项
 
@@ -112,7 +112,7 @@ class KDArgs:
         self.kd_coef = kd_coef
 
 
-class TrainArgs:
+class TrainConfig:
     """
         训练参数配置项
 
@@ -131,13 +131,13 @@ class TrainArgs:
                 梯度累积步数，为0时不使用梯度累积
             eval_batch_interval (`int`, default is 100):
                 每隔多少个batch进行模型eval
-            lr_scheduler_args (`LrSchedulerArgs`):
+            lr_scheduler_config (`LrSchedulerConfig`):
                 lr scheduler配置项
-            fsdp_args: (`FsdpArgs`):
+            fsdp_config: (`FsdpConfig`):
                 fsdp训练模式配置项
-            data_loader_args: (`DataLoaderArgs`):
+            data_loader_config: (`DataLoaderConfig`):
                 data loader配置项
-            kd_args: (`KDArgs`, *Optional*, default is None):
+            kd_config: (`KDConfig`, *Optional*, default is None):
                 知识蒸馏配置项，为None时不使用知识蒸馏
         """
 
@@ -151,10 +151,10 @@ class TrainArgs:
             all_files: Optional[list[any]] = None,
             gradient_accumulation_steps: int = 0,
             eval_batch_interval: int = 100,
-            lr_scheduler_args: LrSchedulerArgs = LrSchedulerArgs(),
-            fsdp_args: FsdpArgs = FsdpArgs(),
-            data_loader_args: DataLoaderArgs = DataLoaderArgs(),
-            kd_args: Optional[KDArgs] = None
+            lr_scheduler_config: LrSchedulerConfig = LrSchedulerConfig(),
+            fsdp_config: FsdpConfig = FsdpConfig(),
+            data_loader_config: DataLoaderConfig = DataLoaderConfig(),
+            kd_config: Optional[KDConfig] = None
     ):
         self.n_epochs = n_epochs
         self.batch_size = batch_size
@@ -163,9 +163,9 @@ class TrainArgs:
         self.all_files = all_files
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.eval_batch_interval = eval_batch_interval
-        self.lr_scheduler_args = lr_scheduler_args
-        self.fsdp_args = fsdp_args
-        self.data_loader_args = data_loader_args
-        self.kd_args = kd_args
+        self.lr_scheduler_config = lr_scheduler_config
+        self.fsdp_config = fsdp_config
+        self.data_loader_config = data_loader_config
+        self.kd_config = kd_config
 
 

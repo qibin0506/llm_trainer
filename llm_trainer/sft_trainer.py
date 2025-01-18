@@ -3,19 +3,19 @@ from typing import Tuple
 from torch.utils.data import Dataset
 
 from .trainer import Trainer
-from .train_args import TrainArgs
+from .train_configs import TrainConfig
 from .dataset import LineByLineTextDataset
 from .utils import sft_collate_fn
 
 class SFTTrainer(Trainer):
     def __init__(
             self,
-            train_args: TrainArgs,
+            train_config: TrainConfig,
             prompt_on_batch: str,
             prompt_on_epoch: str,
     ):
         super().__init__(
-            train_args=train_args,
+            train_config=train_config,
             prompt_on_batch=prompt_on_batch,
             prompt_on_epoch=prompt_on_epoch
         )

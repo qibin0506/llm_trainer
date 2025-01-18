@@ -8,7 +8,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.utils.data import Dataset
 from llama import LlamaModel
 
-from .train_args import TrainArgs
+from .train_configs import TrainConfig
 from .parallel_fsdp import FsdpParallel
 from .tools import TrainerTools
 from .loss import LMLoss, KDLoss
@@ -45,13 +45,13 @@ class Trainer:
     def __init__(
             self,
             *,
-            train_args: TrainArgs,
+            train_config: TrainConfig,
             prompt_on_batch: str,
             prompt_on_epoch: str,
     ):
         set_seed()
 
-        self.train_args: TrainArgs = train_args
+        self.train_config: TrainConfig = train_config
         self.prompt_on_batch: str = prompt_on_batch
         self.prompt_on_epoch: str = prompt_on_epoch
 
@@ -59,11 +59,26 @@ class Trainer:
         self.data_loader_kwargs: dict[str, any] = data_loader_kwargs
         self.sampler_kwargs: dict[str, any] = sampler_kwargs
 
-        self.train_model: nn.Module = self._init_train_model(parallel_kwargs)
+        # initialize a GradScaler. If enabled=False scaler is a no-op
+        self.scalar = torch.GradScaler(enabled=TrainerTools().use_amp)
+
+        batch_count = train_config.all_data_size // TrainerTools().parallel.world_size // train_config.batch_size
+
+        log(f"real batch count: {batch_count}")
+
+        if train_config.gradient_accumulation_steps > 1:
+            batch_count = batch_count // train_config.gradient_accumulation_steps
+
+        # 学习率要根据GPU的数量进行倍增：
+        # 在训练的过程中，损失梯度决定下降的方向，学习率决定下降的步长。如果有两块gpu，前进的综合步长为：平均学习率*2
+        initial_lr = train_config.lr_scheduler_config.initial_lr * TrainerTools().parallel.world_size
+
+        self.train_model, self.optimizer = self._init_train_model_and_optim(initial_lr, parallel_kwargs)
+        self.lr_scheduler = self._init_lr_scheduler(batch_count, initial_lr)
         self.eval_model: Optional[nn.Module] = self._init_eval_model()
 
         self.criterion = LMLoss()
-        self.kd_loss = KDLoss() if train_args.kd_args else None
+        self.kd_loss = KDLoss() if train_config.kd_config else None
 
         self.ctx = torch.autocast(
             device_type=TrainerTools().parallel.device_type,
@@ -73,23 +88,6 @@ class Trainer:
             # https://www.zhihu.com/question/642793891
             cache_enabled=False if isinstance(self.train_model, FSDP) else None
         ) if TrainerTools().use_amp else nullcontext()
-
-        # initialize a GradScaler. If enabled=False scaler is a no-op
-        self.scalar = torch.GradScaler(enabled=TrainerTools().use_amp)
-
-        # 梯度累积步数
-        batch_count = train_args.all_data_size // TrainerTools().parallel.world_size // train_args.batch_size
-
-        log(f"real batch count: {batch_count}")
-
-        if self.train_args.gradient_accumulation_steps > 1:
-            batch_count = batch_count // self.train_args.gradient_accumulation_steps
-
-        # 学习率要根据GPU的数量进行倍增：
-        # 在训练的过程中，损失梯度决定下降的方向，学习率决定下降的步长。如果有两块gpu，前进的综合步长为：平均学习率*2
-        initial_lr = train_args.lr_scheduler_args.initial_lr * TrainerTools().parallel.world_size
-        self.optimizer = self._init_optimizer(initial_lr)
-        self.lr_scheduler = self._init_lr_scheduler(batch_count, initial_lr)
 
         load_checkpoint(
             self.train_model,
@@ -104,9 +102,16 @@ class Trainer:
         if last_lr_steps != -1:
             self.lr_scheduler.update_steps(last_lr_steps)
 
-    def _init_train_model(self, parallel_kwargs) -> nn.Module:
-        model = TrainerTools().parallel.process_model(
-            LlamaModel(self.train_args.llama_config),
+    def _init_train_model_and_optim(
+            self,
+            initial_lr: float,
+            parallel_kwargs
+    ) -> Tuple[nn.Module, torch.optim.Optimizer]:
+        optim = torch.optim.AdamW(self.train_model.parameters(), lr=initial_lr, weight_decay=0.1)
+        model = LlamaModel(self.train_config.llama_config)
+        model, optim = TrainerTools().parallel.process(
+            model=model,
+            optimizer=optim,
             kwargs=parallel_kwargs
         )
 
@@ -118,23 +123,20 @@ class Trainer:
             total_size_mb = total_size_bytes / (1024 * 1024)
             log(f"Total size of the model: {total_size_mb:.2f} MB")
 
-        return model
+        return model, optim
 
     def _init_eval_model(self) -> Optional[nn.Module]:
         if TrainerTools().parallel.is_main_process:
-            return LlamaModel(self.train_args.llama_config).to('cpu')
+            return LlamaModel(self.train_config.llama_config).to('cpu')
 
         return None
 
-    def _init_optimizer(self, initial_lr: float) -> torch.optim.Optimizer:
-        return torch.optim.AdamW(self.train_model.parameters(), lr=initial_lr, weight_decay=0.1)
-
     def _init_lr_scheduler(self, batch_count: int, initial_lr: float) -> LRScheduler:
-        if self.train_args.lr_scheduler_args.enable_lr_scheduler:
-            train_iters = batch_count * self.train_args.n_epochs
-            warmup_iters = int(self.train_args.lr_scheduler_args.warmup_iters_ratio * train_iters)
-            min_lr = self.train_args.lr_scheduler_args.min_lr_ratio * initial_lr
-            max_lr = self.train_args.lr_scheduler_args.max_lr * TrainerTools().parallel.world_size
+        if self.train_config.lr_scheduler_config.enable_lr_scheduler:
+            train_iters = batch_count * self.train_config.n_epochs
+            warmup_iters = int(self.train_config.lr_scheduler_config.warmup_iters_ratio * train_iters)
+            min_lr = self.train_config.lr_scheduler_config.min_lr_ratio * initial_lr
+            max_lr = self.train_config.lr_scheduler_config.max_lr * TrainerTools().parallel.world_size
 
             return CosineAnnealingWarmupLRScheduler(
                 optimizer=self.optimizer,
@@ -148,19 +150,19 @@ class Trainer:
         return NoneLRScheduler()
 
     def _convert_train_args(self) -> Tuple[dict, dict, dict]:
-        if isinstance(TrainerTools().parallel, FsdpParallel) and self.train_args.fsdp_args:
+        if isinstance(TrainerTools().parallel, FsdpParallel) and self.train_config.fsdp_config:
             parallel_kwargs = {
-                'transformer_layer_cls': self.train_args.fsdp_args.transformer_layer_cls,
-                'wrap_policy_num_params': self.train_args.fsdp_args.wrap_policy_num_params,
-                'cpu_offload': self.train_args.fsdp_args.cpu_offload,
-                'offload_params': self.train_args.fsdp_args.offload_params
+                'transformer_layer_cls': self.train_config.fsdp_config.transformer_layer_cls,
+                'wrap_policy_num_params': self.train_config.fsdp_config.wrap_policy_num_params,
+                'cpu_offload': self.train_config.fsdp_config.cpu_offload,
+                'offload_params': self.train_config.fsdp_config.offload_params
             }
         else:
             parallel_kwargs = None
 
-        dataloader_args = self.train_args.data_loader_args
+        dataloader_args = self.train_config.data_loader_config
         data_loader_kwargs = {
-            "batch_size": self.train_args.batch_size,
+            "batch_size": self.train_config.batch_size,
             "pin_memory": dataloader_args.data_loader_pin_memory,
             "collate_fn": pretrain_collate_fn,
             "num_workers": dataloader_args.data_loader_num_workers,
@@ -175,7 +177,7 @@ class Trainer:
         return parallel_kwargs, data_loader_kwargs, sampler_kwargs
 
     def _create_dataset(self, file_path) -> Dataset:
-        max_position_embeddings = self.train_args.llama_config.max_position_embeddings
+        max_position_embeddings = self.train_config.llama_config.max_position_embeddings
         return TextDataset(file_path, max_position_embeddings, max_position_embeddings)
 
     def _calc_loss(self, inputs, attention_mask, logits, labels):
@@ -184,9 +186,9 @@ class Trainer:
 
         # 知识蒸馏loss
         if self.kd_loss:
-            teacher_logits = self.train_args.kd_args.teacher_logits_provider(inputs, attention_mask)
+            teacher_logits = self.train_config.kd_config.teacher_logits_provider(inputs, attention_mask)
             distil_loss = self.kd_loss(logits, teacher_logits, labels)
-            loss = (1 - self.train_args.kd_args.kd_coef) * loss + self.train_args.kd_args.kd_coef * distil_loss
+            loss = (1 - self.train_config.kd_config.kd_coef) * loss + self.train_config.kd_config.kd_coef * distil_loss
 
         return loss
 
@@ -212,7 +214,7 @@ class Trainer:
             epoch,
             batch,
             self.prompt_on_batch,
-            self.train_args.llama_config.max_position_embeddings
+            self.train_config.llama_config.max_position_embeddings
         )
 
     def _on_epoch_end(self, epoch: int):
@@ -220,21 +222,22 @@ class Trainer:
             self.eval_model,
             epoch,
             self.prompt_on_epoch,
-            self.train_args.llama_config.max_position_embeddings
+            self.train_config.llama_config.max_position_embeddings
         )
 
     def train(self):
-        gradient_accumulation_steps = self.train_args.gradient_accumulation_steps
+        # 梯度累积步数
+        gradient_accumulation_steps = self.train_config.gradient_accumulation_steps
         global_steps = 0
         loss_accumulation = 0.0
         skipping_train = False
 
-        for epoch in range(self.train_args.n_epochs):
+        for epoch in range(self.train_config.n_epochs):
             self.train_model.train()
 
-            for file_path in self.train_args.all_files:
+            for file_path in self.train_config.all_files:
                 dataset = self._create_dataset(file_path)
-                train_data_loader = TrainerTools().parallel.create_dataloader(
+                train_data_loader = TrainerTools().parallel.process_dataloader(
                     dataset=dataset,
                     data_loader_kwargs=self.data_loader_kwargs,
                     sampler_kwargs=self.sampler_kwargs
@@ -305,7 +308,7 @@ class Trainer:
                     except Exception as e:
                         self._on_exception(e, epoch, batch)
                     finally:
-                        if need_update_grad and (batch - last_ckpt_batch) >= self.train_args.eval_batch_interval:
+                        if need_update_grad and (batch - last_ckpt_batch) >= self.train_config.eval_batch_interval:
                             save_checkpoint(model=self.train_model, optimizer=self.optimizer)
                             save_steps(global_steps=global_steps, lr_scheduler=self.lr_scheduler)
                             last_ckpt_batch = batch

@@ -6,7 +6,6 @@ import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 from torch.distributed.checkpoint.format_utils import dcp_to_torch_save, torch_save_to_dcp
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 DEFAULT_DCP_DIR = "checkpoint"
 

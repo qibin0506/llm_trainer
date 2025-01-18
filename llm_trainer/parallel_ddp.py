@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 from torch import nn
@@ -17,11 +17,12 @@ class DdpParallel(Parallel):
     def __init__(self):
         super().__init__()
 
-    def process_model(
+    def process(
             self,
             model: nn.Module,
+            optimizer: torch.optim.Optimizer,
             kwargs: Optional[dict] = None
-    ) -> nn.Module:
+    ) -> Tuple[nn.Module, torch.optim.Optimizer]:
         model.to(self.device)
 
         if self._use_compile:
@@ -35,4 +36,4 @@ class DdpParallel(Parallel):
             self.model = model
             self.raw_model = model
 
-        return self.model
+        return self.model, optimizer

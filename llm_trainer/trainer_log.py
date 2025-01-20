@@ -55,6 +55,8 @@ def _eval_task(eval_model, tag, prompt, max_position_embeddings, is_new_process)
 
 
 def _submit_gen_task(eval_model: torch.nn.Module, tag, prompt, max_position_embeddings):
+    # 等待2s，防止deepspeed模式下，找不到checkpoint问题
+    time.sleep(2)
     threading.Thread(target=_eval_task, args=(eval_model, tag, prompt, max_position_embeddings, False)).start()
     # Process(target=_eval_task, args=(eval_model, tag, prompt, max_position_embeddings, True)).start()
 

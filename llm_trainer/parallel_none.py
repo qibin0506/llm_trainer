@@ -6,7 +6,7 @@ from .parallel import Parallel
 
 class NoneParallel(Parallel):
     def __init__(self):
-        super().__init__(user_parallel=False)
+        super().__init__(use_parallel=False)
 
     def process(
             self,

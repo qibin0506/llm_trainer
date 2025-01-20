@@ -3,6 +3,8 @@ from typing import Optional, Union, Tuple
 import torch
 from torch import nn
 from torch.optim import Optimizer
+
+from .parallel_ds import DsParallel
 from .scheduler import LRScheduler
 from .tools import TrainerTools
 from .dcp import save_dcp, load_dcp, convert_dcp_to_pth
@@ -17,7 +19,10 @@ def save_checkpoint(
         model: nn.Module,
         optimizer: Optional[Optimizer] = None
 ):
-    if os.environ.get('ENABLE_DCP', '1') == '1':
+    if isinstance(TrainerTools().parallel, DsParallel):
+        from .ds_checkpoint import save_ds_checkpoint
+        save_ds_checkpoint(model)
+    elif os.environ.get('ENABLE_DCP', '1') == '1':
         save_dcp(model, optimizer)
     else:
         if isinstance(model, FSDP):
@@ -53,10 +58,13 @@ def load_checkpoint(
         optimizer: Optional[Optimizer] = None,
         device: Optional[Union[torch.device, str]] = None
 ):
-    checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)
-    if os.environ.get('ENABLE_DCP', '1') == '1':
+    if isinstance(TrainerTools().parallel, DsParallel):
+        from .ds_checkpoint import load_ds_checkpoint
+        load_ds_checkpoint(model)
+    elif os.environ.get('ENABLE_DCP', '1') == '1':
         load_dcp(model, optimizer)
     else:
+        checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)
         if os.path.exists(checkpoint_name):
             # 未经过测试，else的逻辑经过测试在fsdp下也没问题
             if isinstance(model, FSDP):
@@ -78,7 +86,10 @@ def load_checkpoint_for_eval(
         model: nn.Module,
         device: Optional[Union[torch.device, str]] = None
 ):
-    if os.environ.get('ENABLE_DCP', '1') == '1':
+    if isinstance(TrainerTools().parallel, DsParallel):
+        from .ds_checkpoint import load_ds_checkpoint_for_eval
+        load_ds_checkpoint_for_eval(model)
+    elif os.environ.get('ENABLE_DCP', '1') == '1':
         checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)
 
         # load_dcp方式在cpu上会报错，所以改为先将ckpt转换为pth，然后再加载pth

@@ -4,9 +4,10 @@ from torch import nn
 import deepspeed
 from .parallel import Parallel
 
-class FsdpParallel(Parallel):
+class DsParallel(Parallel):
     def __init__(self):
-        super().__init__()
+        deepspeed.init_distributed(dist_backend='nccl')
+        super().__init__(init_process_group=False)
 
     def process(
             self,
@@ -18,16 +19,26 @@ class FsdpParallel(Parallel):
         :param model:
         :param optimizer:
         :param kwargs:
-            "wrap_policy_num_params" int size_based_auto_wrap_policy的最小参数量
-            "cpu_offload" bool 是否使用cpu卸载
-            "offload_params" bool 是否卸载参数，在cpu_offload为True时生效
+            参考deepspeed配置
         :return:
         """
-        deepspeed.initialize(
+        self.raw_model = model
+
+        model, optim, _, _ = deepspeed.initialize(
             model=model,
             optimizer=optimizer,
-            dist_init_required=True
+            dist_init_required=False,
+            config_params=kwargs
         )
+
+        self.model = model
+        return model, optim
+
+    def synchronize(self):
+        pass
+
+    def destroy(self):
+        pass
 
 
 

@@ -8,7 +8,8 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.utils.data import Dataset
 from llama import LlamaModel
 
-from .train_configs import TrainConfig
+from .train_configs import TrainConfig, DsZero2Config, DsZero3Config
+from .parallel_ds import DsParallel
 from .parallel_fsdp import FsdpParallel
 from .tools import TrainerTools
 from .loss import LMLoss, KDLoss
@@ -107,14 +108,7 @@ class Trainer:
             initial_lr: float,
             parallel_kwargs
     ) -> Tuple[nn.Module, torch.optim.Optimizer]:
-        optim = torch.optim.AdamW(self.train_model.parameters(), lr=initial_lr, weight_decay=0.1)
         model = LlamaModel(self.train_config.llama_config)
-        model, optim = TrainerTools().parallel.process(
-            model=model,
-            optimizer=optim,
-            kwargs=parallel_kwargs
-        )
-
         if TrainerTools().parallel.is_main_process:
             total_params = sum(p.numel() for p in model.parameters())
             log(f"Total number of parameters: {total_params:,}")
@@ -122,6 +116,13 @@ class Trainer:
             total_size_bytes = total_params * 4
             total_size_mb = total_size_bytes / (1024 * 1024)
             log(f"Total size of the model: {total_size_mb:.2f} MB")
+
+        optim = torch.optim.AdamW(model.parameters(), lr=initial_lr, weight_decay=0.1)
+        model, optim = TrainerTools().parallel.process(
+            model=model,
+            optimizer=optim,
+            kwargs=parallel_kwargs
+        )
 
         return model, optim
 
@@ -150,7 +151,90 @@ class Trainer:
         return NoneLRScheduler()
 
     def _convert_train_args(self) -> Tuple[dict, dict, dict]:
-        if isinstance(TrainerTools().parallel, FsdpParallel) and self.train_config.fsdp_config:
+        if isinstance(TrainerTools().parallel, DsParallel) and self.train_config.ds_config:
+            parallel_kwargs = {
+                'gradient_accumulation_steps': 1,
+                'gradient_clipping': False,
+                'train_micro_batch_size_per_gpu': self.train_config.batch_size
+            }
+
+            if self.train_config.ds_config.zero_config:
+                zero_config = self.train_config.ds_config.zero_config
+                zero_optimization = {'stage': zero_config.stage}
+
+                if zero_config.allgather_partitions is not None:
+                    zero_optimization['allgather_partitions'] = zero_config.allgather_partitions
+                if zero_config.allgather_bucket_size is not None:
+                    zero_optimization['allgather_bucket_size'] = zero_config.allgather_bucket_size
+                if zero_config.overlap_comm is not None:
+                    zero_optimization['overlap_comm'] = zero_config.overlap_comm
+                if zero_config.reduce_scatter is not None:
+                    zero_optimization['reduce_scatter'] = zero_config.reduce_scatter
+                if zero_config.reduce_bucket_size is not None:
+                    zero_optimization['reduce_bucket_size'] = zero_config.reduce_bucket_size
+                if zero_config.contiguous_gradients is not None:
+                    zero_optimization['contiguous_gradients'] = zero_config.contiguous_gradients
+
+                if isinstance(zero_config, DsZero2Config) or isinstance(zero_config, DsZero3Config):
+                    if zero_config.offload_optimizer is not None:
+                        zero_optimization['offload_optimizer'] = zero_config.offload_optimizer
+                    if zero_config.offload_param is not None:
+                        zero_optimization['offload_param'] = zero_config.offload_param
+
+                if isinstance(zero_config, DsZero3Config):
+                    if zero_config.sub_group_size is not None:
+                        zero_optimization['sub_group_size'] = zero_config.sub_group_size
+                    if zero_config.stage3_prefetch_bucket_size is not None:
+                        zero_optimization['stage3_prefetch_bucket_size'] = zero_config.stage3_prefetch_bucket_size
+                    if zero_config.stage3_param_persistence_threshold is not None:
+                        zero_optimization['stage3_param_persistence_threshold'] = zero_config.stage3_param_persistence_threshold
+                    if zero_config.stage3_max_live_parameters is not None:
+                        zero_optimization['stage3_max_live_parameters'] = zero_config.stage3_max_live_parameters
+                    if zero_config.stage3_max_reuse_distance is not None:
+                        zero_optimization['stage3_max_reuse_distance'] = zero_config.stage3_max_reuse_distance
+                    if zero_config.stage3_gather_16bit_weights_on_model_save is not None:
+                        zero_optimization['stage3_gather_16bit_weights_on_model_save'] = zero_config.stage3_gather_16bit_weights_on_model_save
+
+                parallel_kwargs['zero_optimization'] = zero_optimization
+
+            if self.train_config.ds_config.fp16_config:
+                fb16_config = self.train_config.ds_config.fp16_config
+                fp16 = {
+                    'enabled': fb16_config.enabled,
+                    'loss_scale': fb16_config.loss_scale,
+                    'loss_scale_window': fb16_config.loss_scale_window,
+                    'initial_scale_power': fb16_config.initial_scale_power,
+                    'hysteresis': fb16_config.hysteresis,
+                    'min_loss_scale': fb16_config.min_loss_scale
+                }
+
+                if fb16_config.fp16_opt_level is not None:
+                    fp16['fp16_opt_level'] = fb16_config.fp16_opt_level
+
+                parallel_kwargs['fp16'] = fp16
+
+            if self.train_config.ds_config.bf16_config:
+                bf16_config = self.train_config.ds_config.bf16_config
+                bf16 = {
+                    'enabled': bf16_config.enabled
+                }
+                parallel_kwargs['bf16'] = bf16
+
+            if self.train_config.ds_config.activation_checkpointing:
+                activation_checkpointing_config = self.train_config.ds_config.activation_checkpointing
+                activation_checkpointing = {
+                    'partition_activations': activation_checkpointing_config.partition_activations,
+                    'cpu_checkpointing': activation_checkpointing_config.cpu_checkpointing,
+                    'contiguous_memory_optimization': activation_checkpointing_config.contiguous_memory_optimization,
+                    'synchronize_checkpoint_boundary': activation_checkpointing_config.synchronize_checkpoint_boundary,
+                    'profile': activation_checkpointing_config.profile
+                }
+
+                if activation_checkpointing_config.number_checkpoints is not None:
+                    activation_checkpointing['number_checkpoints'] = activation_checkpointing_config.number_checkpoints
+
+                parallel_kwargs['activation_checkpointing'] = activation_checkpointing
+        elif isinstance(TrainerTools().parallel, FsdpParallel) and self.train_config.fsdp_config:
             parallel_kwargs = {
                 'transformer_layer_cls': self.train_config.fsdp_config.transformer_layer_cls,
                 'wrap_policy_num_params': self.train_config.fsdp_config.wrap_policy_num_params,
@@ -191,6 +275,25 @@ class Trainer:
             loss = (1 - self.train_config.kd_config.kd_coef) * loss + self.train_config.kd_config.kd_coef * distil_loss
 
         return loss
+
+    def _backward_loss(self, loss):
+        if isinstance(TrainerTools().parallel, DsParallel):
+            self.train_model.backward(loss)
+        else:
+            self.scalar.scale(loss).backward()
+
+    def _step(self):
+        self.lr_scheduler.step()
+        if isinstance(TrainerTools().parallel, DsParallel):
+            self.train_model.step()
+        else:
+            self.scalar.step(self.optimizer)
+            # optimizer.step()
+            self.scalar.update()
+            # flush the gradients as soon as we can, no need for this memory anymore
+            self.optimizer.zero_grad(set_to_none=True)
+
+        TrainerTools().parallel.synchronize()
 
     def _log_loss(
             self,
@@ -283,9 +386,10 @@ class Trainer:
                             loss = loss / gradient_accumulation_steps
 
                         loss_accumulation += loss.detach()
-                        self.scalar.scale(loss).backward()
+                        self._backward_loss(loss)
 
                         if need_update_grad:
+                            # todo check all_reduce??
                             if TrainerTools().parallel.parallel_train:
                                 dist.all_reduce(loss_accumulation, dist.ReduceOp.AVG)
 
@@ -294,14 +398,7 @@ class Trainer:
                                 self.scalar.unscale_(self.optimizer)
                                 torch.nn.utils.clip_grad_norm_(self.train_model.parameters(), 1.0)
 
-                            self.lr_scheduler.step()
-                            self.scalar.step(self.optimizer)
-                            # optimizer.step()
-                            self.scalar.update()
-                            # flush the gradients as soon as we can, no need for this memory anymore
-                            self.optimizer.zero_grad(set_to_none=True)
-                            TrainerTools().parallel.synchronize()
-
+                            self._step()
                             self._log_loss(epoch, batch, batch_count_per_file, loss_accumulation.item())
                             # reset to default
                             loss_accumulation = 0.0

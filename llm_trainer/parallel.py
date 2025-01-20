@@ -12,21 +12,29 @@ from .log import log
 class Parallel:
     def __init__(
             self,
-            user_parallel: bool = True,
-            init_process_group: bool = True
+            init_process_group: bool = True,
+            use_parallel: bool = True,
+            use_compile: bool = False
     ):
-        self._use_compile: bool = False
+        self._initialize(init_process_group, use_parallel, use_compile)
+
+    def _initialize(
+            self,
+            init_process_group: bool,
+            use_parallel: bool,
+            use_compile: bool
+    ):
         self._global_rank: int = int(os.environ.get('RANK', -1))
         self._local_rank: int = int(os.environ.get('LOCAL_RANK', -1))
-        self._use_parallel: bool = user_parallel and self._global_rank != -1
-        self._word_size: int = 1
+        self._use_parallel: bool = use_parallel and self._global_rank != -1
+        self._use_compile = use_compile
 
-        self._sampler:Optional[DistributedSampler] = None
+        self._sampler: Optional[DistributedSampler] = None
 
         self.model: Optional[nn.Module] = None
         self.raw_model: Optional[nn.Module] = None
 
-        if self._use_compile:
+        if use_compile:
             torch.set_float32_matmul_precision('high')
 
         if self._use_parallel:
@@ -35,11 +43,10 @@ class Parallel:
 
             self.device: str = f'cuda:{self._local_rank}'
             self.device_type: str = 'cuda'
-            self._word_size = dist.get_world_size()
 
             torch.cuda.set_device(self.device)
 
-            log(f'global_rank:{self._global_rank},local_rank:{self._local_rank}, world_size:{self._word_size}')
+            log(f'global_rank:{self._global_rank},local_rank:{self._local_rank}, world_size:{self.world_size}')
         else:
             device = "cpu"
             if torch.cuda.is_available():
@@ -49,6 +56,7 @@ class Parallel:
 
             self.device: str = device
             self.device_type: str = device
+
 
     def process(
             self,
@@ -126,4 +134,4 @@ class Parallel:
 
     @property
     def world_size(self) -> int:
-        return self._word_size
+        return dist.get_world_size()

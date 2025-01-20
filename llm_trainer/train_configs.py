@@ -1,6 +1,197 @@
-from typing import Optional, Set, Type, Callable
+from typing import Optional, Union, Set, Type, Callable
 from torch import nn
 from llama import LlamaConfig
+
+class DsOffloadConfig:
+    def __init__(
+            self,
+            *,
+            device: str = 'cpu',
+            pin_memory: bool = False
+    ):
+        self.device = device
+        self.pin_memory = pin_memory
+
+
+class DsActivationCheckpointingConfig:
+    def __init__(
+            self,
+            *,
+            partition_activations: bool = False,
+            cpu_checkpointing: bool = False,
+            contiguous_memory_optimization: bool = False,
+            number_checkpoints: Optional[int] = None,
+            synchronize_checkpoint_boundary: bool = False,
+            profile: bool = False
+    ):
+        self.partition_activations =partition_activations
+        self.cpu_checkpointing = cpu_checkpointing
+        self.contiguous_memory_optimization = contiguous_memory_optimization
+        self.number_checkpoints = number_checkpoints
+        self.synchronize_checkpoint_boundary = synchronize_checkpoint_boundary
+        self.profile = profile
+
+
+class DsZeROConfig:
+    def __init__(
+            self,
+            *,
+            stage: int,
+            allgather_partitions: Optional[bool] = True,
+            allgather_bucket_size: Optional[int] = 5e8,
+            overlap_comm: Optional[bool] = True,
+            reduce_scatter: Optional[bool] = True,
+            reduce_bucket_size: Optional[Union[str, int]] = 5e8,
+            contiguous_gradients: Optional[bool] = True
+    ):
+        self.stage = stage
+        self.allgather_partitions = allgather_partitions
+        self.allgather_bucket_size = allgather_bucket_size
+        self.overlap_comm = overlap_comm
+        self.reduce_scatter = reduce_scatter
+        self.reduce_bucket_size = reduce_bucket_size
+        self.contiguous_gradients = contiguous_gradients
+
+
+class DsZero1Config(DsZeROConfig):
+    def __init__(
+            self,
+            *,
+            allgather_partitions: Optional[bool] = True,
+            allgather_bucket_size: Optional[int] = 5e8,
+            overlap_comm: Optional[bool] = True,
+            reduce_scatter: Optional[bool] = True,
+            reduce_bucket_size: Optional[Union[str, int]] = 5e8,
+            contiguous_gradients: Optional[bool] = True
+    ):
+        super().__init__(
+            stage=1,
+            allgather_partitions=allgather_partitions,
+            allgather_bucket_size=allgather_bucket_size,
+            overlap_comm=overlap_comm,
+            reduce_scatter=reduce_scatter,
+            reduce_bucket_size=reduce_bucket_size,
+            contiguous_gradients=contiguous_gradients
+        )
+
+class DsZero2Config(DsZeROConfig):
+    def __init__(
+            self,
+            *,
+            allgather_partitions: Optional[bool] = True,
+            allgather_bucket_size: Optional[int] = 5e8,
+            overlap_comm: Optional[bool] = True,
+            reduce_scatter: Optional[bool] = True,
+            reduce_bucket_size: Optional[Union[str, int]] = 5e8,
+            contiguous_gradients: Optional[bool] = True,
+            offload_optimizer: Optional[DsOffloadConfig] = DsOffloadConfig(),
+            offload_param: Optional[DsOffloadConfig] = DsOffloadConfig(),
+
+    ):
+        super().__init__(
+            stage=2,
+            allgather_partitions=allgather_partitions,
+            allgather_bucket_size=allgather_bucket_size,
+            overlap_comm=overlap_comm,
+            reduce_scatter=reduce_scatter,
+            reduce_bucket_size=reduce_bucket_size,
+            contiguous_gradients=contiguous_gradients
+        )
+
+        self.offload_optimizer = offload_optimizer
+        self.offload_param = offload_param
+
+
+class DsZero3Config(DsZeROConfig):
+    def __init__(
+            self,
+            *,
+            allgather_partitions: Optional[bool] = None,
+            allgather_bucket_size: Optional[bool] = None,
+            overlap_comm: Optional[bool] = True,
+            reduce_scatter: Optional[bool] = None,
+            reduce_bucket_size: Optional[Union[str, int]] = 'auto',
+            contiguous_gradients: Optional[bool] = True,
+            sub_group_size: Optional[int] = 1e9,
+            stage3_prefetch_bucket_size: Optional[Union[str, int]] = 'auto',
+            stage3_param_persistence_threshold: Optional[Union[str, int]] = 'auto',
+            stage3_max_live_parameters: Optional[int] = 1e9,
+            stage3_max_reuse_distance: Optional[int] = 1e9,
+            stage3_gather_16bit_weights_on_model_save: Optional[bool] = True,
+            offload_optimizer: Optional[DsOffloadConfig] = None,
+            offload_param: Optional[DsOffloadConfig] = None,
+
+    ):
+        super().__init__(
+            stage=3,
+            allgather_partitions=allgather_partitions,
+            allgather_bucket_size=allgather_bucket_size,
+            overlap_comm=overlap_comm,
+            reduce_scatter=reduce_scatter,
+            reduce_bucket_size=reduce_bucket_size,
+            contiguous_gradients=contiguous_gradients
+        )
+
+        self.sub_group_size = sub_group_size
+        self.stage3_prefetch_bucket_size = stage3_prefetch_bucket_size
+        self.stage3_param_persistence_threshold = stage3_param_persistence_threshold
+        self.stage3_max_live_parameters = stage3_max_live_parameters
+        self.stage3_max_reuse_distance = stage3_max_reuse_distance
+        self.stage3_gather_16bit_weights_on_model_save = stage3_gather_16bit_weights_on_model_save
+
+        self.offload_optimizer = offload_optimizer
+        self.offload_param = offload_param
+
+class DsFp16Config:
+    """
+        DeepSpeed fp16配置项
+        参数说明：https://deepspeed.org.cn/docs/config-json/
+    """
+    def __init__(
+            self,
+            *,
+            enabled: Union[str, bool] = 'auto',
+            loss_scale: int = 0,
+            loss_scale_window: int = 1000,
+            initial_scale_power: int = 16,
+            hysteresis: int = 2,
+            min_loss_scale: int = 1,
+            fp16_opt_level: Optional[str] = '02'
+    ):
+        self.enabled = enabled
+        self.loss_scale = loss_scale
+        self.loss_scale_window = loss_scale_window
+        self.initial_scale_power = initial_scale_power
+        self.hysteresis = hysteresis
+        self.min_loss_scale = min_loss_scale
+        self.fp16_opt_level = fp16_opt_level
+
+
+class DsBf16Config:
+    def __init__(
+            self,
+            *,
+            enabled: bool = False
+    ):
+        self.enabled = enabled
+
+
+class DsConfig:
+    """
+        DeepSpeed训练模式配置
+    """
+    def __init__(
+            self,
+            *,
+            zero_config: Optional[DsZeROConfig] = DsZero3Config(),
+            fp16_config: Optional[DsFp16Config] = DsFp16Config(),
+            bf16_config: Optional[DsBf16Config] = DsBf16Config(),
+            activation_checkpointing: Optional[DsActivationCheckpointingConfig] = None
+    ):
+        self.zero_config = zero_config
+        self.fp16_config = fp16_config
+        self.bf16_config = bf16_config
+        self.activation_checkpointing = activation_checkpointing
 
 
 class FsdpConfig:
@@ -152,6 +343,7 @@ class TrainConfig:
             gradient_accumulation_steps: int = 0,
             eval_batch_interval: int = 100,
             lr_scheduler_config: LrSchedulerConfig = LrSchedulerConfig(),
+            ds_config: DsConfig = DsConfig(),
             fsdp_config: FsdpConfig = FsdpConfig(),
             data_loader_config: DataLoaderConfig = DataLoaderConfig(),
             kd_config: Optional[KDConfig] = None
@@ -164,6 +356,7 @@ class TrainConfig:
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.eval_batch_interval = eval_batch_interval
         self.lr_scheduler_config = lr_scheduler_config
+        self.ds_config = ds_config
         self.fsdp_config = fsdp_config
         self.data_loader_config = data_loader_config
         self.kd_config = kd_config

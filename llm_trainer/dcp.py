@@ -7,7 +7,7 @@ from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 from torch.distributed.checkpoint.format_utils import dcp_to_torch_save, torch_save_to_dcp
 
-DEFAULT_CKPT_DIR = "checkpoint"
+DEFAULT_CHECKPOINT_DIR = "checkpoint"
 
 class AppState(Stateful):
     def __init__(self, model: nn.Module, optimizer: Optimizer):
@@ -31,7 +31,7 @@ class AppState(Stateful):
 
 
 def save_dcp(model: nn.Module, optimizer: Optimizer):
-    checkpoint_id = os.environ.get('CKPT_DIR', DEFAULT_CKPT_DIR)
+    checkpoint_id = os.environ.get('DIST_CHECKPOINT_DIR', DEFAULT_CHECKPOINT_DIR)
     state_dict = {'app': AppState(model, optimizer)}
 
     # fs_storage_writer = dcp.FileSystemWriter(checkpoint_id, overwrite=True)
@@ -40,7 +40,7 @@ def save_dcp(model: nn.Module, optimizer: Optimizer):
 
 
 def load_dcp(model: nn.Module, optimizer: Optional[Optimizer] = None):
-    checkpoint_id = os.environ.get('CKPT_DIR', DEFAULT_CKPT_DIR)
+    checkpoint_id = os.environ.get('DIST_CHECKPOINT_DIR', DEFAULT_CHECKPOINT_DIR)
     if os.path.exists(checkpoint_id):
         state_dict = {'app': AppState(model, optimizer)}
         # AppState帮助加载到state_dict中, 然后加载到model中
@@ -68,7 +68,7 @@ def load_dcp(model: nn.Module, optimizer: Optional[Optimizer] = None):
         #         optimizer.load_state_dict(state_dict["optim_state_dict"])
 
 def convert_dcp_to_pth(pth_path: str):
-    dcp_path = os.environ.get('CKPT_DIR', DEFAULT_CKPT_DIR)
+    dcp_path = os.environ.get('DIST_CHECKPOINT_DIR', DEFAULT_CHECKPOINT_DIR)
     if os.path.exists(dcp_path):
         # convert dcp model to torch.save (assumes checkpoint was generated as above)
         dcp_to_torch_save(dcp_path, pth_path)
@@ -76,4 +76,4 @@ def convert_dcp_to_pth(pth_path: str):
 def convert_pth_to_dcp(pth_path: str):
     if os.path.exists(pth_path):
         # converts the torch.save model back to DCP
-        torch_save_to_dcp(pth_path, os.environ.get('CKPT_DIR', DEFAULT_CKPT_DIR))
+        torch_save_to_dcp(pth_path, os.environ.get('DIST_CHECKPOINT_DIR', DEFAULT_CHECKPOINT_DIR))

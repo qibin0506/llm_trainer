@@ -10,15 +10,15 @@ from .checkpoint import load_checkpoint_for_eval
 from .log import log
 
 
-def _get_save_dir() -> str:
-    save_dir = os.environ['SAVE_DIR']
-    if not os.path.exists(save_dir):
-        os.mkdir(save_dir)
+def _get_log_dir() -> str:
+    log_dir = os.environ['LOG_DIR']
+    if not os.path.exists(log_dir):
+        os.mkdir(log_dir)
 
-    return save_dir
+    return log_dir
 
 def _eval_task(eval_model, tag, prompt, max_position_embeddings, is_new_process):
-    save_dir = _get_save_dir()
+    log_dir = _get_log_dir()
 
     # 当eval_model不是独立model时可以尝试这个
     # if isinstance(eval_model, FSDP):
@@ -50,7 +50,7 @@ def _eval_task(eval_model, tag, prompt, max_position_embeddings, is_new_process)
         device='cpu'
     )
 
-    with open(f'{save_dir}gen.txt', 'a') as f:
+    with open(f'{log_dir}gen.txt', 'a') as f:
         f.write(f"{tag}, gen->{gen_result}\n")
 
 
@@ -68,11 +68,11 @@ def log_loss(
         loss
 ):
     if TrainerTools().parallel.is_main_process:
-        save_dir = _get_save_dir()
+        log_dir = _get_log_dir()
         log(f"epoch: {epoch}, batch: {batch}/{batch_count}, loss: {loss}")
         log(
             f"epoch: {epoch}, batch: {batch}/{batch_count}, loss: {loss}\n",
-            f'{save_dir}log.txt'
+            f'{log_dir}log.txt'
         )
 
 def on_batch_end(
@@ -93,17 +93,17 @@ def on_batch_end(
 
 def on_file_start(epoch, file_name):
     if TrainerTools().parallel.is_main_process:
-        log(f"epoch: {epoch}, start train {file_name}\n", f'{_get_save_dir()}log.txt')
+        log(f"epoch: {epoch}, start train {file_name}\n", f'{_get_log_dir()}log.txt')
 
 
 def on_exception(e, epoch, batch):
     if isinstance(e, torch.OutOfMemoryError):
-        save_dir = _get_save_dir()
+        log_dir = _get_log_dir()
         exception_file = e.__traceback__.tb_frame.f_globals["__file__"]
         exception_line = e.__traceback__.tb_lineno
         log(
             f"epoch: {epoch}, batch: {batch}, {e} at {exception_file} line {exception_line}\n",
-            f'{save_dir}log.txt'
+            f'{log_dir}log.txt'
         )
 
         time.sleep(1)

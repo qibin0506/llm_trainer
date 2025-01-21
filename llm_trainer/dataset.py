@@ -15,7 +15,7 @@ class TextDataset(Dataset):
         with open(file_path, 'rb') as f:
             all_tokens = pickle.load(f)
 
-        for i in range(0, len(all_tokens) - block_size, stride):
+        for i in range(0, len(all_tokens) - block_size + 1, stride):
             self.input_ids.append(all_tokens[i:i+block_size])
 
     def __len__(self):

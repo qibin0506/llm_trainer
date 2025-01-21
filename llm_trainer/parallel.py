@@ -134,4 +134,6 @@ class Parallel:
 
     @property
     def world_size(self) -> int:
-        return dist.get_world_size()
+        if self._use_parallel:
+            return dist.get_world_size()
+        return 1

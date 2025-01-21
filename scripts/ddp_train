@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+
+if __name__ == '__main__':
+    import os, sys
+    arguments = sys.argv[1:]
+    run_file_name = arguments[0]
+
+    os.environ['PARALLEL_TYPE'] = 'ddp'
+    command = f'torchrun --standalone --nproc_per_node=gpu {run_file_name}'
+
+    print(f'real command is {command}')
+    os.system(command)

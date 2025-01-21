@@ -21,23 +21,6 @@ class TrainerTools:
             }
 
             parallel_type = os.environ.get('PARALLEL_TYPE', 'none')
-
-            # smart模式
-            # 如果多卡
-            #   1. 安装了deepspeed，则使用deepspeed
-            #   2. 没有安装deepspeed, 使用ddp
-            # 否则使用none
-            if parallel_type == 'smart':
-                global_rank = int(os.environ.get('RANK', -1))
-                if global_rank == -1:
-                    parallel_type = 'none'
-                else:
-                    try:
-                        import deepspeed
-                        parallel_type = 'ds'
-                    except:
-                        parallel_type = 'ddp'
-
             self.parallel = parallel_types[parallel_type]()
 
             self.tokenizer = Tokenizer(os.environ.get('TOKENIZERS_TYPE', 'qwen'))

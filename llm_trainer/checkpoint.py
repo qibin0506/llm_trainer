@@ -5,6 +5,8 @@ from torch import nn
 from torch.optim import Optimizer
 
 from .parallel_ds import DsParallel
+from .parallel_fsdp import FsdpParallel
+from .parallel_ddp import DdpParallel
 from .scheduler import LRScheduler
 from .tools import TrainerTools
 from .dcp import save_dcp, load_dcp, convert_dcp_to_pth
@@ -14,6 +16,18 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 DEFAULT_CHECKPOINT_NAME = "checkpoint.pth"
 
+
+def _can_use_dcp(model: nn.Module) -> bool:
+    if os.environ.get('ENABLE_DCP', '1') != '1':
+        return False
+
+    # 如果是fsdp或者ddp，才能使用dcp保存
+    if (isinstance(TrainerTools().parallel, FsdpParallel)
+            or isinstance(TrainerTools().parallel, DdpParallel)):
+        return True
+
+    return False
+
 def save_checkpoint(
         model: nn.Module,
         optimizer: Optional[Optimizer] = None
@@ -21,7 +35,7 @@ def save_checkpoint(
     if isinstance(TrainerTools().parallel, DsParallel):
         from .ds_checkpoint import save_ds_checkpoint
         save_ds_checkpoint(model)
-    elif os.environ.get('ENABLE_DCP', '1') == '1':
+    elif _can_use_dcp(model):
         save_dcp(model, optimizer)
     else:
         if isinstance(model, FSDP):
@@ -60,7 +74,7 @@ def load_checkpoint(
     if isinstance(TrainerTools().parallel, DsParallel):
         from .ds_checkpoint import load_ds_checkpoint
         load_ds_checkpoint(model)
-    elif os.environ.get('ENABLE_DCP', '1') == '1':
+    elif _can_use_dcp(model):
         load_dcp(model, optimizer)
     else:
         checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)
@@ -88,7 +102,7 @@ def load_checkpoint_for_eval(
     if isinstance(TrainerTools().parallel, DsParallel):
         from .ds_checkpoint import load_ds_checkpoint_for_eval
         load_ds_checkpoint_for_eval(model)
-    elif os.environ.get('ENABLE_DCP', '1') == '1':
+    elif _can_use_dcp(model):
         checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)
 
         # load_dcp方式在cpu上会报错，所以改为先将ckpt转换为pth，然后再加载pth

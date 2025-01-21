@@ -18,18 +18,17 @@ def init_env():
 
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-    os.environ['TOKENIZERS_TYPE'] = '1'
+    os.environ['TOKENIZERS_TYPE'] = 'qwen'  # or bert
     os.environ['TOKEN_DIR'] = './tokens/'
 
-    os.environ['SAVE_DIR'] = './'
+    os.environ['LOG_DIR'] = './log/'
 
-    os.environ['PARALLEL_TYPE'] = 'fsdp'  # or 'ddp'
+    os.environ['PARALLEL_TYPE'] = 'smart'  # or 'ddp'
 
     os.environ['ENABLE_DCP'] = '1'
+    os.environ['DIST_CHECKPOINT_DIR'] = 'ckpt_dir'
     os.environ['CHECKPOINT_NAME'] = 'ckpt.pth'
     os.environ['EVAL_CHECKPOINT_NAME'] = 'eval_ckpt.pth'
-    os.environ['DCP_DIR'] = 'ckpt_dir'
-    # os.environ['CHECKPOINT_DIR'] = 'ckpt_dir'
 
 
 def get_config():

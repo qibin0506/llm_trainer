@@ -18,7 +18,6 @@ if __name__ == '__main__':
     os.environ['PARALLEL_TYPE'] = parallel_type
 
     if parallel_type == 'ds':
-        print('real command: ')
         command = f'deepspeed {run_file_name}'
     elif parallel_type == 'ddp':
         command = f'torchrun --standalone --nproc_per_node=gpu {run_file_name}'

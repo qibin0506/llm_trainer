@@ -214,7 +214,7 @@ def _streaming_generate(
     )
 
     for (token, is_full_result) in generate_text_iterator:
-        yield TrainerTools().tokenizer.decode_to_text(token), is_full_result
+        yield token, is_full_result
 
 
 def streaming_generate(
@@ -241,9 +241,9 @@ def streaming_generate(
         suppress_tokens=suppress_tokens
     )
 
-    for (text, is_full_result) in text_iterator:
+    for (token, is_full_result) in text_iterator:
         if not is_full_result:
-            yield text
+            yield TrainerTools().tokenizer.decode_to_text(token)
 
 
 def generate(
@@ -270,7 +270,7 @@ def generate(
         suppress_tokens=suppress_tokens
     )
 
-    for (text, is_full_result) in text_iterator:
+    for (token, is_full_result) in text_iterator:
         if is_full_result:
-            return text
+            yield TrainerTools().tokenizer.decode_to_text(token)
 

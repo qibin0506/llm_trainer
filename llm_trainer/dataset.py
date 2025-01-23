@@ -29,9 +29,10 @@ class LineByLineTextDataset(Dataset):
     """
     适用于sft阶段
     """
-    def __init__(self, file_path):
+    def __init__(self, file_path, max_len):
         super().__init__()
 
+        self.max_len = max_len
         self.input_ids = []
         with open(file_path, 'rb') as f:
             tokens = pickle.load(f)
@@ -41,5 +42,6 @@ class LineByLineTextDataset(Dataset):
         return len(self.input_ids)
 
     def __getitem__(self, item):
-        # inputs = inputs[:self.ctx_len]
-        return torch.tensor(self.input_ids[item]).long()
+        inputs = self.input_ids[item]
+        inputs = inputs[:self.max_len]
+        return torch.tensor(inputs).long()

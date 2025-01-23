@@ -60,7 +60,7 @@ def estimate_data_size(
             data_size += len(dataset)
     else:
         for file_path in all_files:
-            dataset = LineByLineTextDataset(file_path)
+            dataset = LineByLineTextDataset(file_path, max_position_embeddings)
             data_size += len(dataset)
 
     return data_size

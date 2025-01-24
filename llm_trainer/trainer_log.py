@@ -63,15 +63,17 @@ def _submit_gen_task(eval_model: torch.nn.Module, tag, prompt, max_position_embe
 
 def log_loss(
         epoch: int,
+        file_idx: int,
+        file_count: int,
         batch: int,
         batch_count: int,
         loss
 ):
     if TrainerTools().parallel.is_main_process:
         log_dir = _get_log_dir()
-        log(f"epoch: {epoch}, batch: {batch}/{batch_count}, loss: {loss}")
+        log(f"epoch: {epoch}, file: {file_idx}/{file_count}, batch: {batch}/{batch_count}, loss: {loss}")
         log(
-            f"epoch: {epoch}, batch: {batch}/{batch_count}, loss: {loss}\n",
+            f"epoch: {epoch}, file: {file_idx}/{file_count}, batch: {batch}/{batch_count}, loss: {loss}\n",
             f'{log_dir}log.txt'
         )
 

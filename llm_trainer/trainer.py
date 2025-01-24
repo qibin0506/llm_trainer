@@ -298,11 +298,13 @@ class Trainer:
     def _log_loss(
             self,
             epoch: int,
+            file_idx: int,
+            file_count: int,
             batch: int,
             batch_count: int,
             loss
     ):
-        log_loss(epoch, batch, batch_count, loss)
+        log_loss(epoch, file_idx, file_count, batch, batch_count, loss)
 
     def _on_exception(self, e: Exception, epoch: int, batch: int):
         on_exception(e, epoch, batch)
@@ -337,8 +339,11 @@ class Trainer:
 
         for epoch in range(self.train_config.n_epochs):
             self.train_model.train()
+            file_count = len(self.train_config.all_files)
 
-            for file_path in self.train_config.all_files:
+            for file_idx in range(file_count):
+                file_path = self.train_config.all_files[file_idx]
+
                 dataset = self._create_dataset(file_path)
                 train_data_loader = TrainerTools().parallel.process_dataloader(
                     dataset=dataset,
@@ -399,7 +404,7 @@ class Trainer:
                                 torch.nn.utils.clip_grad_norm_(self.train_model.parameters(), 1.0)
 
                             self._step()
-                            self._log_loss(epoch, batch, batch_count_per_file, loss_accumulation.item())
+                            self._log_loss(epoch, file_idx, file_count, batch, batch_count_per_file, loss_accumulation.item())
                             # reset to default
                             loss_accumulation = 0.0
                     except Exception as e:

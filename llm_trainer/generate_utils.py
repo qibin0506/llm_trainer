@@ -272,5 +272,5 @@ def generate(
 
     for (token, is_full_result) in text_iterator:
         if is_full_result:
-            yield TrainerTools().tokenizer.decode_to_text(token)
+            return TrainerTools().tokenizer.decode_to_text(token)
 

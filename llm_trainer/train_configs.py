@@ -186,11 +186,13 @@ class DsConfig:
             zero_config: Optional[DsZeROConfig] = DsZero3Config(),
             fp16_config: Optional[DsFp16Config] = DsFp16Config(),
             bf16_config: Optional[DsBf16Config] = DsBf16Config(),
+            gradient_clipping: Optional[Union[str, float]] = 'auto',
             activation_checkpointing: Optional[DsActivationCheckpointingConfig] = None
     ):
         self.zero_config = zero_config
         self.fp16_config = fp16_config
         self.bf16_config = bf16_config
+        self.gradient_clipping = gradient_clipping
         self.activation_checkpointing = activation_checkpointing
 
 

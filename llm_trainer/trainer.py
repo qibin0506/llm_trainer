@@ -154,7 +154,7 @@ class Trainer:
         if isinstance(TrainerTools().parallel, DsParallel) and self.train_config.ds_config:
             parallel_kwargs = {
                 'gradient_accumulation_steps': 1,
-                'gradient_clipping': False,
+                'gradient_clipping': self.train_config.ds_config.gradient_clipping,
                 'train_micro_batch_size_per_gpu': self.train_config.batch_size
             }
 
@@ -398,7 +398,8 @@ class Trainer:
                             if TrainerTools().parallel.parallel_train:
                                 dist.all_reduce(loss_accumulation, dist.ReduceOp.AVG)
 
-                            if self.lr_scheduler.can_clip_grad():
+                            # ds模式已经集成gradient_clipping
+                            if not isinstance(TrainerTools().parallel, DsParallel) and self.lr_scheduler.can_clip_grad():
                                 # clip grad
                                 self.scalar.unscale_(self.optimizer)
                                 torch.nn.utils.clip_grad_norm_(self.train_model.parameters(), 1.0)

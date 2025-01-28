@@ -71,9 +71,9 @@ def log_loss(
 ):
     if TrainerTools().parallel.is_main_process:
         log_dir = _get_log_dir()
-        log(f"epoch: {epoch}, file: {file_idx}/{file_count}, batch: {batch}/{batch_count}, loss: {loss}")
+        log(f"epoch: {epoch}, file: {file_idx + 1}/{file_count}, batch: {batch}/{batch_count}, loss: {loss}")
         log(
-            f"epoch: {epoch}, file: {file_idx}/{file_count}, batch: {batch}/{batch_count}, loss: {loss}\n",
+            f"epoch: {epoch}, file: {file_idx + 1}/{file_count}, batch: {batch}/{batch_count}, loss: {loss}\n",
             f'{log_dir}log.txt'
         )
 

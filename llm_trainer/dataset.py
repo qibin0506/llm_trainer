@@ -1,6 +1,19 @@
+import os.path
+
 import torch
 from torch.utils.data import Dataset
 import pickle
+
+from .tools import TrainerTools
+
+
+def try_load_pkl(file_path: str):
+    tokens = None
+    try:
+        with open(file_path, 'rb') as f:
+            tokens = pickle.load(f)
+    finally:
+        return tokens
 
 
 class TextDataset(Dataset):
@@ -12,11 +25,20 @@ class TextDataset(Dataset):
 
         self.input_ids = []
 
-        with open(file_path, 'rb') as f:
-            all_tokens = pickle.load(f)
+        tokens = try_load_pkl(file_path)
+        if not tokens:
+            cache_file = f'{file_path}.cache'
+            if os.path.exists(cache_file):
+                tokens = try_load_pkl(cache_file)
+            else:
+                with open(file_path, 'r') as f:
+                    tokens = TrainerTools().tokenizer.encode_to_token(f.read(), False, covert_tensor=False)
 
-        for i in range(0, len(all_tokens) - block_size + 1, stride):
-            self.input_ids.append(all_tokens[i:i+block_size])
+                with open(cache_file, 'wb') as f:
+                    pickle.dump(tokens, f)
+
+        for i in range(0, len(tokens) - block_size + 1, stride):
+            self.input_ids.append(tokens[i:i+block_size])
 
     def __len__(self):
         return len(self.input_ids)
@@ -34,9 +56,22 @@ class LineByLineTextDataset(Dataset):
 
         self.max_len = max_len
         self.input_ids = []
-        with open(file_path, 'rb') as f:
-            tokens = pickle.load(f)
-            self.input_ids = tokens
+
+        tokens = try_load_pkl(file_path)
+        if not tokens:
+            cache_file = f'{file_path}.cache'
+            if os.path.exists(cache_file):
+                tokens = try_load_pkl(cache_file)
+            else:
+                tokens = []
+                with open(file_path, 'r') as f:
+                    for line in f:
+                        tokens.append(TrainerTools().tokenizer.encode_to_token(line, False, covert_tensor=False))
+
+                with open(cache_file, 'wb') as f:
+                    pickle.dump(tokens, f)
+
+        self.input_ids = tokens
 
     def __len__(self):
         return len(self.input_ids)

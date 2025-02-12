@@ -1,20 +1,30 @@
+from abc import ABC, abstractmethod
 import torch
 import math
 from .log import log
 
-class LRScheduler:
+class LRScheduler(ABC):
     @property
+    @abstractmethod
     def cur_steps(self):
-        raise NotImplementedError()
+        pass
 
+    @property
+    @abstractmethod
+    def cur_lr(self):
+        pass
+
+    @abstractmethod
     def update_steps(self, steps):
-        raise NotImplementedError()
+        pass
 
+    @abstractmethod
     def step(self):
-        raise NotImplementedError()
+        pass
 
+    @abstractmethod
     def can_clip_grad(self):
-        raise NotImplementedError()
+        pass
 
 
 class CosineAnnealingWarmupLRScheduler(LRScheduler):
@@ -38,6 +48,7 @@ class CosineAnnealingWarmupLRScheduler(LRScheduler):
         self.total_iters = total_iters
         self.lr_increment = (max_lr - initial_lr) / warmup_iters
         self.steps = -1
+        self.current_lr = initial_lr
 
         log(f'warmup_iters: {self.warmup_iters},'
               f' initial_lr: {self.initial_lr},'
@@ -49,6 +60,10 @@ class CosineAnnealingWarmupLRScheduler(LRScheduler):
     @property
     def cur_steps(self):
         return self.steps
+
+    @property
+    def cur_lr(self):
+        return self.current_lr
 
     def update_steps(self, steps):
         log(f'update step to {steps}')
@@ -74,12 +89,21 @@ class CosineAnnealingWarmupLRScheduler(LRScheduler):
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = lr
 
+        self.current_lr = lr
+
 
 class NoneLRScheduler(LRScheduler):
+
+    def __init__(self, initial_lr):
+        self.current_lr = initial_lr
 
     @property
     def cur_steps(self):
         return -1
+
+    @property
+    def cur_lr(self):
+        return self.current_lr
 
     def update_steps(self, steps):
         pass

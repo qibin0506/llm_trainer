@@ -1,5 +1,6 @@
 import os
 from typing import Optional, Tuple
+from abc import ABC, abstractmethod
 
 import torch
 from torch import nn
@@ -9,7 +10,7 @@ from torch.utils.data.distributed import DistributedSampler
 from .log import log
 
 
-class Parallel:
+class Parallel(ABC):
     def __init__(
             self,
             init_process_group: bool = True,
@@ -58,13 +59,14 @@ class Parallel:
             self.device_type: str = device
 
 
+    @abstractmethod
     def process(
             self,
             model: nn.Module,
             optimizer: torch.optim.Optimizer,
             kwargs: Optional[dict] = None
     ) -> Tuple[nn.Module, torch.optim.Optimizer]:
-        raise NotImplementedError
+        pass
 
     def process_dataloader(
             self,

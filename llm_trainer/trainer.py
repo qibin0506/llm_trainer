@@ -8,13 +8,18 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.utils.data import Dataset
 from llama import LlamaModel
 
-from .train_configs import TrainConfig, DsZero2Config, DsZero3Config
 from .parallel_ds import DsParallel
 from .parallel_fsdp import FsdpParallel
 from .tools import TrainerTools
 from .loss import LMLoss, KDLoss
 from .log import log
 from .dataset import TextDataset
+
+from .train_configs import (
+    TrainConfig,
+    DsZero2Config,
+    DsZero3Config
+)
 
 from .scheduler import (
     LRScheduler,
@@ -148,7 +153,7 @@ class Trainer:
                 total_iters=train_iters
             )
 
-        return NoneLRScheduler()
+        return NoneLRScheduler(initial_lr)
 
     def _convert_train_args(self) -> Tuple[dict, dict, dict]:
         if isinstance(TrainerTools().parallel, DsParallel) and self.train_config.ds_config:
@@ -304,7 +309,7 @@ class Trainer:
             batch_count: int,
             loss
     ):
-        log_loss(epoch, file_idx, file_count, batch, batch_count, loss)
+        log_loss(epoch, file_idx, file_count, batch, batch_count, loss, self.lr_scheduler.cur_lr)
 
     def _on_exception(self, e: Exception, epoch: int, batch: int):
         on_exception(e, epoch, batch)
@@ -433,13 +438,11 @@ class Trainer:
 
 """
 todo: 
-调研deepspeed，fsdp方式训练不收敛
 0. 实现按照token数据确定batch大小，不固定batch的方案 done
 1. 处理异常重启
-2. 调研fsdp2 没有太多资料
-3. Yarn和phi3的Phi3LongRoPEScaledRotaryEmbedding调研
-4. MLA调研
-5. DPO调研
-6. inference使用缓存model，每个进程缓存一个
-7. 多模态
+2. Yarn和phi3的Phi3LongRoPEScaledRotaryEmbedding调研
+3. MLA调研
+4. DPO调研
+5. inference使用缓存model，每个进程缓存一个
+6. 多模态
 """

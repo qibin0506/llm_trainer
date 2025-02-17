@@ -79,15 +79,15 @@ class Tokenizer:
         return self.tokenizer.decode(token.squeeze(0))
 
 
-if __name__ == '__main__':
-    tokenizer = Tokenizer(TOKEN_TYPE_YI)
-    print(tokenizer.vocab_size)
-    print(tokenizer.encode_to_token(tokenizer.eot_text), tokenizer.eot)
-    print(tokenizer.encode_to_token(tokenizer.pad_text), tokenizer.pad)
-    print(tokenizer.encode_to_token(tokenizer.unk_text), tokenizer.unk)
-    print(tokenizer.encode_to_token(tokenizer.user_text), tokenizer.user)
-    print(tokenizer.encode_to_token(tokenizer.bot_text), tokenizer.bot)
-    print(tokenizer.encode_to_token(tokenizer.bor_text), tokenizer.bor)
-    print(tokenizer.encode_to_token(tokenizer.eor_text), tokenizer.eor)
+# if __name__ == '__main__':
+#     tokenizer = Tokenizer(TOKEN_TYPE_YI)
+#     print(tokenizer.vocab_size)
+#     print(tokenizer.encode_to_token(tokenizer.eot_text), tokenizer.eot)
+#     print(tokenizer.encode_to_token(tokenizer.pad_text), tokenizer.pad)
+#     print(tokenizer.encode_to_token(tokenizer.unk_text), tokenizer.unk)
+#     print(tokenizer.encode_to_token(tokenizer.user_text), tokenizer.user)
+#     print(tokenizer.encode_to_token(tokenizer.bot_text), tokenizer.bot)
+#     print(tokenizer.encode_to_token(tokenizer.bor_text), tokenizer.bor)
+#     print(tokenizer.encode_to_token(tokenizer.eor_text), tokenizer.eor)
 
 

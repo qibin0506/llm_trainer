@@ -63,7 +63,7 @@ class Tokenizer:
 
         self.vocab_size = len(self.tokenizer)
 
-    def encode_to_token(self, text: str, unsqueeze=False, covert_tensor=False):
+    def encode_to_token(self, text: str, unsqueeze=True, covert_tensor=True):
         # [x,x,x]
         encoded = self.tokenizer.encode(text, add_special_tokens=False)
 

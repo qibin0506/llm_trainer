@@ -1,5 +1,5 @@
 from contextlib import nullcontext
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import torch
 from torch import nn
@@ -83,8 +83,7 @@ class Trainer:
         self.lr_scheduler = self._init_lr_scheduler(batch_count, initial_lr)
         self.eval_model: Optional[nn.Module] = self._init_eval_model()
 
-        self.criterion = LMLoss()
-        self.kd_loss = KDLoss() if train_config.kd_config else None
+        self.criterion, self.kd_loss = self._init_loss()
 
         self.ctx = torch.autocast(
             device_type=TrainerTools().parallel.device_type,
@@ -154,6 +153,23 @@ class Trainer:
             )
 
         return NoneLRScheduler(initial_lr)
+
+    def _init_loss(self):
+        critical_tokens: Optional[List[int]] = None
+        critical_alpha: float = 1.0
+        if self.train_config.loss_config.critical_tokens:
+            critical_tokens = self.train_config.loss_config.critical_tokens
+            critical_alpha = self.train_config.loss_config.critical_alpha
+
+        criterion = LMLoss(
+            critical_tokens=critical_tokens,
+            critical_alpha=critical_alpha,
+            vocab_size=TrainerTools().tokenizer.vocab_size
+        )
+
+        kd_loss = KDLoss() if self.train_config.kd_config else None
+
+        return criterion, kd_loss
 
     def _convert_train_args(self) -> Tuple[dict, dict, dict]:
         if isinstance(TrainerTools().parallel, DsParallel) and self.train_config.ds_config:

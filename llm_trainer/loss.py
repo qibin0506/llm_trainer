@@ -1,22 +1,31 @@
-from typing import Tuple
+from typing import List, Optional
 import torch
 from torch import nn
 import torch.nn.functional as F
-
-# def pretrain_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-#     logits = logits.reshape(-1, logits.shape[-1])
-#     targets = labels.reshape(-1)
-#
-#     return F.cross_entropy(logits, targets, ignore_index=-100)
 
 
 class LMLoss(nn.Module):
     """
     llm loss
     """
-    def __init__(self, ignore_index: int = -100):
+    def __init__(
+            self,
+            ignore_index: int = -100,
+            *,
+            critical_tokens: Optional[List[int]] = None,
+            critical_alpha: float = 1.0,
+            vocab_size: int = 0
+    ):
         super().__init__()
         self.ignore_index = ignore_index
+        self.critical_tokens = critical_tokens
+        self.critical_alpha = critical_alpha
+
+        if critical_tokens and vocab_size > 0:
+            self.register_buffer('weights', torch.ones(vocab_size))
+            # 为关键token设置权重
+            self.weights[self.critical_tokens] = critical_alpha
+
 
     def forward(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         # logits shape (batch, seq_len, vocab_size)
@@ -27,7 +36,22 @@ class LMLoss(nn.Module):
         logits = shift_logits.reshape(-1, logits.shape[-1])
         targets = shift_labels.reshape(-1)
 
-        return F.cross_entropy(logits, targets, ignore_index=self.ignore_index)
+        ce_loss = F.cross_entropy(
+            logits,
+            targets,
+            ignore_index=self.ignore_index,
+            weight=self.weights.to(logits.device, dtype=logits.dtype) if self.critical_tokens else None
+        )
+
+        # 添加额外惩罚项（可选）
+        # if self.critical_tokens:
+        #     crit_mask = torch.isin(targets, torch.tensor(self.critical_tokens).to(targets.device))
+        #     crit_logits = logits[crit_mask]
+        #     crit_targets = targets[crit_mask]
+        #     extra_loss = F.cross_entropy(crit_logits, crit_targets, ignore_index=self.ignore_index)
+        #     return ce_loss + extra_loss * (self.critical_alpha - 1)  # 增强惩罚
+
+        return ce_loss
 
 
 class KDLoss(nn.Module):

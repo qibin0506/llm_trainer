@@ -1,4 +1,4 @@
-from typing import Optional, Union, Set, Type, Callable
+from typing import Optional, Union, Set, Type, Callable, List
 from torch import nn
 from llama import LlamaConfig
 
@@ -284,6 +284,18 @@ class LrSchedulerConfig:
         self.warmup_iters_ratio = warmup_iters_ratio
         self.min_lr_ratio = min_lr_ratio
 
+
+class LossConfig:
+    def __init__(
+            self,
+            *,
+            critical_tokens: Optional[List[int]] = None,
+            critical_alpha: float = 1.0
+    ):
+        super().__init__()
+        self.critical_tokens = critical_tokens
+        self.critical_alpha = critical_alpha
+
 class KDConfig:
     """
         知识蒸馏模式配置项
@@ -344,6 +356,7 @@ class TrainConfig:
             all_files: Optional[list[any]] = None,
             gradient_accumulation_steps: int = 0,
             eval_batch_interval: int = 100,
+            loss_config: LossConfig = LossConfig(),
             lr_scheduler_config: LrSchedulerConfig = LrSchedulerConfig(),
             ds_config: DsConfig = DsConfig(),
             fsdp_config: FsdpConfig = FsdpConfig(),
@@ -357,6 +370,7 @@ class TrainConfig:
         self.all_files = all_files
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.eval_batch_interval = eval_batch_interval
+        self.loss_config = loss_config
         self.lr_scheduler_config = lr_scheduler_config
         self.ds_config = ds_config
         self.fsdp_config = fsdp_config

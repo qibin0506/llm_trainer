@@ -10,6 +10,7 @@ from .utils import sft_collate_fn
 class SFTTrainer(Trainer):
     def __init__(
             self,
+            *,
             train_config: TrainConfig,
             prompt_on_batch: str,
             prompt_on_epoch: str,

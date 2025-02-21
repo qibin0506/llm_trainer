@@ -1,3 +1,4 @@
+import time
 from contextlib import nullcontext
 from typing import Optional, Tuple, List
 
@@ -450,6 +451,8 @@ class Trainer:
                 TrainerTools().parallel.on_epoch_end(epoch)
                 self._on_epoch_end(epoch)
 
+        # 等待checkpoint保存完成
+        time.sleep(10)
         TrainerTools().parallel.destroy()
 
 """

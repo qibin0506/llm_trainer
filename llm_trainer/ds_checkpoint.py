@@ -21,7 +21,7 @@ def save_ds_checkpoint(model: nn.Module):
 
     # 删除历史checkpoint
     ckpt_paths = glob(os.path.join(ckpt_dir, "global_*"))
-    if len(ckpt_paths) > 1:
+    if len(ckpt_paths) > 2:
         # 按修改时间排序，找到最旧的目录
         oldest_ckpt = sorted(ckpt_paths, key=os.path.getmtime)[0]
         try:

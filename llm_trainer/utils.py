@@ -13,12 +13,26 @@ def set_seed(seed=42):
 
 
 def pretrain_collate_fn(batch_data):
+    # [[x,x,x], [y,y,y]]
     inputs = pad_sequence(batch_data, batch_first=True, padding_value=TrainerTools().tokenizer.pad)
     # crossEntropy默认的ignore_index是-100
     labels = pad_sequence(batch_data, batch_first=True, padding_value=-100)
 
     return inputs, labels
 
+
+def _mask_prompt(labels):
+    # 支持多轮会话的mask
+    for batch, label in enumerate(labels):
+        start_index = -1
+        for index, token in enumerate(label):
+            if token == TrainerTools().tokenizer.user:
+                start_index = index
+            elif token == TrainerTools().tokenizer.bot and start_index != -1:
+                labels[batch, start_index:index + 1] = -100
+                start_index = -1
+
+    return labels
 
 def sft_collate_fn(batch_data):
     """
@@ -39,16 +53,7 @@ def sft_collate_fn(batch_data):
     """
 
     inputs, labels = pretrain_collate_fn(batch_data)
-
-    # 支持多轮会话的mask
-    for batch, label in enumerate(labels):
-        start_index = -1
-        for index, token in enumerate(label):
-            if token == TrainerTools().tokenizer.user:
-                start_index = index
-            elif token == TrainerTools().tokenizer.bot and start_index != -1:
-                labels[batch, start_index:index + 1] = -100
-                start_index = -1
+    labels = _mask_prompt(labels)
 
     # 支持单轮会话的mask
     # inputs, labels = pretrain_collate_fn(batch_data)
@@ -60,3 +65,37 @@ def sft_collate_fn(batch_data):
     #     labels[batch, :bot_idx] = torch.tensor([-100] * bot_idx)
 
     return inputs, labels
+
+
+def dpo_collate_fn(batch_data):
+    # batch_data: [{'chosen': chosen, 'rejected': rejected}, {'chosen': chosen, 'rejected': rejected}]
+    chosen_inputs = []
+    chosen_labels = []
+    rejected_inputs = []
+    rejected_labels = []
+
+    max_len = 0
+    for key in ['chosen', 'rejected']:
+        max_len = max(max(len(item[key]) for item in batch_data), max_len)
+
+    for item in batch_data:
+        chosen_sequence = item['chosen']
+        chosen_inputs.append(chosen_sequence + [TrainerTools().tokenizer.pad] * (max_len - len(chosen_sequence)))
+        chosen_labels.append(chosen_sequence + [-100] * (max_len - len(chosen_sequence)))
+
+        rejected_sequence = item['rejected']
+        rejected_inputs.append(rejected_sequence + [TrainerTools().tokenizer.pad] * (max_len - len(rejected_sequence)))
+        rejected_labels.append(rejected_sequence + [-100] * (max_len - len(rejected_sequence)))
+
+    chosen_inputs = torch.tensor(chosen_inputs).long()
+    chosen_labels = _mask_prompt(torch.tensor(chosen_labels).long())
+
+    rejected_inputs = torch.tensor(rejected_inputs).long()
+    rejected_labels = _mask_prompt(torch.tensor(rejected_labels).long())
+
+    return {
+        'chosen_inputs': chosen_inputs,
+        'chosen_labels': chosen_labels,
+        'rejected_inputs': rejected_inputs,
+        'rejected_labels': rejected_labels
+    }

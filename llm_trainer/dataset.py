@@ -80,3 +80,35 @@ class LineByLineTextDataset(Dataset):
         inputs = self.input_ids[item]
         inputs = inputs[:self.max_len]
         return torch.tensor(inputs).long()
+
+
+class DPODataset(Dataset):
+    def __init__(self, file_path, max_len):
+        self.max_len = max_len
+        self.prompt_ids = []
+        self.chosen_ids = []
+        self.rejected_ids = []
+
+        # [{'prompt': [], 'chosen': [], 'rejected': []}]
+        tokens = try_load_pkl(file_path)
+        for token in tokens:
+            self.prompt_ids.append(token['prompt'])
+            self.chosen_ids.append(token['chosen'])
+            self.rejected_ids.append(token['rejected'])
+
+    def __len__(self):
+        return len(self.prompt_ids)
+
+    def __getitem__(self, item):
+        prompt_id = self.prompt_ids[item]
+        chosen_id = self.chosen_ids[item]
+        rejected_id = self.rejected_ids[item]
+
+        chosen = prompt_id + chosen_id
+        rejected = prompt_id + rejected_id
+
+        chosen = chosen[:self.max_len]
+        rejected = rejected[:self.max_len]
+
+        return {'chosen': chosen, 'rejected': rejected}
+

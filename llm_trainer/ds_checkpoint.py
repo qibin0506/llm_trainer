@@ -30,12 +30,12 @@ def save_ds_checkpoint(model: nn.Module):
             pass
 
 
-def load_ds_checkpoint(model: nn.Module):
+def load_ds_checkpoint(model: nn.Module, load_module_only: bool = False):
     assert isinstance(model, DeepSpeedEngine)
     ckpt_dir = os.environ.get('DIST_CHECKPOINT_DIR', 'checkpoint')
     # 包括model、optimizer等状态
     if os.path.exists(ckpt_dir):
-        model.load_checkpoint(load_dir=ckpt_dir)
+        model.load_checkpoint(load_dir=ckpt_dir, load_module_only=load_module_only)
 
 
 def load_ds_checkpoint_for_eval(model: nn.Module):

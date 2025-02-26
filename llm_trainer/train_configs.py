@@ -296,6 +296,20 @@ class LossConfig:
         self.critical_tokens = critical_tokens
         self.critical_alpha = critical_alpha
 
+
+class DPOLossConfig:
+    def __init__(
+            self,
+            beta: float,
+            label_smoothing: float = 0.0,
+            ipo: bool = False
+    ):
+        super().__init__()
+        self.beta = beta
+        self.label_smoothing = label_smoothing
+        self.ipo = ipo
+
+
 class KDConfig:
     """
         知识蒸馏模式配置项
@@ -357,6 +371,7 @@ class TrainConfig:
             gradient_accumulation_steps: int = 0,
             eval_batch_interval: int = 100,
             loss_config: LossConfig = LossConfig(),
+            dpo_loss_config: Optional[DPOLossConfig] = None,
             lr_scheduler_config: LrSchedulerConfig = LrSchedulerConfig(),
             ds_config: DsConfig = DsConfig(),
             fsdp_config: FsdpConfig = FsdpConfig(),
@@ -371,6 +386,7 @@ class TrainConfig:
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.eval_batch_interval = eval_batch_interval
         self.loss_config = loss_config
+        self.dpo_loss_config = dpo_loss_config
         self.lr_scheduler_config = lr_scheduler_config
         self.ds_config = ds_config
         self.fsdp_config = fsdp_config

@@ -69,11 +69,12 @@ def save_checkpoint(
 def load_checkpoint(
         model: nn.Module,
         optimizer: Optional[Optimizer] = None,
-        device: Optional[Union[torch.device, str]] = None
+        device: Optional[Union[torch.device, str]] = None,
+        load_module_only: bool = False
 ):
     if isinstance(TrainerTools().parallel, DsParallel):
         from .ds_checkpoint import load_ds_checkpoint
-        load_ds_checkpoint(model)
+        load_ds_checkpoint(model, load_module_only=load_module_only)
     elif _can_use_dcp(model):
         load_dcp(model, optimizer)
     else:

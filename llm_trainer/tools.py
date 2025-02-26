@@ -8,29 +8,32 @@ from .parallel_none import NoneParallel
 from .log import log
 
 
+parallel_types = {
+    'ds': DsParallel,
+    'fsdp': FsdpParallel,
+    'ddp': DdpParallel,
+    'none': NoneParallel
+}
+
 class TrainerTools:
     def __init__(self):
         if not hasattr(TrainerTools, "_first_init"):
             TrainerTools._first_init = True
 
-            parallel_types = {
-                'ds': DsParallel,
-                'fsdp': FsdpParallel,
-                'ddp': DdpParallel,
-                'none': NoneParallel
-            }
-
-            parallel_type = os.environ.get('PARALLEL_TYPE', 'none')
-            self.parallel = parallel_types[parallel_type]()
+            self.parallel = self.new_parallel()
 
             self.tokenizer = Tokenizer(os.environ.get('TOKENIZERS_TYPE', 'zh_llama'))
             self.use_amp = 'cuda' in self.parallel.device and not isinstance(self.parallel, DsParallel)
             self.dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
 
-            log(f'parallel_type={parallel_type},'
-                f' word_size={self.parallel.world_size},'
+            log(f'word_size={self.parallel.world_size},'
                 f' use_amp={self.use_amp},'
                 f' dtype={self.dtype}')
+
+    def new_parallel(self):
+        parallel_type = os.environ.get('PARALLEL_TYPE', 'none')
+        log(f'parallel_type={parallel_type}')
+        return parallel_types[parallel_type]()
 
     def __new__(cls, *args, **kwargs):
         if not hasattr(TrainerTools, "_instance"):

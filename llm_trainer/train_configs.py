@@ -302,12 +302,14 @@ class DPOLossConfig:
             self,
             beta: float,
             label_smoothing: float = 0.0,
-            ipo: bool = False
+            ipo: bool = False,
+            nll_loss: bool = False
     ):
         super().__init__()
         self.beta = beta
         self.label_smoothing = label_smoothing
         self.ipo = ipo
+        self.nll_loss = nll_loss
 
 
 class KDConfig:

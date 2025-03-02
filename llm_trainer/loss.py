@@ -90,6 +90,23 @@ class DPOLoss(nn.Module):
         self.label_smoothing = label_smoothing
         self.ipo = ipo
 
+    def _log_probs_from_logits(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        # https://github.com/OpenRLHF/OpenRLHF/pull/718#issuecomment-2641081881
+        if logits.dtype in [torch.float32, torch.float64]:
+            logits_labels = torch.gather(logits, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+            logsumexp_values = torch.stack(
+                [torch.logsumexp(l, dim=-1) for l in logits]  # loop to reduce peak mem consumption
+            )
+            log_probs_labels = logits_labels - logsumexp_values  # log_softmax(x_i) = x_i - logsumexp(x)
+        else:
+            log_probs_labels = []
+            for row_logits, row_labels in zip(logits, labels):  # loop to reduce peak mem consumption
+                row_log_probs = F.log_softmax(row_logits, dim=-1)
+                row_log_probs_labels = row_log_probs.gather(dim=-1, index=row_labels.unsqueeze(-1)).squeeze(-1)
+                log_probs_labels.append(row_log_probs_labels)
+            log_probs_labels = torch.stack(log_probs_labels)
+        return log_probs_labels
+
     def logprobs(self, logits, labels, mask):
         """
         Calculate the average log probabilities for a batch of sequences.
@@ -107,29 +124,21 @@ class DPOLoss(nn.Module):
         labels = labels[:, 1:].clone()
         logits = logits[:, :-1, :]
 
-        log_probs = F.log_softmax(logits, dim=-1)
+        # Shift mask right by one to align with labels
+        mask = mask[:, 1:].clone()
 
         # dummy token; we'll ignore the losses on these tokens later
         labels[labels == -100] = 0
 
         # Gather the log probabilities for the actual labels
-        selected_log_probs = torch.gather(
-            input=log_probs,
-            dim=-1,
-            index=labels.unsqueeze(-1)
-        ).squeeze(-1)
-
-        # Shift mask right by one to align with labels
-        mask = mask[:, 1:].clone()
+        per_token_logps = self._log_probs_from_logits(logits, labels)
 
         # Apply the mask to set log-probs of padding tokens to 0
-        selected_log_probs = selected_log_probs * mask
+        logprobs_sums = (per_token_logps * mask).sum(-1)
 
-        # Calculate the average log probability excluding padding token
-        num_nonpad_tokens = mask.sum(dim=-1)
-        avg_log_prob = selected_log_probs.sum(dim=-1) / num_nonpad_tokens
+        logprobs_means = (per_token_logps * mask).sum(-1) / mask.sum(-1)
 
-        return avg_log_prob
+        return logprobs_sums, -logprobs_means.mean()
 
     def forward(
             self,

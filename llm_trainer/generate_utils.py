@@ -141,8 +141,10 @@ def _generate_text(
         t = tokens[:, -max_position_embeddings:]
         with torch.no_grad():
             with ctx:
+                result = model(t, past_key_values=kv_cache, use_cache=use_kv_cache)
                 # logits (batch, seq_len, vocab_size)
-                logits, kv_cache = model(t, past_key_values=kv_cache, use_cache=use_kv_cache)
+                logits = result['logits']
+                kv_cache = result['past_key_values']
 
         # (batch, vocab_size)
         logits = logits[:, -1, :]

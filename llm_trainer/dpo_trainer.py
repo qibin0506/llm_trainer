@@ -177,17 +177,17 @@ class DPOTrainer(Trainer):
                             self.train_model.require_backward_grad_sync = need_update_grad
 
                         with self.ctx:
-                            chosen_policy_logits, _ = self.train_model(chosen_inputs, attention_mask=chosen_attention_mask)
-                            rejected_policy_logits, _ = self.train_model(rejected_inputs, attention_mask=rejected_attention_mask)
+                            chosen_policy_result = self.train_model(chosen_inputs, attention_mask=chosen_attention_mask)
+                            rejected_policy_result = self.train_model(rejected_inputs, attention_mask=rejected_attention_mask)
 
-                            chosen_reference_logits, _ = self.reference_model(chosen_inputs, attention_mask=chosen_attention_mask)
-                            rejected_reference_logits, _ = self.reference_model(rejected_inputs, attention_mask=rejected_attention_mask)
+                            chosen_reference_result = self.reference_model(chosen_inputs, attention_mask=chosen_attention_mask)
+                            rejected_reference_result = self.reference_model(rejected_inputs, attention_mask=rejected_attention_mask)
 
-                            chosen_policy_logprobs = self.criterion.logprobs(chosen_policy_logits, chosen_labels, chosen_attention_mask)
-                            rejected_policy_logprobs = self.criterion.logprobs(rejected_policy_logits, rejected_labels, rejected_attention_mask)
+                            chosen_policy_logprobs = self.criterion.logprobs(chosen_policy_result['logits'], chosen_labels, chosen_attention_mask)
+                            rejected_policy_logprobs = self.criterion.logprobs(rejected_policy_result['logits'], rejected_labels, rejected_attention_mask)
 
-                            chosen_reference_logprobs = self.criterion.logprobs(chosen_reference_logits, chosen_labels, chosen_attention_mask)
-                            rejected_reference_logprobs = self.criterion.logprobs(rejected_reference_logits, rejected_labels, rejected_attention_mask)
+                            chosen_reference_logprobs = self.criterion.logprobs(chosen_reference_result['logits'], chosen_labels, chosen_attention_mask)
+                            rejected_reference_logprobs = self.criterion.logprobs(rejected_reference_result['logits'], rejected_labels, rejected_attention_mask)
 
                             # calc loss
                             loss, chosen_rewards, rejected_rewards = self.criterion(

@@ -408,8 +408,8 @@ class Trainer:
                             result = self.train_model(inputs, attention_mask=attention_mask)
                             # calc loss
                             loss = self._calc_loss(inputs, attention_mask, result['logits'], labels)
-                            if result['aux_loss']:
-                                loss += result['aux_loss']
+                            if result['aux_loss'] and self.train_config.loss_config.aux_loss_coef:
+                                loss += self.train_config.loss_config.aux_loss_coef * result['aux_loss']
 
                         if gradient_accumulation_steps > 1:
                             loss = loss / gradient_accumulation_steps

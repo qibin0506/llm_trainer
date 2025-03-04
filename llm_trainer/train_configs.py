@@ -290,11 +290,13 @@ class LossConfig:
             self,
             *,
             critical_tokens: Optional[List[int]] = None,
-            critical_alpha: float = 1.0
+            critical_alpha: float = 1.0,
+            aux_loss_coef: Optional[float] = 1.0
     ):
         super().__init__()
         self.critical_tokens = critical_tokens
         self.critical_alpha = critical_alpha
+        self.aux_loss_coef = aux_loss_coef
 
 
 class DPOLossConfig:
@@ -303,13 +305,13 @@ class DPOLossConfig:
             beta: float,
             label_smoothing: float = 0.0,
             ipo: bool = False,
-            nll_loss: bool = False
+            nll_loss_coef: Optional[float] = None
     ):
         super().__init__()
         self.beta = beta
         self.label_smoothing = label_smoothing
         self.ipo = ipo
-        self.nll_loss = nll_loss
+        self.nll_loss_coef = nll_loss_coef
 
 
 class KDConfig:

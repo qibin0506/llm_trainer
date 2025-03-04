@@ -126,6 +126,9 @@ class DPOTrainer(Trainer):
         loss_accumulation = 0.0
         skipping_train = False
 
+        nll_loss_coef = self.train_config.dpo_loss_config.nll_loss_coef
+        aux_loss_coef = self.train_config.loss_config.aux_loss_coef
+
         for epoch in range(self.train_config.n_epochs):
             self.train_model.train()
             file_count = len(self.train_config.all_files)
@@ -180,14 +183,15 @@ class DPOTrainer(Trainer):
                             chosen_policy_result = self.train_model(chosen_inputs, attention_mask=chosen_attention_mask)
                             rejected_policy_result = self.train_model(rejected_inputs, attention_mask=rejected_attention_mask)
 
-                            chosen_reference_result = self.reference_model(chosen_inputs, attention_mask=chosen_attention_mask)
-                            rejected_reference_result = self.reference_model(rejected_inputs, attention_mask=rejected_attention_mask)
+                            with torch.no_grad():
+                                chosen_reference_result = self.reference_model(chosen_inputs, attention_mask=chosen_attention_mask)
+                                rejected_reference_result = self.reference_model(rejected_inputs, attention_mask=rejected_attention_mask)
 
-                            chosen_policy_logprobs = self.criterion.logprobs(chosen_policy_result['logits'], chosen_labels, chosen_attention_mask)
-                            rejected_policy_logprobs = self.criterion.logprobs(rejected_policy_result['logits'], rejected_labels, rejected_attention_mask)
+                            chosen_policy_logprobs, nll_loss = self.criterion.logprobs(chosen_policy_result['logits'], chosen_labels, chosen_attention_mask)
+                            rejected_policy_logprobs, _ = self.criterion.logprobs(rejected_policy_result['logits'], rejected_labels, rejected_attention_mask)
 
-                            chosen_reference_logprobs = self.criterion.logprobs(chosen_reference_result['logits'], chosen_labels, chosen_attention_mask)
-                            rejected_reference_logprobs = self.criterion.logprobs(rejected_reference_result['logits'], rejected_labels, rejected_attention_mask)
+                            chosen_reference_logprobs, _ = self.criterion.logprobs(chosen_reference_result['logits'], chosen_labels, chosen_attention_mask)
+                            rejected_reference_logprobs, _ = self.criterion.logprobs(rejected_reference_result['logits'], rejected_labels, rejected_attention_mask)
 
                             # calc loss
                             loss, chosen_rewards, rejected_rewards = self.criterion(
@@ -196,6 +200,16 @@ class DPOTrainer(Trainer):
                                 chosen_reference_logprobs,
                                 rejected_reference_logprobs
                             )
+
+                            if nll_loss_coef:
+                                loss += nll_loss_coef * nll_loss
+
+                            if aux_loss_coef:
+                                if chosen_policy_result['aux_loss']:
+                                    loss += aux_loss_coef * chosen_policy_result['aux_loss']
+
+                                if rejected_policy_result['aux_loss']:
+                                    loss += aux_loss_coef * rejected_policy_result['aux_loss']
 
                         if gradient_accumulation_steps > 1:
                             loss = loss / gradient_accumulation_steps

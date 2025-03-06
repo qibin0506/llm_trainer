@@ -1,6 +1,7 @@
 import time
 from contextlib import nullcontext
 from typing import Optional, Tuple, List
+import random
 
 import torch
 from torch import nn
@@ -53,14 +54,12 @@ class Trainer:
             self,
             *,
             train_config: TrainConfig,
-            prompt_on_batch: str,
-            prompt_on_epoch: str,
+            eval_prompts: List[str]
     ):
         set_seed()
 
         self.train_config: TrainConfig = train_config
-        self.prompt_on_batch: str = prompt_on_batch
-        self.prompt_on_epoch: str = prompt_on_epoch
+        self.eval_prompts = eval_prompts
 
         parallel_kwargs, data_loader_kwargs, sampler_kwargs = self._convert_train_args()
         self.data_loader_kwargs: dict[str, any] = data_loader_kwargs
@@ -317,6 +316,12 @@ class Trainer:
 
         TrainerTools().parallel.synchronize()
 
+    def _get_eval_prompt(self) -> str:
+        if len(self.eval_prompts) == 0:
+            return ''
+
+        return random.choice(self.eval_prompts)
+
     def _log_loss(
             self,
             epoch: int,
@@ -340,7 +345,7 @@ class Trainer:
             self.eval_model,
             epoch,
             batch,
-            self.prompt_on_batch,
+            self._get_eval_prompt(),
             self.train_config.llama_config.max_position_embeddings
         )
 
@@ -348,7 +353,7 @@ class Trainer:
         on_epoch_end(
             self.eval_model,
             epoch,
-            self.prompt_on_epoch,
+            self._get_eval_prompt(),
             self.train_config.llama_config.max_position_embeddings
         )
 

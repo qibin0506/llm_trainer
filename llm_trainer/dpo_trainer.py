@@ -1,6 +1,6 @@
 import time
 import os
-from typing import Tuple
+from typing import Tuple, List
 import torch
 from torch import nn
 from torch.utils.data import Dataset
@@ -32,13 +32,11 @@ class DPOTrainer(Trainer):
             self,
             *,
             train_config: TrainConfig,
-            prompt_on_batch: str,
-            prompt_on_epoch: str,
+            eval_prompts: List[str]
     ):
         super().__init__(
             train_config=train_config,
-            prompt_on_batch=prompt_on_batch,
-            prompt_on_epoch=prompt_on_epoch
+            eval_prompts=eval_prompts
         )
 
         self.reference_model = self._init_reference_model()

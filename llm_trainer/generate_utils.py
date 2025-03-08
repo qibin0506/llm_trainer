@@ -139,7 +139,7 @@ def _generate_text(
     for _ in range(max_new_tokens):
         # 是否需要截取？？
         t = tokens[:, -max_position_embeddings:]
-        with torch.no_grad():
+        with torch.inference_mode():
             with ctx:
                 result = model(t, past_key_values=kv_cache, use_cache=use_kv_cache)
                 # logits (batch, seq_len, vocab_size)

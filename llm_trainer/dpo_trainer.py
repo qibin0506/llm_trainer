@@ -181,7 +181,7 @@ class DPOTrainer(Trainer):
                             chosen_policy_result = self.train_model(chosen_inputs, attention_mask=chosen_attention_mask)
                             rejected_policy_result = self.train_model(rejected_inputs, attention_mask=rejected_attention_mask)
 
-                            with torch.no_grad():
+                            with torch.inference_mode():
                                 chosen_reference_result = self.reference_model(chosen_inputs, attention_mask=chosen_attention_mask)
                                 rejected_reference_result = self.reference_model(rejected_inputs, attention_mask=rejected_attention_mask)
 

@@ -1,8 +1,6 @@
 import time
-import os
 from typing import Tuple, List
 import torch
-from torch import nn
 from torch.utils.data import Dataset
 import torch.distributed as dist
 
@@ -21,10 +19,6 @@ from .checkpoint import (
     save_checkpoint,
     load_checkpoint_for_eval,
     save_steps,
-)
-
-from .trainer_log import (
-    on_file_start,
 )
 
 class DPOTrainer(Trainer):
@@ -97,9 +91,9 @@ class DPOTrainer(Trainer):
 
     def _init_loss(self):
         criterion = DPOLoss(
-            beta=self.train_config.dpo_loss_config.beta,
-            label_smoothing=self.train_config.dpo_loss_config.label_smoothing,
-            ipo=self.train_config.dpo_loss_config.ipo
+            beta=self.train_config.dpo_config.loss_beta,
+            label_smoothing=self.train_config.dpo_config.loss_label_smoothing,
+            ipo=self.train_config.dpo_config.loss_ipo
         )
 
         return criterion, None
@@ -124,7 +118,7 @@ class DPOTrainer(Trainer):
         loss_accumulation = 0.0
         skipping_train = False
 
-        nll_loss_coef = self.train_config.dpo_loss_config.nll_loss_coef
+        nll_loss_coef = self.train_config.dpo_config.nll_loss_coef
         aux_loss_coef = self.train_config.loss_config.aux_loss_coef
 
         for epoch in range(self.train_config.n_epochs):
@@ -145,7 +139,7 @@ class DPOTrainer(Trainer):
                 batch_count_per_file = len(train_data_loader)
 
                 TrainerTools().parallel.on_epoch_start(epoch)
-                on_file_start(epoch, file_path)
+                self._on_file_start(epoch, file_path)
 
                 for batch, batch_data in enumerate(train_data_loader):
                     global_steps += 1
@@ -227,7 +221,13 @@ class DPOTrainer(Trainer):
                                 torch.nn.utils.clip_grad_norm_(self.train_model.parameters(), 1.0)
 
                             self._step()
-                            self._log_loss(epoch, file_idx, file_count, batch, batch_count_per_file, loss_accumulation.item())
+
+                            self._log_loss(
+                                epoch_tag=f'epoch: {epoch}',
+                                file_tag=f'file: {file_idx + 1}/{file_count}',
+                                batch_tag=f'batch: {batch}/{batch_count_per_file}',
+                                loss=loss_accumulation.item()
+                            )
                             # reset to default
                             loss_accumulation = 0.0
                     except Exception as e:
@@ -237,7 +237,7 @@ class DPOTrainer(Trainer):
                             save_checkpoint(model=self.train_model, optimizer=self.optimizer)
                             save_steps(global_steps=global_steps, lr_scheduler=self.lr_scheduler)
                             last_ckpt_batch = batch
-                            self._on_batch_end(epoch, batch)
+                            self._on_batch_end(tag=f'epoch:{epoch}/batch:{batch}')
 
                         try:
                             del loss
@@ -249,7 +249,7 @@ class DPOTrainer(Trainer):
                 save_checkpoint(model=self.train_model, optimizer=self.optimizer)
                 save_steps(global_steps=global_steps, lr_scheduler=self.lr_scheduler)
                 TrainerTools().parallel.on_epoch_end(epoch)
-                self._on_epoch_end(epoch)
+                self._on_epoch_end(tag=f'epoch:{epoch}')
 
         # 等待checkpoint保存完成
         time.sleep(10)

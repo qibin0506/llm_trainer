@@ -82,8 +82,8 @@ class Tokenizer:
 
             return encoded
 
-    def decode_to_text(self, token: torch.Tensor) -> str:
-        return self.tokenizer.decode(token.squeeze(0))
+    def decode_to_text(self, token: torch.Tensor, skip_special_tokens: bool = False) -> str:
+        return self.tokenizer.decode(token.squeeze(0), skip_special_tokens=skip_special_tokens)
 
 
 # if __name__ == '__main__':

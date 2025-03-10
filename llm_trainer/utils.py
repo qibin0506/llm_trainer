@@ -1,8 +1,19 @@
+import os
+import random
 import torch
 from torch.nn.utils.rnn import pad_sequence
+import torch.nn.functional as F
 from .tools import TrainerTools
 import numpy as np
-import random
+
+
+def get_log_dir() -> str:
+    log_dir = os.environ['LOG_DIR']
+    if not os.path.exists(log_dir):
+        os.mkdir(log_dir)
+
+    return log_dir
+
 
 def set_seed(seed=42):
     random.seed(seed)
@@ -99,3 +110,76 @@ def dpo_collate_fn(batch_data):
         'rejected_inputs': rejected_inputs,
         'rejected_labels': rejected_labels
     }
+
+def _zero_pad_sequences(
+    sequences: list[torch.Tensor], side: str = "left"
+) -> torch.Tensor:
+    assert side in ("left", "right")
+    max_len = max(seq.size(0) for seq in sequences)
+    padded_sequences = []
+    for seq in sequences:
+        pad_len = max_len - seq.size(0)
+        padding = (pad_len, 0) if side == "left" else (0, pad_len)
+        padded_sequences.append(F.pad(seq, padding))
+    return torch.stack(padded_sequences, dim=0)
+
+
+def split_batch(data_per_batch: dict) -> list[dict]:
+    """
+    from: data_per_batch("sequences": [group_size, max_generate_len] ...)
+    to:   [dict("sequences": [max_generate_len] ...) ... group_size]
+    """
+
+    group_size = data_per_batch['sequence_ids'].size(0)
+    # [{"sequence_ids": xxx, "old_log_probs": xxx...}, ...]
+    group_data = [{} for _ in range(group_size)]
+
+    keys = (
+        'sequence_ids',
+        'old_log_probs',
+        'ref_log_probs',
+        'advantages',
+        'attention_mask',
+        'mask',
+    )
+
+    for key in keys:
+        value = data_per_batch[key]
+        if value is None:
+            vals = [None] * group_size
+        else:
+            vals = torch.unbind(value)
+
+        for i, v in enumerate(vals):
+            group_data[i][key] = v
+
+    return group_data
+
+
+def join_batch(batch_data: list[dict]) -> dict:
+    """
+    from: [dict("sequences": [max_generate_len] ...), ...]
+    to:   dict("sequences": max_generate_len, ...)
+    """
+
+    result = {}
+    keys = (
+        'sequence_ids',
+        'old_log_probs',
+        'ref_log_probs',
+        'advantages',
+        'attention_mask',
+        'mask',
+    )
+
+    for key in keys:
+        # [sequence_ids, sequence_ids ...]
+        # shape [batch_size, seq_len]
+        vals = [item[key] for item in batch_data]
+        if all(v is not None for v in vals):
+            data = _zero_pad_sequences(vals, "left")
+        else:
+            data = None
+        result[key] = data
+
+    return result

@@ -36,18 +36,12 @@ from .checkpoint import (
     save_steps,
 )
 from .utils import (
+    get_log_dir,
     set_seed,
     pretrain_collate_fn,
 )
 
-from .trainer_log import (
-    on_batch_end,
-    on_exception,
-    on_epoch_end,
-    on_file_start,
-    log_loss
-)
-
+from .eval import submit_gen_task
 
 class Trainer:
     def __init__(
@@ -68,12 +62,7 @@ class Trainer:
         # initialize a GradScaler. If enabled=False scaler is a no-op
         self.scalar = torch.GradScaler(enabled=TrainerTools().use_amp)
 
-        batch_count = train_config.all_data_size // TrainerTools().parallel.world_size // train_config.batch_size
-
-        log(f"real batch count: {batch_count}")
-
-        if train_config.gradient_accumulation_steps > 1:
-            batch_count = batch_count // train_config.gradient_accumulation_steps
+        batch_count = self._calc_batch_count()
 
         # 学习率要根据GPU的数量进行倍增：
         # 在训练的过程中，损失梯度决定下降的方向，学习率决定下降的步长。如果有两块gpu，前进的综合步长为：平均学习率*2
@@ -135,6 +124,16 @@ class Trainer:
             return LlamaModel(self.train_config.llama_config).to('cpu')
 
         return None
+
+    def _calc_batch_count(self) -> int:
+        batch_count = self.train_config.all_data_size // TrainerTools().parallel.world_size // self.train_config.batch_size
+
+        log(f"real batch count: {batch_count}")
+
+        if self.train_config.gradient_accumulation_steps > 1:
+            batch_count = batch_count // self.train_config.gradient_accumulation_steps
+
+        return batch_count
 
     def _init_lr_scheduler(self, batch_count: int, initial_lr: float) -> LRScheduler:
         if self.train_config.lr_scheduler_config.enable_lr_scheduler:
@@ -324,38 +323,63 @@ class Trainer:
 
     def _log_loss(
             self,
-            epoch: int,
-            file_idx: int,
-            file_count: int,
-            batch: int,
-            batch_count: int,
+            epoch_tag: str,
+            file_tag: str,
+            batch_tag: str,
             loss
     ):
-        log_loss(epoch, file_idx, file_count, batch, batch_count, loss, self.lr_scheduler.cur_lr)
+        if TrainerTools().parallel.is_main_process:
+            log_dir = get_log_dir()
+            lr = self.lr_scheduler.cur_lr
+            log_msg = f"{epoch_tag}, {file_tag}, {batch_tag}, lr: {lr}, loss: {loss}"
+            log(log_msg)
+            log(f"{log_msg}\n", f'{log_dir}log.txt')
 
-    def _on_exception(self, e: Exception, epoch: int, batch: int):
-        on_exception(e, epoch, batch)
+    def _on_exception(
+            self,
+            e: Exception,
+            epoch: int,
+            batch: int
+    ):
+        log_dir = get_log_dir()
+        exception_file = e.__traceback__.tb_frame.f_globals["__file__"]
+        exception_line = e.__traceback__.tb_lineno
+        log_msg = f"epoch: {epoch}, batch: {batch}, {e} at {exception_file} line {exception_line}\n"
+        log(log_msg, f'{log_dir}log.txt')
+
+        raise e
 
     def _on_batch_end(
             self,
-            epoch: int,
-            batch: int,
+            tag: str
     ):
-        on_batch_end(
-            self.eval_model,
-            epoch,
-            batch,
-            self._get_eval_prompt(),
-            self.train_config.llama_config.max_position_embeddings
-        )
+        if TrainerTools().parallel.is_main_process:
+            submit_gen_task(
+                self.eval_model,
+                tag=f'sign:batch/{tag}',
+                prompt=self._get_eval_prompt(),
+                max_position_embeddings=self.train_config.llama_config.max_position_embeddings
+            )
 
-    def _on_epoch_end(self, epoch: int):
-        on_epoch_end(
-            self.eval_model,
-            epoch,
-            self._get_eval_prompt(),
-            self.train_config.llama_config.max_position_embeddings
-        )
+    def _on_epoch_end(
+            self,
+            tag: str
+    ):
+        if TrainerTools().parallel.is_main_process:
+            submit_gen_task(
+                self.eval_model,
+                tag=f'sign:epoch/{tag}',
+                prompt=self._get_eval_prompt(),
+                max_position_embeddings=self.train_config.llama_config.max_position_embeddings
+            )
+
+    def _on_file_start(
+            self,
+            epoch: int,
+            file_name: str
+    ):
+        if TrainerTools().parallel.is_main_process:
+            log(f"epoch: {epoch}, start train {file_name}\n", f'{get_log_dir()}log.txt')
 
     def train(self):
         # 梯度累积步数
@@ -382,7 +406,7 @@ class Trainer:
                 batch_count_per_file = len(train_data_loader)
 
                 TrainerTools().parallel.on_epoch_start(epoch)
-                on_file_start(epoch, file_path)
+                self._on_file_start(epoch, file_path)
 
                 for batch, (inputs, labels) in enumerate(train_data_loader):
                     global_steps += 1
@@ -434,7 +458,13 @@ class Trainer:
                                 torch.nn.utils.clip_grad_norm_(self.train_model.parameters(), 1.0)
 
                             self._step()
-                            self._log_loss(epoch, file_idx, file_count, batch, batch_count_per_file, loss_accumulation.item())
+
+                            self._log_loss(
+                                epoch_tag=f'epoch: {epoch}',
+                                file_tag=f'file: {file_idx + 1}/{file_count}',
+                                batch_tag=f'batch: {batch}/{batch_count_per_file}',
+                                loss=loss_accumulation.item()
+                            )
                             # reset to default
                             loss_accumulation = 0.0
                     except Exception as e:
@@ -444,8 +474,7 @@ class Trainer:
                             save_checkpoint(model=self.train_model, optimizer=self.optimizer)
                             save_steps(global_steps=global_steps, lr_scheduler=self.lr_scheduler)
                             last_ckpt_batch = batch
-                            self._on_batch_end(epoch, batch)
-
+                            self._on_batch_end(tag=f'epoch:{epoch}/batch:{batch}')
                         try:
                             del loss
                         except UnboundLocalError:
@@ -456,7 +485,7 @@ class Trainer:
                 save_checkpoint(model=self.train_model, optimizer=self.optimizer)
                 save_steps(global_steps=global_steps, lr_scheduler=self.lr_scheduler)
                 TrainerTools().parallel.on_epoch_end(epoch)
-                self._on_epoch_end(epoch)
+                self._on_epoch_end(tag=f'epoch:{epoch}')
 
         # 等待checkpoint保存完成
         time.sleep(10)

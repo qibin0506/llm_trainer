@@ -1,4 +1,5 @@
 from typing import Optional, Union, Set, Type, Callable, List
+import torch
 from torch import nn
 from llama import LlamaConfig
 
@@ -299,19 +300,43 @@ class LossConfig:
         self.aux_loss_coef = aux_loss_coef
 
 
-class DPOLossConfig:
+class DPOConfig:
     def __init__(
             self,
-            beta: float,
-            label_smoothing: float = 0.0,
-            ipo: bool = False,
+            loss_beta: float,
+            loss_label_smoothing: float = 0.0,
+            loss_ipo: bool = False,
             nll_loss_coef: Optional[float] = None
     ):
         super().__init__()
-        self.beta = beta
-        self.label_smoothing = label_smoothing
-        self.ipo = ipo
+        self.loss_beta = loss_beta
+        self.loss_label_smoothing = loss_label_smoothing
+        self.loss_ipo = loss_ipo
         self.nll_loss_coef = nll_loss_coef
+
+
+class GRPOConfig:
+    def __init__(
+            self,
+            rollouts_per_step: int,
+            clip_eps: float = 0.2,
+            kl_weight: float = 0.01,
+            group_size: int = 12,
+            gen_max_new_tokens: Optional[int] = None,
+            gen_temperature: Optional[float] = None,
+            gen_k: Optional[int] = None,
+            gen_p: Optional[float] = None,
+            gen_suppress_tokens: Optional[list[int]] = None,
+    ):
+        self.rollouts_per_step = rollouts_per_step
+        self.clip_eps = clip_eps
+        self.kl_weight = kl_weight
+        self.group_size = group_size
+        self.gen_max_new_tokens = gen_max_new_tokens
+        self.gen_temperature = gen_temperature
+        self.gen_k = gen_k
+        self.gen_p = gen_p
+        self.gen_suppress_tokens = gen_suppress_tokens
 
 
 class KDConfig:
@@ -375,7 +400,8 @@ class TrainConfig:
             gradient_accumulation_steps: int = 0,
             eval_batch_interval: int = 100,
             loss_config: LossConfig = LossConfig(),
-            dpo_loss_config: Optional[DPOLossConfig] = None,
+            dpo_config: Optional[DPOConfig] = None,
+            grpo_config: Optional[GRPOConfig] = None,
             lr_scheduler_config: LrSchedulerConfig = LrSchedulerConfig(),
             ds_config: DsConfig = DsConfig(),
             fsdp_config: FsdpConfig = FsdpConfig(),
@@ -390,7 +416,8 @@ class TrainConfig:
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.eval_batch_interval = eval_batch_interval
         self.loss_config = loss_config
-        self.dpo_loss_config = dpo_loss_config
+        self.dpo_config = dpo_config
+        self.grpo_config = grpo_config
         self.lr_scheduler_config = lr_scheduler_config
         self.ds_config = ds_config
         self.fsdp_config = fsdp_config

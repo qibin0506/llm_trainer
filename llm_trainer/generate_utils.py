@@ -93,7 +93,7 @@ def _top_p_warper(logits: torch.Tensor, p: float, min_tokens_to_keep: int = 1) -
     return scores_processed
 
 
-def _generate_text(
+def _generate(
         model: torch.nn.Module,
         *,
         tokens: torch.Tensor,
@@ -187,6 +187,35 @@ def _generate_text(
     yield tokens if not use_kv_cache else generate_tokens, True
 
 
+def _generate_tokens(
+        model: torch.nn.Module,
+        *,
+        tokens: torch.Tensor,
+        max_position_embeddings: int,
+        max_new_tokens: int,
+        temperature: Optional[float],
+        k: Optional[int],
+        p: Optional[float],
+        suppress_tokens: Optional[list[int]] = None,
+        device: Union[str, torch.device, int]
+):
+    generate_text_iterator = _generate(
+        model=model,
+        tokens=tokens,
+        max_position_embeddings=max_position_embeddings,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        k=k,
+        p=p,
+        device=device,
+        suppress_tokens=suppress_tokens
+    )
+
+    for (token, is_full_result) in generate_text_iterator:
+        if is_full_result:
+            return token
+
+
 def _streaming_generate(
         model: torch.nn.Module,
         *,
@@ -203,7 +232,7 @@ def _streaming_generate(
     device = TrainerTools().parallel.device if not device else device
     encoded_tokens = TrainerTools().tokenizer.encode_to_token(prompt).to(device)
 
-    generate_text_iterator = _generate_text(
+    generate_text_iterator = _generate(
         model=model,
         tokens=encoded_tokens,
         max_position_embeddings=max_position_embeddings,

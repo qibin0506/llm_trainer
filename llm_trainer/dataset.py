@@ -5,6 +5,7 @@ from torch.utils.data import Dataset
 import pickle
 
 from .tools import TrainerTools
+from .utils import split_batch
 
 
 def try_load_pkl(file_path: str):
@@ -112,3 +113,44 @@ class DPODataset(Dataset):
 
         return {'chosen': chosen, 'rejected': rejected}
 
+
+class GRPORolloutDataset(Dataset):
+    def __init__(self, file_path):
+        self.questions = []
+        self.answers = []
+
+        # [{'question': xxx, 'answer': ''}]
+        tokens = try_load_pkl(file_path)
+        for token in tokens:
+            self.questions.append(token['question'])
+            self.answers.append(token['answer'])
+
+    def __len__(self):
+        return len(self.questions)
+
+    def __getitem__(self, item):
+        question = self.questions[item]
+        answer = self.answers[item]
+
+        return {
+            'question': torch.tensor(question).long(),
+            'answer': torch.tensor(answer).long()
+        }
+
+
+class GRPODataset(Dataset):
+    def __init__(self):
+        # [{"sequence_ids": xxx, "old_log_probs": xxx...}, ...]
+        self.items = []
+
+    def append(self, data_per_batch: dict):
+        self.items.extend(split_batch(data_per_batch))
+
+    def clear(self):
+        self.items.clear()
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int):
+        return self.items[idx]

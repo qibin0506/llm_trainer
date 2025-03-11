@@ -178,6 +178,7 @@ class GRPOTrainer(Trainer):
         gradient_accumulation_steps = self.train_config.gradient_accumulation_steps
         global_steps = 0
         loss_accumulation = 0.0
+        reload_generate_model_weights = True
 
         grpo_dataset = GRPODataset()
 
@@ -205,10 +206,19 @@ class GRPOTrainer(Trainer):
 
                 grpo_dataset.clear()
                 # self.train_model.eval()
+
                 # 使用单独的模型生成数据， 原因是在deepspeed并行训练时，使用train_model生成数据会卡死
-                # 这里保证生成模型使用的参数是最新
                 self.generate_model.to(TrainerTools().parallel.device)
-                load_checkpoint_for_eval(self.generate_model, TrainerTools().parallel.device)
+
+                # 保存了train_model checkpoint后，这里保证生成模型使用的参数是最新
+                if reload_generate_model_weights:
+                    log('reload_generate_model_weights')
+                    try:
+                        load_checkpoint_for_eval(self.generate_model, TrainerTools().parallel.device)
+                    except:
+                        pass
+
+                    reload_generate_model_weights = False
 
                 with torch.inference_mode():
                     for item in batch_data:
@@ -337,6 +347,7 @@ class GRPOTrainer(Trainer):
                                 save_steps(global_steps=global_steps, lr_scheduler=self.lr_scheduler)
                                 last_ckpt_batch = batch
                                 self._on_batch_end(tag=f'epoch:{epoch}/real_bach:{real_batch}/batch:{batch}')
+                                reload_generate_model_weights = True
                             try:
                                 del loss
                             except UnboundLocalError:
@@ -347,6 +358,7 @@ class GRPOTrainer(Trainer):
                     save_steps(global_steps=global_steps, lr_scheduler=self.lr_scheduler)
                     TrainerTools().parallel.on_epoch_end(epoch)
                     self._on_epoch_end(tag=f'epoch:{epoch}')
+                    reload_generate_model_weights = True
 
         # 等待checkpoint保存完成
         time.sleep(10)

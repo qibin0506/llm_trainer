@@ -30,13 +30,14 @@ def _can_use_dcp(model: nn.Module) -> bool:
 
 def save_checkpoint(
         model: nn.Module,
-        optimizer: Optional[Optimizer] = None
+        optimizer: Optional[Optimizer] = None,
+        suffix: Optional[str] = None
 ):
     if isinstance(TrainerTools().parallel, DsParallel):
         from .ds_checkpoint import save_ds_checkpoint
-        save_ds_checkpoint(model)
+        save_ds_checkpoint(model, suffix)
     elif _can_use_dcp(model):
-        save_dcp(model, optimizer)
+        save_dcp(model, optimizer, suffix)
     else:
         if isinstance(model, FSDP):
             # 未经过测试 参考：https://doc.hfai.high-flyer.cn/haiscale/haiscale_fsdp.html
@@ -49,6 +50,9 @@ def save_checkpoint(
             ):
                 if TrainerTools().parallel.is_main_process:
                     checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)
+                    if suffix:
+                        checkpoint_name = f"{checkpoint_name}_{suffix}"
+
                     ckpt = {'model_state_dict': model.state_dict()}
 
                     if optimizer:
@@ -58,6 +62,9 @@ def save_checkpoint(
         else:
             if TrainerTools().parallel.is_main_process:
                 checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)
+                if suffix:
+                    checkpoint_name = f"{checkpoint_name}_{suffix}"
+
                 ckpt = {'model_state_dict': TrainerTools().parallel.raw_model.state_dict()}
 
                 if optimizer:
@@ -70,15 +77,19 @@ def load_checkpoint(
         model: nn.Module,
         optimizer: Optional[Optimizer] = None,
         device: Optional[Union[torch.device, str]] = None,
-        load_module_only: bool = False
+        load_module_only: bool = False,
+        suffix: Optional[str] = None
 ):
     if isinstance(TrainerTools().parallel, DsParallel):
         from .ds_checkpoint import load_ds_checkpoint
-        load_ds_checkpoint(model, load_module_only=load_module_only)
+        load_ds_checkpoint(model, load_module_only=load_module_only, suffix=suffix)
     elif _can_use_dcp(model):
-        load_dcp(model, optimizer)
+        load_dcp(model, optimizer, suffix)
     else:
         checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)
+        if suffix:
+            checkpoint_name = f"{checkpoint_name}_{suffix}"
+
         if os.path.exists(checkpoint_name):
             # 未经过测试，else的逻辑经过测试在fsdp下也没问题
             if isinstance(model, FSDP):
@@ -98,7 +109,8 @@ def load_checkpoint(
 
 def load_checkpoint_for_eval(
         model: nn.Module,
-        device: Optional[Union[torch.device, str]] = None
+        device: Optional[Union[torch.device, str]] = None,
+        suffix: Optional[str] = None
 ):
     if isinstance(TrainerTools().parallel, DsParallel):
         from .ds_checkpoint import load_ds_checkpoint_for_eval
@@ -109,6 +121,9 @@ def load_checkpoint_for_eval(
         # load_dcp方式在cpu上会报错，所以改为先将ckpt转换为pth，然后再加载pth
         # load_dcp(model, optimizer)
         pth_name = os.environ.get('EVAL_CHECKPOINT_NAME', checkpoint_name)
+        if suffix:
+            pth_name = f'{pth_name}_{suffix}'
+
         convert_dcp_to_pth(pth_name)
 
         if os.path.exists(pth_name):
@@ -117,7 +132,7 @@ def load_checkpoint_for_eval(
             # 使用完删除
             os.remove(pth_name)
     else:
-        load_checkpoint(model, None, device)
+        load_checkpoint(model, None, device, suffix=suffix)
 
 def save_steps(global_steps: int, lr_scheduler: Optional[LRScheduler] = None):
     # 暂时只保存主进程的

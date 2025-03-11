@@ -8,7 +8,6 @@ from torch.nn.utils.rnn import pad_sequence
 from llama import LlamaModel
 
 from .parallel_ds import DsParallel
-from .parallel_fsdp import FsdpParallel
 from .trainer import Trainer
 from .train_configs import TrainConfig
 from .dataset import GRPORolloutDataset, GRPODataset
@@ -20,6 +19,7 @@ from .log import log
 
 from .checkpoint import (
     save_checkpoint,
+    load_checkpoint,
     load_checkpoint_for_eval,
     save_steps,
 )
@@ -36,63 +36,36 @@ class GRPOTrainer(Trainer):
             train_config=train_config,
             eval_prompts=eval_prompts
         )
-        self.reward_funcs = reward_funcs
 
+        self.reward_funcs = reward_funcs
         self.reference_model = self._init_reference_model()
+        self.generate_model = self._init_generate_model()
 
     def _init_reference_model(self):
-        parallel = TrainerTools().new_parallel()
-
         reference_model = LlamaModel(self.train_config.llama_config)
-        load_checkpoint_for_eval(model=reference_model, device=parallel.device)
 
-        reference_model, _ = parallel.process(
-            model=reference_model,
-            optimizer=None,
-            kwargs=self._init_reference_args()
-        )
+        device = TrainerTools().parallel.device
+        reference_model.to(device)
+        load_checkpoint_for_eval(model=reference_model, device=device)
 
-        parallel.raw_model.eval()
-        for param in parallel.raw_model.parameters():
+        reference_model.eval()
+        for param in reference_model.parameters():
             param.requires_grad = False
 
         return reference_model
 
-    def _init_reference_args(self):
-        if isinstance(TrainerTools().parallel, DsParallel) and self.train_config.ds_config:
-            parallel_kwargs = {
-                'gradient_accumulation_steps': 1,
-                'train_micro_batch_size_per_gpu': 1
-            }
+    def _init_generate_model(self):
+        generate_model = LlamaModel(self.train_config.llama_config)
 
-            if self.train_config.ds_config.zero_config:
-                zero_optimization = {'stage': 0}
-                parallel_kwargs['zero_optimization'] = zero_optimization
+        # device = TrainerTools().parallel.device
+        # generate_model.to(device)
+        # load_checkpoint_for_eval(model=generate_model, device=device)
 
-            if self.train_config.ds_config.fp16_config:
-                fb16_config = self.train_config.ds_config.fp16_config
-                fp16 = { 'enabled': fb16_config.enabled }
+        generate_model.eval()
+        for param in generate_model.parameters():
+            param.requires_grad = False
 
-                if fb16_config.fp16_opt_level is not None:
-                    fp16['fp16_opt_level'] = fb16_config.fp16_opt_level
-
-                parallel_kwargs['fp16'] = fp16
-
-            if self.train_config.ds_config.bf16_config:
-                bf16_config = self.train_config.ds_config.bf16_config
-                bf16 = { 'enabled': bf16_config.enabled }
-                parallel_kwargs['bf16'] = bf16
-        elif isinstance(TrainerTools().parallel, FsdpParallel) and self.train_config.fsdp_config:
-            parallel_kwargs = {
-                'transformer_layer_cls': self.train_config.fsdp_config.transformer_layer_cls,
-                'wrap_policy_num_params': self.train_config.fsdp_config.wrap_policy_num_params,
-                'cpu_offload': self.train_config.fsdp_config.cpu_offload,
-                'offload_params': self.train_config.fsdp_config.offload_params
-            }
-        else:
-            parallel_kwargs = None
-
-        return parallel_kwargs
+        return generate_model
 
     def _calc_batch_count(self) -> int:
         raw_data_size_per_world = self.train_config.all_data_size // TrainerTools().parallel.world_size
@@ -134,7 +107,8 @@ class GRPOTrainer(Trainer):
 
         # [[1, 2, 3]]
         generate_ids = _generate_tokens(
-            model=self.train_model,
+            # model=self.train_model,
+            model=self.generate_model,
             tokens=prompt_ids.unsqueeze(0),
             max_position_embeddings=self.train_config.llama_config.max_position_embeddings,
             max_new_tokens=self.train_config.grpo_config.gen_max_new_tokens,
@@ -230,37 +204,41 @@ class GRPOTrainer(Trainer):
                     continue
 
                 grpo_dataset.clear()
-                self.train_model.eval()
+                # self.train_model.eval()
+                # 使用单独的模型生成数据， 原因是在deepspeed并行训练时，使用train_model生成数据会卡死
+                # 这里保证生成模型使用的参数是最新
+                self.generate_model.to(TrainerTools().parallel.device)
+                load_checkpoint_for_eval(self.generate_model, TrainerTools().parallel.device)
 
                 with torch.inference_mode():
                     for item in batch_data:
                         question = item["question"].to(TrainerTools().parallel.device)
                         answer = item["answer"].to(TrainerTools().parallel.device)
 
-                        # generate_ids [group_size, max_generate_len]
+                        # sequence_ids [group_size, max_generate_len]
                         # rewards [group_size, 1]
                         # masks [group_size, max_generate_len - 1]
-                        generate_ids, rewards, masks = self._rollout_per_question(question, answer)
+                        sequence_ids, rewards, masks = self._rollout_per_question(question, answer)
 
                         advantages = self.criterion.group_advantages(rewards)
-                        attention_mask = generate_ids != TrainerTools().tokenizer.pad
+                        attention_mask = sequence_ids != TrainerTools().tokenizer.pad
 
                         # [group_size, max_generate_len - 1]
                         log_probs, _ = self.criterion.sequences_log_probs(
-                            model=self.train_model,
-                            sequence_ids=generate_ids,
+                            model=self.generate_model,
+                            sequence_ids=sequence_ids,
                             attention_mask=attention_mask,
                         )
 
                         # [group_size, max_generate_len - 1]
                         ref_log_probs, _ = self.criterion.sequences_log_probs(
                             model=self.reference_model,
-                            sequence_ids=generate_ids,
+                            sequence_ids=sequence_ids,
                             attention_mask=attention_mask,
                         )
 
                         rollout_per_batch = {
-                            'sequence_ids': generate_ids,
+                            'sequence_ids': sequence_ids,
                             'old_log_probs': log_probs,
                             'ref_log_probs': ref_log_probs,
                             'advantages': advantages,
@@ -269,6 +247,8 @@ class GRPOTrainer(Trainer):
                         }
                         grpo_dataset.append(rollout_per_batch)
 
+                # 卸载到cpu上，等待下次使用时再to gpu
+                self.generate_model.to('cpu')
                 torch.cuda.empty_cache()
 
                 data_loader = DataLoader(

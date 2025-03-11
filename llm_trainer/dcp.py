@@ -30,8 +30,15 @@ class AppState(Stateful):
         )
 
 
-def save_dcp(model: nn.Module, optimizer: Optimizer):
+def save_dcp(
+        model: nn.Module,
+        optimizer: Optimizer,
+        suffix: Optional[str] = None
+):
     checkpoint_id = os.environ.get('DIST_CHECKPOINT_DIR', DEFAULT_CHECKPOINT_DIR)
+    if suffix:
+        checkpoint_id = f"{checkpoint_id}_{suffix}"
+
     state_dict = {'app': AppState(model, optimizer)}
 
     # fs_storage_writer = dcp.FileSystemWriter(checkpoint_id, overwrite=True)
@@ -39,8 +46,15 @@ def save_dcp(model: nn.Module, optimizer: Optimizer):
     dcp.save(state_dict=state_dict, checkpoint_id=checkpoint_id)
 
 
-def load_dcp(model: nn.Module, optimizer: Optional[Optimizer] = None):
+def load_dcp(
+        model: nn.Module,
+        optimizer: Optional[Optimizer] = None,
+        suffix: Optional[str] = None
+):
     checkpoint_id = os.environ.get('DIST_CHECKPOINT_DIR', DEFAULT_CHECKPOINT_DIR)
+    if suffix:
+        checkpoint_id = f"{checkpoint_id}_{suffix}"
+
     if os.path.exists(checkpoint_id):
         state_dict = {'app': AppState(model, optimizer)}
         # AppState帮助加载到state_dict中, 然后加载到model中

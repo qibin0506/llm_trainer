@@ -120,68 +120,65 @@ def _generate(
     如果temperature很大但内容单一，需要增大k、p
     """
     use_kv_cache = True
-    enable_autocast = 'cuda' in device
 
-    if enable_autocast:
-        ctx = torch.autocast(
-            device_type=device,
-            dtype=TrainerTools().dtype,
-            enabled=enable_autocast,
-            # fsdp模式，需要将cache_enabled设置为false
-            cache_enabled=False if isinstance(model, FSDP) else None
-        )
-    else:
-        ctx = nullcontext()
+    ctx = torch.autocast(
+        device_type=device,
+        dtype=TrainerTools().dtype,
+        enabled=True,
+        # fsdp模式，需要将cache_enabled设置为false
+        cache_enabled=False if isinstance(model, FSDP) else None
+    ) if TrainerTools().use_amp else nullcontext()
 
     kv_cache: Optional[KVCache] = None
     generate_tokens = tokens.clone()
 
-    for _ in range(max_new_tokens):
-        # 是否需要截取？？
-        t = tokens[:, -max_position_embeddings:]
-        with torch.inference_mode():
+    model.eval()
+    with torch.inference_mode():
+        for _ in range(max_new_tokens):
+            # 是否需要截取？？
+            t = tokens[:, -max_position_embeddings:]
             with ctx:
                 result = model(t, past_key_values=kv_cache, use_cache=use_kv_cache)
                 # logits (batch, seq_len, vocab_size)
                 logits = result['logits']
                 kv_cache = result['past_key_values']
 
-        # (batch, vocab_size)
-        logits = logits[:, -1, :]
-        # 抑制特殊token输出
-        if suppress_tokens and len(suppress_tokens) != 0:
-            logits = _suppress_warper(logits, suppress_tokens)
+            # (batch, vocab_size)
+            logits = logits[:, -1, :]
+            # 抑制特殊token输出
+            if suppress_tokens and len(suppress_tokens) != 0:
+                logits = _suppress_warper(logits, suppress_tokens)
 
-        multinomial = False
-        if temperature and temperature > 0:
-            multinomial = True
-            logits = _temperature_warper(logits, temperature)
+            multinomial = False
+            if temperature and temperature > 0:
+                multinomial = True
+                logits = _temperature_warper(logits, temperature)
 
-        if k and k != 0:
-            logits = _top_k_warper(logits, k, device)
+            if k and k != 0:
+                logits = _top_k_warper(logits, k, device)
 
-        if p and p < 1:
-            logits = _top_p_warper(logits, p)
+            if p and p < 1:
+                logits = _top_p_warper(logits, p)
 
-        if multinomial:
-            prob = logits.softmax(dim=-1)
-            # 返回下标
-            next_token = torch.multinomial(prob, num_samples=1)
-        else:
-            # 返回下标
-            next_token = logits.argmax(dim=-1, keepdim=True)
+            if multinomial:
+                prob = logits.softmax(dim=-1)
+                # 返回下标
+                next_token = torch.multinomial(prob, num_samples=1)
+            else:
+                # 返回下标
+                next_token = logits.argmax(dim=-1, keepdim=True)
 
-        # token, is_full_result
-        yield next_token, False
+            # token, is_full_result
+            yield next_token, False
 
-        if use_kv_cache:
-            tokens = next_token
-            generate_tokens = torch.cat((generate_tokens, next_token), dim=-1)
-        else:
-            tokens = torch.cat((tokens, next_token), dim=-1)
+            if use_kv_cache:
+                tokens = next_token
+                generate_tokens = torch.cat((generate_tokens, next_token), dim=-1)
+            else:
+                tokens = torch.cat((tokens, next_token), dim=-1)
 
-        if next_token.item() == TrainerTools().tokenizer.eot:
-            break
+            if next_token.item() == TrainerTools().tokenizer.eot:
+                break
 
     # token, is_full_result
     yield tokens if not use_kv_cache else generate_tokens, True
@@ -228,7 +225,6 @@ def _streaming_generate(
         suppress_tokens: Optional[list[int]] = None,
         device: Union[str, torch.device, int] = None,
 ):
-    model.eval()
     device = TrainerTools().parallel.device if not device else device
     encoded_tokens = TrainerTools().tokenizer.encode_to_token(prompt).to(device)
 

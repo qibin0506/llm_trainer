@@ -77,7 +77,7 @@ class Trainer:
         self.ctx = torch.autocast(
             device_type=TrainerTools().parallel.device_type,
             dtype=TrainerTools().dtype,
-            enabled=TrainerTools().use_amp,
+            enabled=True,
             # fsdp模式，需要将cache_enabled设置为false
             # https://www.zhihu.com/question/642793891
             cache_enabled=False if isinstance(self.train_model, FSDP) else None

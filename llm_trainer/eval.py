@@ -34,7 +34,7 @@ def _eval_task(eval_model, tag, prompt, max_position_embeddings, is_new_process)
         eval_model,
         prompt=prompt,
         max_position_embeddings=max_position_embeddings,
-        max_new_tokens=100,
+        max_new_tokens=max_position_embeddings,
         temperature=0.6,
         k=3,
         p=None,

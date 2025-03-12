@@ -44,7 +44,7 @@ class GRPOTrainer(Trainer):
     def _init_reference_model(self):
         reference_model = LlamaModel(self.train_config.llama_config)
 
-        device = TrainerTools().parallel.device
+        device = 'cpu' # TrainerTools().parallel.device
         reference_model.to(device)
         load_checkpoint_for_eval(model=reference_model, device=device)
 
@@ -57,8 +57,8 @@ class GRPOTrainer(Trainer):
     def _init_generate_model(self):
         generate_model = LlamaModel(self.train_config.llama_config)
 
-        # device = TrainerTools().parallel.device
-        # generate_model.to(device)
+        device = 'cpu' #TrainerTools().parallel.device
+        generate_model.to(device)
         # load_checkpoint_for_eval(model=generate_model, device=device)
 
         generate_model.eval()
@@ -209,6 +209,7 @@ class GRPOTrainer(Trainer):
 
                 # 使用单独的模型生成数据， 原因是在deepspeed并行训练时，使用train_model生成数据会卡死
                 self.generate_model.to(TrainerTools().parallel.device)
+                self.reference_model.to(TrainerTools().parallel.device)
 
                 # 保存了train_model checkpoint后，这里保证生成模型使用的参数是最新
                 if reload_generate_model_weights:
@@ -259,6 +260,7 @@ class GRPOTrainer(Trainer):
 
                 # 卸载到cpu上，等待下次使用时再to gpu
                 self.generate_model.to('cpu')
+                self.reference_model.to('cpu')
                 torch.cuda.empty_cache()
 
                 data_loader = DataLoader(

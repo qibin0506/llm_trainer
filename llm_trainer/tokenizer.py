@@ -1,4 +1,5 @@
 import os
+from typing import List
 from transformers import Qwen2TokenizerFast
 from transformers import AutoTokenizer
 from transformers import AddedToken
@@ -84,6 +85,10 @@ class Tokenizer:
 
     def decode_to_text(self, token: torch.Tensor, skip_special_tokens: bool = False) -> str:
         return self.tokenizer.decode(token.squeeze(0), skip_special_tokens=skip_special_tokens)
+
+
+    def batch_decode(self, tokens: torch.Tensor, skip_special_tokens: bool = False) -> List[str]:
+        return self.tokenizer.batch_decode(tokens, skip_special_tokens=skip_special_tokens)
 
 
 # if __name__ == '__main__':

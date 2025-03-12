@@ -40,9 +40,11 @@ def _top_k_warper(logits: torch.Tensor, k: int, device: Union[str, torch.device,
     :param device:
     :return:
     """
+    # [batch, k]
     topk_logits, _ = torch.topk(logits, k=k)
+    # []
     min_val: torch.Tensor = topk_logits[:, -1]
-    logits = torch.where(logits < min_val, torch.tensor(-torch.inf).to(device), logits)
+    logits = torch.where(logits < min_val.unsqueeze(-1), torch.tensor(-torch.inf).to(device), logits)
     return logits
 
 
@@ -184,35 +186,6 @@ def _generate(
     yield tokens if not use_kv_cache else generate_tokens, True
 
 
-def _generate_tokens(
-        model: torch.nn.Module,
-        *,
-        tokens: torch.Tensor,
-        max_position_embeddings: int,
-        max_new_tokens: int,
-        temperature: Optional[float],
-        k: Optional[int],
-        p: Optional[float],
-        suppress_tokens: Optional[list[int]] = None,
-        device: Union[str, torch.device, int]
-):
-    generate_text_iterator = _generate(
-        model=model,
-        tokens=tokens,
-        max_position_embeddings=max_position_embeddings,
-        max_new_tokens=max_new_tokens,
-        temperature=temperature,
-        k=k,
-        p=p,
-        device=device,
-        suppress_tokens=suppress_tokens
-    )
-
-    for (token, is_full_result) in generate_text_iterator:
-        if is_full_result:
-            return token
-
-
 def _streaming_generate(
         model: torch.nn.Module,
         *,
@@ -301,3 +274,94 @@ def generate(
         if is_full_result:
             return TrainerTools().tokenizer.decode_to_text(token)
 
+
+def batch_generate(
+        model: torch.nn.Module,
+        *,
+        tokens: torch.Tensor,
+        pad_token_id: torch.Tensor,
+        attention_mask: torch.Tensor,
+        max_position_embeddings: int,
+        max_new_tokens: int,
+        temperature: Optional[float],
+        k: Optional[int],
+        p: Optional[float],
+        suppress_tokens: Optional[list[int]] = None,
+        device: Union[str, torch.device, int]
+):
+    use_kv_cache = True
+
+    ctx = torch.autocast(
+        device_type=device,
+        dtype=TrainerTools().dtype,
+        enabled=True,
+        cache_enabled=False if isinstance(model, FSDP) else None
+    ) if TrainerTools().use_amp else nullcontext()
+
+    kv_cache: Optional[KVCache] = None
+    generate_tokens = tokens.clone()
+    batch_size = tokens.shape[0]
+
+    # 初始化完成标记
+    eot_token = TrainerTools().tokenizer.eot
+    done = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+    model.eval()
+    with torch.inference_mode():
+        for _ in range(max_new_tokens):
+            # 只处理未完成的样本
+            if done.all():
+                break
+
+            t = tokens[:, -max_position_embeddings:]
+            with ctx:
+                result = model(t, past_key_values=kv_cache, use_cache=use_kv_cache)
+                logits = result['logits']
+                kv_cache = result['past_key_values']
+
+            # 处理logits
+            logits = logits[:, -1, :]  # (batch, vocab_size)
+
+            # 抑制已完成样本的logits
+            if done.any():
+                logits[done] = torch.finfo(logits.dtype).min
+                logits[done, pad_token_id] = 0
+
+            if suppress_tokens and suppress_tokens:
+                logits = _suppress_warper(logits, suppress_tokens)
+
+            multinomial = False
+            if temperature and temperature > 0:
+                multinomial = True
+                logits = _temperature_warper(logits, temperature)
+
+            if k and k != 0:
+                logits = _top_k_warper(logits, k, device)
+
+            if p and p < 1:
+                logits = _top_p_warper(logits, p)
+
+            if multinomial:
+                prob = logits.softmax(dim=-1)
+                # 添加数值稳定性检查
+                if torch.isnan(prob).any() or torch.isinf(prob).any():
+                    prob = torch.nan_to_num(prob, nan=0.0, posinf=1.0, neginf=0.0)
+                    prob[done] = 0
+                    prob[done, pad_token_id] = 1  # 强制已完成样本的概率分布
+
+                next_token = torch.multinomial(prob, num_samples=1)
+            else:
+                next_token = logits.argmax(dim=-1, keepdim=True)
+
+            # 更新完成标记
+            done = done | (next_token.squeeze(-1) == eot_token)
+
+            # 拼接生成结果
+            if use_kv_cache:
+                tokens = next_token
+                generate_tokens = torch.cat((generate_tokens, next_token), dim=-1)
+            else:
+                tokens = torch.cat((tokens, next_token), dim=-1)
+
+        # 返回完整结果
+        return tokens if not use_kv_cache else generate_tokens

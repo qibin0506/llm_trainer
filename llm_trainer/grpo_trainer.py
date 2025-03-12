@@ -13,7 +13,7 @@ from .train_configs import TrainConfig
 from .dataset import GRPORolloutDataset, GRPODataset
 from .loss import GRPOLoss
 from .tools import TrainerTools
-from .generate_utils import _generate_tokens
+from .generate_utils import batch_generate
 from .utils import join_batch
 from .log import log
 
@@ -102,14 +102,30 @@ class GRPOTrainer(Trainer):
     def _calc_loss(self, inputs, attention_mask, logits, labels):
         pass
 
-    def _rollout_generate(self, prompt_ids: torch.Tensor):
+    def _rollout_per_question(
+            self,
+            prompt_ids: torch.Tensor,
+            answer: torch.Tensor
+    ):
+        pad_token_id = TrainerTools().tokenizer.pad
         device = TrainerTools().parallel.device
 
-        # [[1, 2, 3]]
-        generate_ids = _generate_tokens(
+        # prompt_ids [prompt_len,]
+        prompt_len = prompt_ids.shape[0]
+        group_size = self.train_config.grpo_config.group_size
+
+        # [group_size, prompt_len]
+        group_prompt_ids = prompt_ids.repeat(group_size, 1)
+        # [group_size, prompt_len]
+        attention_masks = group_prompt_ids != pad_token_id
+
+        # [group_size, max_seq_len]
+        generate_ids = batch_generate(
             # model=self.train_model,
             model=self.generate_model,
-            tokens=prompt_ids.unsqueeze(0),
+            tokens=group_prompt_ids,
+            pad_token_id=pad_token_id,
+            attention_mask=attention_masks,
             max_position_embeddings=self.train_config.llama_config.max_position_embeddings,
             max_new_tokens=self.train_config.grpo_config.gen_max_new_tokens,
             temperature=self.train_config.grpo_config.gen_temperature,
@@ -119,57 +135,27 @@ class GRPOTrainer(Trainer):
             suppress_tokens=self.train_config.grpo_config.gen_suppress_tokens
         )
 
-        # hello world
-        generate_text = TrainerTools().tokenizer.decode_to_text(generate_ids[:, prompt_ids.shape[0]:])
-
-        #  [generate_len], str
-        return generate_ids[0], generate_text
-
-    def _rollout_per_question(
-            self,
-            prompt_ids: torch.Tensor,
-            answer: torch.Tensor
-    ):
-        pad_token_id = TrainerTools().tokenizer.pad
-        device = TrainerTools().parallel.device
-
-        # prompt_ids shape [prompt_len,]
-        prompt_len = prompt_ids.shape[0]
-        group_size = self.train_config.grpo_config.group_size
-
-        # shape is [group_size, length]
-        generate_ids = []
-        # shape is [group_size, 1]
-        rewards = torch.zeros(group_size, 1, dtype=torch.float)
-
-        # generate group_size answer for each question
-        for step in range(group_size):
-            # [generate_len], str
-            generate_id, generate_text = self._rollout_generate(prompt_ids)
-
-            # [group_size, generate_id_len]
-            generate_ids.append(generate_id)
-
-            reward = 0.0
-            if self.reward_funcs:
-                for reward_fun in self.reward_funcs:
-                    reward += reward_fun(prompt_ids, generate_id, answer)
-
-            rewards[step] = reward
-
-        # add pad for aligning
-        # [group_size, max_generate_id_len]
-        generate_ids = pad_sequence(generate_ids, batch_first=True, padding_value=pad_token_id).to(device)
-
-        # [group_size, max_generate_id_len]
+        # [group_size, max_seq_len]
         masks = torch.zeros_like(generate_ids, dtype=torch.bool, device=device)
         # mask prompt
         masks[:, prompt_len:] = True
         # mask pad
         masks[generate_ids == pad_token_id] = False
         # shift right
-        # [group_size, max_generate_id_len - 1]
+        # [group_size, max_seq_len - 1]
         masks = masks[:, 1:]
+
+        # shape [group_size, 1]
+        rewards = torch.zeros(group_size, 1, dtype=torch.float)
+
+        # apply reward for each response
+        for step in range(group_size):
+            reward = 0.0
+            if self.reward_funcs:
+                for reward_fun in self.reward_funcs:
+                    reward += reward_fun(prompt_ids, generate_ids[step], answer)
+
+            rewards[step] = reward
 
         return generate_ids, rewards, masks
 

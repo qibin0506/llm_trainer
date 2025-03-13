@@ -319,6 +319,7 @@ class GRPOConfig:
     def __init__(
             self,
             rollouts_per_step: int,
+            load_state_step_interval: int = 1,
             clip_eps: float = 0.2,
             kl_weight: float = 0.01,
             group_size: int = 12,
@@ -329,6 +330,7 @@ class GRPOConfig:
             gen_suppress_tokens: Optional[list[int]] = None,
     ):
         self.rollouts_per_step = rollouts_per_step
+        self.load_state_step_interval = load_state_step_interval
         self.clip_eps = clip_eps
         self.kl_weight = kl_weight
         self.group_size = group_size

@@ -1,5 +1,4 @@
 from typing import Optional, Union, Set, Type, Callable, List
-import torch
 from torch import nn
 from llama import LlamaConfig
 
@@ -254,36 +253,24 @@ class DataLoaderConfig:
 
 
 class LrSchedulerConfig:
-    """
-        lr scheduler配置项
-
-        Args:
-            enable_lr_scheduler (`bool`, default is True):
-                是否启动lr scheduler
-            initial_lr (`float`, *optional*, default is 1e-4):
-                初始化lr
-            max_lr (`float`, *optional*, default is 5e-4):
-                最大lr
-            warmup_iters_ratio (`float`, *optional*, default is 0.2):
-                使用warmup的最大batch
-            min_lr_ratio (`float`, default is 0.1):
-                最小lr的比例，最小lr=min_lr_ratio*initial_lr
-        """
-
     def __init__(
             self,
             *,
-            enable_lr_scheduler: bool = True,
-            initial_lr: float = 1e-4,
-            max_lr: float = 5e-4,
-            warmup_iters_ratio: float = 0.2,
-            min_lr_ratio: float = 0.1,
+            enable_lr_scheduler: bool = False,
+            initial_lr: Optional[float] = None,
+            max_lr: Optional[float] = None,
+            min_lr: Optional[float] = None,
+            period: Optional[int] = None,
+            period_mul: Optional[int] = None,
+            warmup_iters: Optional[int] = None
     ):
         self.enable_lr_scheduler = enable_lr_scheduler
         self.initial_lr = initial_lr
         self.max_lr = max_lr
-        self.warmup_iters_ratio = warmup_iters_ratio
-        self.min_lr_ratio = min_lr_ratio
+        self.min_lr = min_lr
+        self.period = period
+        self.period_mul = period_mul
+        self.warmup_iters = warmup_iters
 
 
 class LossConfig:
@@ -397,7 +384,6 @@ class TrainConfig:
             batch_size: int,
             *,
             llama_config: LlamaConfig,
-            all_data_size: int,
             all_files: Optional[list[any]] = None,
             gradient_accumulation_steps: int = 0,
             eval_batch_interval: int = 100,
@@ -413,7 +399,6 @@ class TrainConfig:
         self.n_epochs = n_epochs
         self.batch_size = batch_size
         self.llama_config = llama_config
-        self.all_data_size = all_data_size
         self.all_files = all_files
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.eval_batch_interval = eval_batch_interval

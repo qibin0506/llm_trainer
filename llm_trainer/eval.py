@@ -5,7 +5,7 @@ import torch
 
 from .generate_utils import generate
 from .checkpoint import load_checkpoint_for_eval
-from .utils import get_log_dir
+from .log import get_log_dir
 
 
 def _eval_task(eval_model, tag, prompt, max_position_embeddings, is_new_process):

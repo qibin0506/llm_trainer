@@ -14,7 +14,6 @@ from .parallel_ds import DsParallel
 from .parallel_fsdp import FsdpParallel
 from .tools import TrainerTools
 from .loss import LMLoss, KDLoss
-from .log import log
 from .dataset import TextDataset
 
 from .train_configs import (
@@ -25,7 +24,7 @@ from .train_configs import (
 
 from .scheduler import (
     LRScheduler,
-    CosineAnnealingWarmupLRScheduler,
+    WarmupCosineAnnealingLRScheduler,
     NoneLRScheduler
 )
 
@@ -36,9 +35,13 @@ from .checkpoint import (
     save_steps,
 )
 from .utils import (
-    get_log_dir,
     set_seed,
     pretrain_collate_fn,
+)
+
+from .log import(
+    log,
+    get_log_dir
 )
 
 from .eval import submit_gen_task
@@ -62,14 +65,12 @@ class Trainer:
         # initialize a GradScaler. If enabled=False scaler is a no-op
         self.scalar = torch.GradScaler(enabled=TrainerTools().use_amp)
 
-        batch_count = self._calc_batch_count()
-
-        # 学习率要根据GPU的数量进行倍增：
+        # 注意：学习率要根据GPU的数量进行倍增：
         # 在训练的过程中，损失梯度决定下降的方向，学习率决定下降的步长。如果有两块gpu，前进的综合步长为：平均学习率*2
-        initial_lr = train_config.lr_scheduler_config.initial_lr * TrainerTools().parallel.world_size
+        initial_lr = train_config.lr_scheduler_config.initial_lr
 
         self.train_model, self.optimizer = self._init_train_model_and_optim(initial_lr, parallel_kwargs)
-        self.lr_scheduler = self._init_lr_scheduler(batch_count, initial_lr)
+        self.lr_scheduler = self._init_lr_scheduler(initial_lr)
         self.eval_model: Optional[nn.Module] = self._init_eval_model()
 
         self.criterion, self.kd_loss = self._init_loss()
@@ -125,30 +126,22 @@ class Trainer:
 
         return None
 
-    def _calc_batch_count(self) -> int:
-        batch_count = self.train_config.all_data_size // TrainerTools().parallel.world_size // self.train_config.batch_size
-
-        log(f"real batch count: {batch_count}")
-
-        if self.train_config.gradient_accumulation_steps > 1:
-            batch_count = batch_count // self.train_config.gradient_accumulation_steps
-
-        return batch_count
-
-    def _init_lr_scheduler(self, batch_count: int, initial_lr: float) -> LRScheduler:
+    def _init_lr_scheduler(self, initial_lr: float) -> LRScheduler:
         if self.train_config.lr_scheduler_config.enable_lr_scheduler:
-            train_iters = batch_count * self.train_config.n_epochs
-            warmup_iters = int(self.train_config.lr_scheduler_config.warmup_iters_ratio * train_iters)
-            min_lr = self.train_config.lr_scheduler_config.min_lr_ratio * initial_lr
-            max_lr = self.train_config.lr_scheduler_config.max_lr * TrainerTools().parallel.world_size
+            min_lr = self.train_config.lr_scheduler_config.min_lr
+            max_lr = self.train_config.lr_scheduler_config.max_lr
+            warmup_iters = self.train_config.lr_scheduler_config.warmup_iters
+            period = self.train_config.lr_scheduler_config.period
+            period_mul = self.train_config.lr_scheduler_config.period_mul
 
-            return CosineAnnealingWarmupLRScheduler(
+            return WarmupCosineAnnealingLRScheduler(
                 optimizer=self.optimizer,
-                warmup_iters=warmup_iters,
                 initial_lr=initial_lr,
                 min_lr=min_lr,
                 max_lr=max_lr,
-                total_iters=train_iters
+                warmup_iters=warmup_iters,
+                period=period,
+                period_mul=period_mul
             )
 
         return NoneLRScheduler(initial_lr)
@@ -330,8 +323,7 @@ class Trainer:
     ):
         if TrainerTools().parallel.is_main_process:
             log_dir = get_log_dir()
-            lr = self.lr_scheduler.cur_lr
-            log_msg = f"{epoch_tag}, {file_tag}, {batch_tag}, lr: {lr}, loss: {loss}"
+            log_msg = f"{epoch_tag}, {file_tag}, {batch_tag}, loss: {loss}"
             log(log_msg)
             log(f"{log_msg}\n", f'{log_dir}log.txt')
 
@@ -493,11 +485,9 @@ class Trainer:
 
 """
 todo: 
-0. 实现按照token数据确定batch大小，不固定batch的方案 done
 1. 处理异常重启
 2. Yarn和phi3的Phi3LongRoPEScaledRotaryEmbedding调研
 3. MLA调研
-4. DPO调研
 5. inference使用缓存model，每个进程缓存一个
 6. 多模态
 """

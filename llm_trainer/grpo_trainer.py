@@ -3,7 +3,6 @@ from typing import Tuple, List, Callable
 import torch
 from torch.utils.data import Dataset, DataLoader
 import torch.distributed as dist
-from torch.nn.utils.rnn import pad_sequence
 
 from llama import LlamaModel
 
@@ -19,7 +18,6 @@ from .log import log
 
 from .checkpoint import (
     save_checkpoint,
-    load_checkpoint,
     load_checkpoint_for_eval,
     save_steps,
 )
@@ -66,18 +64,6 @@ class GRPOTrainer(Trainer):
             param.requires_grad = False
 
         return generate_model
-
-    def _calc_batch_count(self) -> int:
-        raw_data_size_per_world = self.train_config.all_data_size // TrainerTools().parallel.world_size
-        train_data_size_per_word = raw_data_size_per_world * self.train_config.grpo_config.group_size
-        batch_count = train_data_size_per_word // self.train_config.batch_size
-
-        log(f"real batch count: {batch_count}")
-
-        if self.train_config.gradient_accumulation_steps > 1:
-            batch_count = batch_count // self.train_config.gradient_accumulation_steps
-
-        return batch_count
 
     def _init_loss(self):
         criterion = GRPOLoss(

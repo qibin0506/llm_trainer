@@ -7,14 +7,6 @@ from .tools import TrainerTools
 import numpy as np
 
 
-def get_log_dir() -> str:
-    log_dir = os.environ['LOG_DIR']
-    if not os.path.exists(log_dir):
-        os.mkdir(log_dir)
-
-    return log_dir
-
-
 def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)

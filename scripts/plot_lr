@@ -1,0 +1,32 @@
+#!/usr/bin/env python3
+
+if __name__ == '__main__':
+    import os, sys
+    import matplotlib.pyplot as plt
+
+    arguments = sys.argv[1:]
+    lr_file = arguments[0]
+
+    if not os.path.exists(lr_file):
+        print(f'{lr_file}lr.txt not found')
+        exit(0)
+
+    steps = []
+    lrs = []
+    with open(lr_file, 'r') as f:
+        for line in f:
+            if not line:
+                continue
+
+            #step = {self.cur_steps}, lr = {self.cur_lr}
+            data = line.replace('step=', '').replace('lr=', '').split(',')
+            steps.append(int(data[0]))
+            lrs.append(float(data[1]))
+
+    plt.xlabel('steps')
+    plt.ylabel('lr')
+
+    plt.plot(steps, lrs)
+    plt.show()
+
+

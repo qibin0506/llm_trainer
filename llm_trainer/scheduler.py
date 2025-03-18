@@ -101,7 +101,7 @@ class WarmupCosineAnnealingLRScheduler(LRScheduler):
             param_group['lr'] = lr
 
         self._current_lr = lr
-        log(f"step={self.cur_steps},lr={self.cur_lr}\n", f'{get_log_dir()}log.txt')
+        log(f"step={self.cur_steps},lr={self.cur_lr}\n", f'{get_log_dir()}lr.txt')
 
 
 class NoneLRScheduler(LRScheduler):

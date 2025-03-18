@@ -305,8 +305,7 @@ class DPOConfig:
 class GRPOConfig:
     def __init__(
             self,
-            rollouts_per_step: int,
-            load_state_step_interval: int = 1,
+            grpo_steps: int = 1,
             clip_eps: float = 0.2,
             kl_weight: float = 0.01,
             group_size: int = 12,
@@ -316,8 +315,7 @@ class GRPOConfig:
             gen_p: Optional[float] = None,
             gen_suppress_tokens: Optional[list[int]] = None,
     ):
-        self.rollouts_per_step = rollouts_per_step
-        self.load_state_step_interval = load_state_step_interval
+        self.grpo_steps = grpo_steps
         self.clip_eps = clip_eps
         self.kl_weight = kl_weight
         self.group_size = group_size
@@ -366,6 +364,7 @@ class TrainConfig:
                 所有训练文件
             gradient_accumulation_steps (`int`, *Optional*, default is 0):
                 梯度累积步数，为0时不使用梯度累积
+                grpo训练时不生效该配置！
             eval_batch_interval (`int`, default is 100):
                 每隔多少个batch进行模型eval
             lr_scheduler_config (`LrSchedulerConfig`):

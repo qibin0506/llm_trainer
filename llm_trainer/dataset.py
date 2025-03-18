@@ -122,7 +122,7 @@ class GRPORolloutDataset(Dataset):
         # [{'question': xxx, 'answer': ''}]
         tokens = try_load_pkl(file_path)
         for token in tokens:
-            self.questions.append(token['question'])
+            self.questions.append(token['prompt'])
             self.answers.append(token['answer'])
 
     def __len__(self):
@@ -133,24 +133,6 @@ class GRPORolloutDataset(Dataset):
         answer = self.answers[item]
 
         return {
-            'question': torch.tensor(question).long(),
+            'prompt': torch.tensor(question).long(),
             'answer': torch.tensor(answer).long()
         }
-
-
-class GRPODataset(Dataset):
-    def __init__(self):
-        # [{"sequence_ids": xxx, "old_log_probs": xxx...}, ...]
-        self.items = []
-
-    def append(self, data_per_batch: dict):
-        self.items.extend(split_batch(data_per_batch))
-
-    def clear(self):
-        self.items.clear()
-
-    def __len__(self) -> int:
-        return len(self.items)
-
-    def __getitem__(self, idx: int):
-        return self.items[idx]

@@ -178,85 +178,41 @@ class GRPOLoss(nn.Module):
         self.clip_eps = clip_eps
         self.kl_weight = kl_weight
 
-    def _sequence_log_probs_from_logits(
-            self,
-            logits: torch.tensor,
-            output_ids: torch.tensor
-    ) -> torch.Tensor:
-        log_prob = F.log_softmax(logits, dim=-1)
-        return log_prob.gather(dim=-1, index=output_ids.unsqueeze(-1)).squeeze(-1)
-
-    def _approx_kl_divergence(
-            self,
-            log_probs: torch.Tensor,
-            ref_log_probs: torch.Tensor,
-            mask: Optional[torch.Tensor]
-    ) -> torch.Tensor:
-        """
-        Monte-Carlo approximation of KL divergence, k3 estimator, see: http://joschu.net/blog/kl-approx.html
-        """
-        log_ratio = ref_log_probs.float() - log_probs.float()
-        if mask is not None:
-            log_ratio = log_ratio * mask
-
-        return log_ratio.exp() - log_ratio - 1
-
-    def _masked_mean(
-            self,
-            tensor: torch.Tensor,
-            mask: Optional[torch.Tensor],
-            dim: int = None,
-    ) -> torch.Tensor:
-        if mask is None:
-            return tensor.mean(dim=dim)
-        return (tensor * mask).sum(dim=dim) / mask.sum(dim=dim)
-
-    def group_advantages(
-            self,
-            rewards: torch.Tensor,
-            eps: float = 1e-8
-    ) -> torch.Tensor:
-        return (rewards - rewards.mean()) / (rewards.std() + eps)
-
-    def sequences_log_probs(
-            self,
-            model: LlamaModel,
-            sequence_ids: torch.Tensor,
-            attention_mask: torch.Tensor,
-    ) -> [torch.Tensor, torch.Tensor]:
-        # sequence_ids [group_size, max_generate_len]
-        # attention_mask [group_size, max_generate_len]
-        output = model(
-            input_ids=sequence_ids,
-            attention_mask=attention_mask
-        )
-
-        logits = output["logits"]
-        log_probs = self._sequence_log_probs_from_logits(
-            logits=logits[:, :-1].to(torch.float32),
-            output_ids=sequence_ids[:, 1:],
-        )
-
-        return log_probs, output['aux_loss']
-
     def forward(
             self,
             log_probs: torch.Tensor,
             old_log_probs: torch.Tensor,
             ref_log_probs: torch.Tensor,
-            mask: torch.Tensor,
+            completion_mask: torch.Tensor,
             advantages: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        kl = self._approx_kl_divergence(
-            log_probs=log_probs,
-            ref_log_probs=ref_log_probs,
-            mask=mask,
-        )
+    ) -> torch.Tensor:
+        # Compute policy ratio
+        ratio = torch.exp(log_probs - old_log_probs)
 
-        ratio = (log_probs - old_log_probs).exp()
-        surr1 = ratio * advantages
-        surr2 = ratio.clamp(1 - self.clip_eps, 1 + self.clip_eps) * advantages
-        loss = -torch.min(surr1, surr2) + self.kl_weight * kl
+        # Compute surrogate loss with clipping
+        surrogate1 = ratio * advantages
+        surrogate2 = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * advantages
+        surrogate_loss = torch.min(surrogate1, surrogate2)
 
-        loss = self._masked_mean(loss, mask, dim=-1).mean()
-        return loss, kl.mean()
+        # Compute KL divergence penalty
+        kl_div = torch.exp(ref_log_probs - log_probs) - (ref_log_probs - log_probs) - 1
+
+        # Combine losses
+        per_token_loss = surrogate_loss - self.kl_weight * kl_div
+        loss = -((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+
+        return loss
+
+        # kl = self._approx_kl_divergence(
+        #     log_probs=log_probs,
+        #     ref_log_probs=ref_log_probs,
+        #     mask=mask,
+        # )
+        #
+        # ratio = (log_probs - old_log_probs).exp()
+        # surr1 = ratio * advantages
+        # surr2 = ratio.clamp(1 - self.clip_eps, 1 + self.clip_eps) * advantages
+        # loss = -torch.min(surr1, surr2) + self.kl_weight * kl
+        #
+        # loss = self._masked_mean(loss, mask, dim=-1).mean()
+        # return loss, kl.mean()

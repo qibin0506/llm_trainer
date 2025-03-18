@@ -313,9 +313,14 @@ def batch_generate(
             if done.all():
                 break
 
-            t = tokens[:, -max_position_embeddings:]
+            t = tokens #tokens[:, -max_position_embeddings:]
             with ctx:
-                result = model(t, past_key_values=kv_cache, use_cache=use_kv_cache)
+                result = model(
+                    t,
+                    attention_mask=attention_mask,
+                    past_key_values=kv_cache,
+                    use_cache=use_kv_cache
+                )
                 logits = result['logits']
                 kv_cache = result['past_key_values']
 
@@ -362,6 +367,9 @@ def batch_generate(
                 generate_tokens = torch.cat((generate_tokens, next_token), dim=-1)
             else:
                 tokens = torch.cat((tokens, next_token), dim=-1)
+
+            new_mask = torch.ones_like(next_token, dtype=torch.bool)
+            attention_mask = torch.cat((attention_mask, new_mask), dim=-1)
 
         # 返回完整结果
         return tokens if not use_kv_cache else generate_tokens

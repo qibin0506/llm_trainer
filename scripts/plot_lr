@@ -17,11 +17,20 @@ if __name__ == '__main__':
         for line in f:
             if not line:
                 continue
+            # line: (2025-03-19 18:15:30) step=159,lr=2.159680442248444e-05
+            # data: 159,lr=2.159680442248444e-05
+            data = line.split('step=')[-1]
+            # [159, 2.159680442248444e-05]
+            data = data.split(',lr=')
 
-            #step = {self.cur_steps}, lr = {self.cur_lr}
-            data = line.replace('step=', '').replace('lr=', '').split(',')
-            steps.append(int(data[0]))
-            lrs.append(float(data[1]))
+            step = int(data[0])
+            lr = float(data[1])
+
+            if step in steps:
+                continue
+
+            steps.append(step)
+            lrs.append(lr)
 
     plt.xlabel('steps')
     plt.ylabel('lr')

@@ -8,7 +8,7 @@ if __name__ == '__main__':
     lr_file = arguments[0]
 
     if not os.path.exists(lr_file):
-        print(f'{lr_file}lr.txt not found')
+        print(f'{lr_file} not found')
         exit(0)
 
     steps = []

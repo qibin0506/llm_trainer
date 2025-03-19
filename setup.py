@@ -6,10 +6,17 @@ setup(
     name='project_llm_trainer',
     version='0.1',
     description='llm trainer',
-    scripts=['scripts/smart_train',
-               'scripts/ds_train',
-               'scripts/ddp_train',
-               'scripts/py_train'],
+    scripts=[
+        'scripts/smart_train',
+        'scripts/ds_train',
+        'scripts/ddp_train',
+        'scripts/py_train',
+        'scripts/plot_lr',
+        'scripts/plot_loss'
+    ],
+    # package_data={'': ['*.pyc']},
+    # exclude_package_data={'': ['*.py']},
+    # include_package_data=True,
     author='qibin',
     author_email='qibin0506@gmail.com',
     packages=find_packages()

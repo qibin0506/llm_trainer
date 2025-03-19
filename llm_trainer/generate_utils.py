@@ -321,16 +321,18 @@ def batch_generate(
                     past_key_values=kv_cache,
                     use_cache=use_kv_cache
                 )
+
                 logits = result['logits']
                 kv_cache = result['past_key_values']
 
             # 处理logits
             logits = logits[:, -1, :]  # (batch, vocab_size)
 
-            # 抑制已完成样本的logits
             if done.any():
-                logits[done] = torch.finfo(logits.dtype).min
-                logits[done, pad_token_id] = 0
+                # 强制构造 one-hot 分布，确保 pad_token_id 概率为 1
+                logits_done = torch.full_like(logits[done], -torch.finfo(logits.dtype).max)
+                logits_done[:, pad_token_id] = 0  # pad_token_id 的 logit 设为 0
+                logits[done] = logits_done
 
             if suppress_tokens and suppress_tokens:
                 logits = _suppress_warper(logits, suppress_tokens)
@@ -346,14 +348,25 @@ def batch_generate(
             if p and p < 1:
                 logits = _top_p_warper(logits, p)
 
-            if multinomial:
-                prob = logits.softmax(dim=-1)
-                # 添加数值稳定性检查
-                if torch.isnan(prob).any() or torch.isinf(prob).any():
-                    prob = torch.nan_to_num(prob, nan=0.0, posinf=1.0, neginf=0.0)
-                    prob[done] = 0
-                    prob[done, pad_token_id] = 1  # 强制已完成样本的概率分布
+            prob = logits.softmax(dim=-1)
 
+            # 检查并修正无效概率分布（sum <=0）[[1]][[4]]
+            prob_sum = prob.sum(dim=-1, keepdim=True)
+            invalid_mask = (prob_sum <= 0)
+            if invalid_mask.any():
+                # 为无效样本生成均匀分布，确保概率总和>0
+                uniform_prob = torch.ones_like(prob) / prob.size(-1)
+                prob = torch.where(invalid_mask.unsqueeze(-1), uniform_prob, prob)
+
+            # 抑制已完成样本（确保 pad_token_id 概率为 1）
+            prob[done] = 0
+            prob[done, pad_token_id] = 1
+
+            # 数值稳定性处理
+            if torch.isnan(prob).any() or torch.isinf(prob).any():
+                prob = torch.nan_to_num(prob, nan=0.0, posinf=1.0, neginf=0.0)
+
+            if multinomial:
                 next_token = torch.multinomial(prob, num_samples=1)
             else:
                 next_token = logits.argmax(dim=-1, keepdim=True)

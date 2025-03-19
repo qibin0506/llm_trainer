@@ -15,6 +15,13 @@ parallel_types = {
     'none': NoneParallel
 }
 
+dtypes = {
+    'float': torch.float,
+    'float16': torch.float16,
+    'float32': torch.float32,
+    'float64': torch.float64
+}
+
 class TrainerTools:
     def __init__(self):
         if not hasattr(TrainerTools, "_first_init"):
@@ -24,7 +31,12 @@ class TrainerTools:
 
             self.tokenizer = Tokenizer(os.environ.get('TOKENIZERS_TYPE', 'zh_llama'))
             self.use_amp = 'cuda' in self.parallel.device and not isinstance(self.parallel, DsParallel)
-            self.dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+
+            dtype = os.environ.get('DTYPE', None)
+            self.dtype = dtypes[dtype] if dtype in dtypes else None
+
+            if not self.dtype:
+                self.dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
 
             log(f'word_size={self.parallel.world_size},'
                 f' use_amp={self.use_amp},'

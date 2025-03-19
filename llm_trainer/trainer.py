@@ -69,7 +69,7 @@ class Trainer:
         # 在训练的过程中，损失梯度决定下降的方向，学习率决定下降的步长。如果有两块gpu，前进的综合步长为：平均学习率*2
         initial_lr = train_config.lr_scheduler_config.initial_lr
 
-        self.train_model, self.optimizer = self._init_train_model_and_optim(initial_lr, parallel_kwargs)
+        self.train_model, self.optimizer, self.origin_optimizer = self._init_train_model_and_optim(initial_lr, parallel_kwargs)
         self.lr_scheduler = self._init_lr_scheduler(initial_lr)
         self.eval_model: Optional[nn.Module] = self._init_eval_model()
 
@@ -101,7 +101,7 @@ class Trainer:
             self,
             initial_lr: float,
             parallel_kwargs
-    ) -> Tuple[nn.Module, torch.optim.Optimizer]:
+    ):
         model = LlamaModel(self.train_config.llama_config)
         if TrainerTools().parallel.is_main_process:
             total_params = sum(p.numel() for p in model.parameters())
@@ -111,14 +111,14 @@ class Trainer:
             total_size_mb = total_size_bytes / (1024 * 1024)
             log(f"Total size of the model: {total_size_mb:.2f} MB")
 
-        optim = torch.optim.AdamW(model.parameters(), lr=initial_lr, weight_decay=0.1)
+        origin_optim = torch.optim.AdamW(model.parameters(), lr=initial_lr, weight_decay=0.1)
         model, optim = TrainerTools().parallel.process(
             model=model,
-            optimizer=optim,
+            optimizer=origin_optim,
             kwargs=parallel_kwargs
         )
 
-        return model, optim
+        return model, optim, origin_optim
 
     def _init_eval_model(self) -> Optional[nn.Module]:
         if TrainerTools().parallel.is_main_process:
@@ -135,7 +135,7 @@ class Trainer:
             period_mul = self.train_config.lr_scheduler_config.period_mul
 
             return WarmupCosineAnnealingLRScheduler(
-                optimizer=self.optimizer,
+                optimizer=self.origin_optimizer,
                 initial_lr=initial_lr,
                 min_lr=min_lr,
                 max_lr=max_lr,

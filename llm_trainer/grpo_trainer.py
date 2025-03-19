@@ -1,6 +1,6 @@
 import time
 import copy
-from typing import Tuple, List, Callable
+from typing import Tuple, List, Union, Callable
 import torch
 from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
@@ -39,6 +39,10 @@ class GRPOTrainer(Trainer):
         self.reward_func = reward_func
         self.reference_model = self._init_reference_model()
         self.generate_model = self._init_generate_model()
+
+        # 默认使用torch提供的pad_sequence
+        # 如果pad_sequence不支持padding_side参数，则将改参数置为False，使用反转的方式
+        self._use_origin_pad_sequence = True
 
     def _init_reference_model(self):
         reference_model = LlamaModel(self.train_config.llama_config)
@@ -86,6 +90,25 @@ class GRPOTrainer(Trainer):
 
     def _calc_loss(self, inputs, attention_mask, logits, labels):
         pass
+
+    def _left_pad_sequence(
+            self,
+            sequences: Union[torch.Tensor, List[torch.Tensor]],
+            padding_value: float,
+    ) -> torch.Tensor:
+        if self._use_origin_pad_sequence:
+            try:
+                return pad_sequence(sequences, batch_first=True, padding_value=padding_value, padding_side='left')
+            except:
+                self._use_origin_pad_sequence = False
+                return self._left_pad_sequence(sequences, padding_value)
+        else:
+            # 反转每个序列的顺序（如 [1,2,3] → [3,2,1]）
+            reversed_sequences = [seq.flip(dims=(0,)) for seq in sequences]
+            # 使用默认的右侧填充
+            padded_reversed = pad_sequence(reversed_sequences, batch_first=True, padding_value=padding_value)
+            # 再次反转序列顺序，恢复原始方向（填充在左侧）
+            return padded_reversed.flip(dims=(1,))
 
     def _selective_log_softmax(self, logits, input_ids):
         # Convert raw logits into log probabilities along the vocabulary axis.
@@ -159,7 +182,7 @@ class GRPOTrainer(Trainer):
 
         # 左边添加pad，对齐prompt长度
         # [batch, max_prompt_len]
-        prompt_ids = pad_sequence(prompts, batch_first=True, padding_value=pad_token_id, padding_side='left')
+        prompt_ids = self._left_pad_sequence(prompts, padding_value=pad_token_id)
         prompt_ids = prompt_ids.to(device)
 
         prompt_len = prompt_ids.shape[1]

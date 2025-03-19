@@ -141,7 +141,8 @@ class Trainer:
                 max_lr=max_lr,
                 warmup_iters=warmup_iters,
                 period=period,
-                period_mul=period_mul
+                period_mul=period_mul,
+                need_log=TrainerTools().parallel.is_main_process
             )
 
         return NoneLRScheduler(initial_lr)

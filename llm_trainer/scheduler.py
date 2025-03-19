@@ -40,7 +40,8 @@ class WarmupCosineAnnealingLRScheduler(LRScheduler):
             max_lr: float,
             warmup_iters: int,
             period: int, # 每个周期的步数
-            period_mul: int = 1 # 周期长度的倍数
+            period_mul: int = 1, # 周期长度的倍数
+            need_log: bool = False
     ):
         super().__init__()
 
@@ -57,6 +58,8 @@ class WarmupCosineAnnealingLRScheduler(LRScheduler):
         self._current_lr = initial_lr
 
         self._cosine_annealing_scheduler = None
+
+        self.need_log = need_log
 
 
     @property
@@ -101,7 +104,9 @@ class WarmupCosineAnnealingLRScheduler(LRScheduler):
             param_group['lr'] = lr
 
         self._current_lr = lr
-        log(f"step={self.cur_steps},lr={self.cur_lr}\n", f'{get_log_dir()}lr.txt')
+
+        if self.need_log:
+            log(f"step={self.cur_steps},lr={self.cur_lr}\n", f'{get_log_dir()}lr.txt')
 
 
 class NoneLRScheduler(LRScheduler):

@@ -12,7 +12,8 @@ setup(
         'scripts/ddp_train',
         'scripts/py_train',
         'scripts/plot_lr',
-        'scripts/plot_loss'
+        'scripts/plot_loss',
+        'scripts/calc_intermediate_size'
     ],
     # package_data={'': ['*.pyc']},
     # exclude_package_data={'': ['*.py']},

@@ -9,7 +9,12 @@ from .parallel_fsdp import FsdpParallel
 from .parallel_ddp import DdpParallel
 from .scheduler import LRScheduler
 from .tools import TrainerTools
-from .dcp import save_dcp, load_dcp, convert_dcp_to_pth
+
+try:
+    from .dcp import save_dcp, load_dcp, convert_dcp_to_pth
+except:
+    os.environ['ENABLE_DCP'] = "0"
+    
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 # https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html

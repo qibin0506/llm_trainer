@@ -17,6 +17,10 @@ if __name__ == '__main__':
         step = 0
         for line in f:
             if not line or 'loss:' not in line:
+                if 'start train' not in line:
+                    steps.clear()
+                    losses.clear()
+                    step = 0
                 continue
 
             # (2025-03-19 20:13:44) epoch: 0, file: 1/1, batch: 623/1099, loss: 0.12186837196350098

@@ -86,8 +86,6 @@ class WarmupCosineAnnealingLRScheduler(LRScheduler):
         if self._steps <= self._warmup_iters:
             # Warmup: adjust learning rate linearly
             lr = self._initial_lr + self._steps * self._lr_increment
-            for param_group in self._optimizer.param_groups:
-                param_group['lr'] = lr
         else:
             if not self._cosine_annealing_scheduler:
                 self._cosine_annealing_scheduler = CosineAnnealingWarmRestarts(

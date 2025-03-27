@@ -56,7 +56,7 @@ class WarmupCosineAnnealingLRScheduler(LRScheduler):
         if warmup_iters != 0:
             self._lr_increment = (max_lr - initial_lr) / warmup_iters
         else:
-            self._lr_increment = -1
+            self._lr_increment = 0
 
         self._steps = -1
         self._current_lr = initial_lr

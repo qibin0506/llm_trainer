@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
+import math
 import torch
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from .log import (
     log,
     get_log_dir
@@ -50,8 +50,12 @@ class WarmupCosineAnnealingLRScheduler(LRScheduler):
         self._min_lr = min_lr
         self._max_lr = max_lr
         self._warmup_iters = warmup_iters
+
         self._period = period
         self._period_mul = period_mul
+
+        self.T_cur = 0  # 当前周期内已走过的步数
+        self.cycle = 0  # 当前周期编号
 
         if warmup_iters != 0:
             self._lr_increment = (max_lr - initial_lr) / warmup_iters
@@ -60,8 +64,7 @@ class WarmupCosineAnnealingLRScheduler(LRScheduler):
 
         self._steps = -1
         self._current_lr = initial_lr
-
-        self._cosine_annealing_scheduler = None
+        self._cosine_annealing_base_lr = None
 
         self.need_log = need_log
 
@@ -89,25 +92,35 @@ class WarmupCosineAnnealingLRScheduler(LRScheduler):
     def _update_lr(self):
         if self._steps <= self._warmup_iters:
             # Warmup: adjust learning rate linearly
+            # (max_lr - initial_lr) / warmup_iters
             lr = self._initial_lr + self._steps * self._lr_increment
             for param_group in self._optimizer.param_groups:
                 param_group['lr'] = lr
         else:
-            if not self._cosine_annealing_scheduler:
-                self._cosine_annealing_scheduler = CosineAnnealingWarmRestarts(
-                    optimizer=self._optimizer,
-                    T_0=self._period,
-                    T_mult=self._period_mul,
-                    eta_min=self._min_lr
-                )
+            if not self._cosine_annealing_base_lr:
+                self._cosine_annealing_base_lr = self.cur_lr
 
-            self._cosine_annealing_scheduler.step()
-            lr = self._cosine_annealing_scheduler.get_last_lr()[0]
+            """每步更新学习率"""
+            # 计算当前周期的最大步数
+            T_max = self._period * (self._period_mul ** self.cycle)
+
+            # 更新周期状态
+            self.T_cur += 1
+            if self.T_cur >= T_max:
+                self.cycle += 1
+                self.T_cur = 0  # 重置周期步数
+
+            # 计算并设置新学习率
+            cos_factor = (1 + math.cos(math.pi * self.T_cur / T_max)) / 2
+            lr = self._min_lr + (self._cosine_annealing_base_lr - self._min_lr) * cos_factor
+
+            for param_group in self._optimizer.param_groups:
+                param_group['lr'] = lr
 
         self._current_lr = lr
 
         if self.need_log:
-            log(f"step={self.cur_steps},lr={self.cur_lr}\n", f'{get_log_dir()}lr.txt')
+            log(f"step={self.cur_steps},lr={lr}\n", f'{get_log_dir()}lr.txt')
 
 
 class NoneLRScheduler(LRScheduler):

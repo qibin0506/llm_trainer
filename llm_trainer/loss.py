@@ -91,65 +91,19 @@ class DPOLoss(nn.Module):
         self.label_smoothing = label_smoothing
         self.ipo = ipo
 
-    def _log_probs_from_logits(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        # https://github.com/OpenRLHF/OpenRLHF/pull/718#issuecomment-2641081881
-        if logits.dtype in [torch.float32, torch.float64]:
-            logits_labels = torch.gather(logits, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
-            logsumexp_values = torch.stack(
-                [torch.logsumexp(l, dim=-1) for l in logits]  # loop to reduce peak mem consumption
-            )
-            log_probs_labels = logits_labels - logsumexp_values  # log_softmax(x_i) = x_i - logsumexp(x)
-        else:
-            log_probs_labels = []
-            for row_logits, row_labels in zip(logits, labels):  # loop to reduce peak mem consumption
-                row_log_probs = F.log_softmax(row_logits, dim=-1)
-                row_log_probs_labels = row_log_probs.gather(dim=-1, index=row_labels.unsqueeze(-1)).squeeze(-1)
-                log_probs_labels.append(row_log_probs_labels)
-            log_probs_labels = torch.stack(log_probs_labels)
-        return log_probs_labels
-
-    def logprobs(self, logits, labels, mask):
-        """
-        Calculate the average log probabilities for a batch of sequences.
-
-        Args:
-            logits (torch.Tensor): Logits from the model with shape (B, T, V)
-            labels (torch.Tensor): Ground truth labels with shape (B, T).
-            mask (torch.Tensor): Mask tensor with shape (B, T) indicating
-                which tokens are not padding (1 for valid tokens, 0 for padding).
-
-        Returns:
-            torch.Tensor: Average log probabilities for each sequence in the batch.
-                          Shape is (B,) representing the mean log probability for each sequence.
-        """
-        labels = labels[:, 1:].clone()
-        logits = logits[:, :-1, :]
-
-        # Shift mask right by one to align with labels
-        mask = mask[:, 1:].clone()
-
-        # dummy token; we'll ignore the losses on these tokens later
-        labels[labels == -100] = 0
-
-        # Gather the log probabilities for the actual labels
-        per_token_logps = self._log_probs_from_logits(logits, labels)
-
-        # Apply the mask to set log-probs of padding tokens to 0
-        logprobs_sums = (per_token_logps * mask).sum(-1)
-
-        logprobs_means = (per_token_logps * mask).sum(-1) / mask.sum(-1)
-
-        return logprobs_sums, -logprobs_means.mean()
-
     def forward(
             self,
-            policy_chosen_logps: torch.Tensor,
-            policy_rejected_logps: torch.Tensor,
-            reference_chosen_logps: torch.Tensor,
-            reference_rejected_logps: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        pi_logratios = policy_chosen_logps - policy_rejected_logps
-        ref_logratios = reference_chosen_logps - reference_rejected_logps
+            policy_logps: torch.Tensor,
+            reference_logps: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size = reference_logps.shape[0]
+        ref_chosen_probs = reference_logps[:batch_size//2]
+        ref_reject_probs = reference_logps[batch_size//2:]
+        policy_chosen_probs = policy_logps[:batch_size//2]
+        policy_reject_probs = policy_logps[batch_size//2:]
+
+        pi_logratios = policy_chosen_probs - policy_reject_probs
+        ref_logratios = ref_chosen_probs - ref_reject_probs
         logits = pi_logratios - ref_logratios
 
         if self.ipo:
@@ -162,10 +116,10 @@ class DPOLoss(nn.Module):
             )
 
         loss = losses.mean()
-        chosen_rewards = self.beta * (policy_chosen_logps - reference_chosen_logps).detach()
-        rejected_rewards = self.beta * (policy_rejected_logps - reference_rejected_logps).detach()
+        # chosen_rewards = self.beta * (policy_chosen_probs - ref_chosen_probs).detach()
+        # rejected_rewards = self.beta * (policy_reject_probs - ref_reject_probs).detach()
 
-        return loss, chosen_rewards, rejected_rewards
+        return loss
 
 
 class GRPOLoss(nn.Module):

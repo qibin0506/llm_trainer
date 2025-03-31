@@ -420,10 +420,6 @@ class Trainer:
                         attention_mask = inputs != TrainerTools().tokenizer.pad
 
                         if TrainerTools().parallel.parallel_train:
-                            # in DDP training we only need to sync gradients at the last micro step.
-                            # the official way to do this is with model.no_sync() context manager, but
-                            # I really dislike that this bloats the code and forces us to repeat code
-                            # looking at the source of that context manager, it just toggles this variable
                             self.train_model.require_backward_grad_sync = need_update_grad
 
                         with self.ctx:

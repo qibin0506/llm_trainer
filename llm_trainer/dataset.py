@@ -86,32 +86,23 @@ class LineByLineTextDataset(Dataset):
 class DPODataset(Dataset):
     def __init__(self, file_path, max_len):
         self.max_len = max_len
-        self.prompt_ids = []
         self.chosen_ids = []
         self.rejected_ids = []
 
-        # [{'prompt': [], 'chosen': [], 'rejected': []}]
+        # [{'chosen': xxx, 'rejected': xxx} ...]
         tokens = try_load_pkl(file_path)
         for token in tokens:
-            self.prompt_ids.append(token['prompt'])
             self.chosen_ids.append(token['chosen'])
             self.rejected_ids.append(token['rejected'])
 
     def __len__(self):
-        return len(self.prompt_ids)
+        return len(self.chosen_ids)
 
     def __getitem__(self, item):
-        prompt_id = self.prompt_ids[item]
         chosen_id = self.chosen_ids[item]
         rejected_id = self.rejected_ids[item]
 
-        chosen = prompt_id + chosen_id
-        rejected = prompt_id + rejected_id
-
-        chosen = chosen[:self.max_len]
-        rejected = rejected[:self.max_len]
-
-        return {'chosen': chosen, 'rejected': rejected}
+        return {'chosen': chosen_id[:self.max_len], 'rejected': rejected_id[:self.max_len]}
 
 
 class GRPORolloutDataset(Dataset):

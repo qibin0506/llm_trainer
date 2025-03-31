@@ -97,21 +97,3 @@ class Tokenizer:
 
     def batch_decode(self, tokens: torch.Tensor, skip_special_tokens: bool = False) -> List[str]:
         return self.tokenizer.batch_decode(tokens, skip_special_tokens=skip_special_tokens)
-
-
-# if __name__ == '__main__':
-#     tokenizer = Tokenizer(TOKEN_TYPE_ZH_LLAMA)
-#     print(tokenizer.vocab_size)
-#     print(tokenizer.tokenizer.vocab_size)
-#     print(tokenizer.encode_to_token(tokenizer.eot_text), tokenizer.eot)
-#     print(tokenizer.encode_to_token(tokenizer.pad_text), tokenizer.pad)
-#     print(tokenizer.encode_to_token(tokenizer.unk_text), tokenizer.unk)
-#     print(tokenizer.encode_to_token(tokenizer.user_text), tokenizer.user)
-#     print(tokenizer.encode_to_token(tokenizer.bot_text), tokenizer.bot)
-#     print(tokenizer.encode_to_token(tokenizer.bor_text), tokenizer.bor)
-#     print(tokenizer.encode_to_token(tokenizer.eor_text), tokenizer.eor)
-#     print(tokenizer.encode_to_token('什么时候'))
-#     print(tokenizer.encode_to_token('你好'))
-#     print(tokenizer.decode_to_text(torch.tensor(tokenizer.encode_to_token('什么时候'))))
-
-

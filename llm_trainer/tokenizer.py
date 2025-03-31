@@ -1,9 +1,7 @@
 import os
 from typing import List
 from transformers import Qwen2TokenizerFast
-from transformers import AutoTokenizer
 from transformers import AddedToken
-from transformers import PreTrainedTokenizerFast
 from transformers import LlamaTokenizer
 import torch, json
 
@@ -19,30 +17,35 @@ class Tokenizer:
         assert token_type in AVAILABLE_TOKEN_TYPES, 'token type is unavailable'
         self.token_type = token_type
 
-        self.eot_text = '</s>'
+        self.text_end = '</s>'
 
-        self.pad_text = '<pad>'
-        self.unk_text = '<unk>'
+        self.text_pad = '<pad>'
+        self.text_unk = '<unk>'
 
-        self.user_text = '<user>'
-        self.bot_text = '<assistant>'
+        self.text_user = '<user>'
+        self.text_assistant = '<assistant>'
 
-        self.bor_text = '<reasoning>'
-        self.eor_text = '</reasoning>'
+        self.text_reasoning_start = '<reasoning>'
+        self.text_reasoning_end = '</reasoning>'
+
+        self.text_answer_start = '<answer>'
+        self.text_answer_end = '</answer>'
+
+        self.text_system = '<system>'
 
         if token_type == TOKEN_TYPE_QWEN:
             self.tokenizer = Qwen2TokenizerFast(
                 vocab_file=f"{os.environ['TOKEN_DIR']}qwen_vocab.json",
                 merges_file=f"{os.environ['TOKEN_DIR']}qwen_merges.txt",
-                unk_token=self.unk_text,
-                eos_token=self.eot_text,
-                pad_token=self.pad_text
+                unk_token=self.text_unk,
+                eos_token=self.text_end,
+                pad_token=self.text_pad
             )
             additional_special_tokens = [
-                AddedToken(self.user_text, lstrip=False, rstrip=False),
-                AddedToken(self.bot_text, lstrip=False, rstrip=False),
-                AddedToken(self.bor_text, lstrip=False, rstrip=False),
-                AddedToken(self.eor_text, lstrip=False, rstrip=False)
+                AddedToken(self.text_user, lstrip=False, rstrip=False),
+                AddedToken(self.text_assistant, lstrip=False, rstrip=False),
+                AddedToken(self.text_reasoning_start, lstrip=False, rstrip=False),
+                AddedToken(self.text_reasoning_end, lstrip=False, rstrip=False)
             ]
 
             self.tokenizer.add_special_tokens({"additional_special_tokens": additional_special_tokens})
@@ -51,16 +54,21 @@ class Tokenizer:
             # self.tokenizer = AutoTokenizer.from_pretrained(os.environ['TOKEN_DIR'])
             # self.tokenizer = PreTrainedTokenizerFast.from_pretrained(os.environ['TOKEN_DIR'], trust_remote_code=True)
 
-        self.eot = self.tokenizer.convert_tokens_to_ids(self.eot_text)
+        self.end = self.tokenizer.convert_tokens_to_ids(self.text_end)
 
-        self.pad = self.tokenizer.convert_tokens_to_ids(self.pad_text)
-        self.unk = self.tokenizer.convert_tokens_to_ids(self.unk_text)
+        self.pad = self.tokenizer.convert_tokens_to_ids(self.text_pad)
+        self.unk = self.tokenizer.convert_tokens_to_ids(self.text_unk)
 
-        self.user = self.tokenizer.convert_tokens_to_ids(self.user_text)
-        self.bot = self.tokenizer.convert_tokens_to_ids(self.bot_text)
+        self.user = self.tokenizer.convert_tokens_to_ids(self.text_user)
+        self.assistant = self.tokenizer.convert_tokens_to_ids(self.text_assistant)
 
-        self.bor = self.tokenizer.convert_tokens_to_ids(self.bor_text)
-        self.eor = self.tokenizer.convert_tokens_to_ids(self.eor_text)
+        self.reasoning_start = self.tokenizer.convert_tokens_to_ids(self.text_reasoning_start)
+        self.reasoning_end = self.tokenizer.convert_tokens_to_ids(self.text_reasoning_end)
+
+        self.answer_start = self.tokenizer.convert_tokens_to_ids(self.text_answer_start)
+        self.answer_end = self.tokenizer.convert_tokens_to_ids(self.text_answer_end)
+
+        self.system = self.tokenizer.convert_tokens_to_ids(self.text_system)
 
         self.vocab_size = len(self.tokenizer)
 

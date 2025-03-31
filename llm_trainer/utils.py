@@ -31,7 +31,7 @@ def _mask_prompt(labels):
         for index, token in enumerate(label):
             if token == TrainerTools().tokenizer.user:
                 start_index = index
-            elif token == TrainerTools().tokenizer.bot and start_index != -1:
+            elif token == TrainerTools().tokenizer.assistant and start_index != -1:
                 labels[batch, start_index:index + 1] = -100
                 start_index = -1
 
@@ -61,7 +61,7 @@ def sft_collate_fn(batch_data):
     # 支持单轮会话的mask
     # inputs, labels = pretrain_collate_fn(batch_data)
     # batch_size = len(labels)
-    # batch_bot_idx = torch.nonzero(torch.eq(labels, TrainerTools().tokenizer.bot), as_tuple=True)[1]
+    # batch_bot_idx = torch.nonzero(torch.eq(labels, TrainerTools().tokenizer.assistant), as_tuple=True)[1]
     #
     # for batch in range(batch_size):
     #     bot_idx = batch_bot_idx[batch].item() + 1

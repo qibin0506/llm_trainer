@@ -179,7 +179,7 @@ def _generate(
             else:
                 tokens = torch.cat((tokens, next_token), dim=-1)
 
-            if next_token.item() == TrainerTools().tokenizer.eot:
+            if next_token.item() == TrainerTools().tokenizer.end:
                 break
 
     # token, is_full_result
@@ -303,7 +303,7 @@ def batch_generate(
     batch_size = tokens.shape[0]
 
     # 初始化完成标记
-    eot_token = TrainerTools().tokenizer.eot
+    end_token = TrainerTools().tokenizer.end
     done = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
     model.eval()
@@ -372,7 +372,7 @@ def batch_generate(
                 next_token = logits.argmax(dim=-1, keepdim=True)
 
             # 更新完成标记
-            done = done | (next_token.squeeze(-1) == eot_token)
+            done = done | (next_token.squeeze(-1) == end_token)
 
             # 拼接生成结果
             if use_kv_cache:

@@ -45,7 +45,10 @@ class Tokenizer:
                 AddedToken(self.text_user, lstrip=False, rstrip=False),
                 AddedToken(self.text_assistant, lstrip=False, rstrip=False),
                 AddedToken(self.text_reasoning_start, lstrip=False, rstrip=False),
-                AddedToken(self.text_reasoning_end, lstrip=False, rstrip=False)
+                AddedToken(self.text_reasoning_end, lstrip=False, rstrip=False),
+                AddedToken(self.text_answer_start, lstrip=False, rstrip=False),
+                AddedToken(self.text_answer_end, lstrip=False, rstrip=False),
+                AddedToken(self.text_system, lstrip=False, rstrip=False),
             ]
 
             self.tokenizer.add_special_tokens({"additional_special_tokens": additional_special_tokens})

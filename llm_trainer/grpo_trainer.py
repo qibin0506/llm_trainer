@@ -220,7 +220,10 @@ class GRPOTrainer(Trainer):
         answers = [item["answer"] for item in batch_data]
         group_size = self.train_config.grpo_config.group_size
 
-        with torch.inference_mode():
+        # 使用no_grad替换inference_mode
+        # 修复问题：Inference tensors cannot be saved for backward. To work around you can make a clone to get a normal
+        with torch.no_grad():
+        # with torch.inference_mode():
             prompt_ids, prompt_mask, completion_ids, completion_mask = self._generate_completions(prompts, group_size)
             input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
             attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)

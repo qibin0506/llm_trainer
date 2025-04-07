@@ -3,8 +3,9 @@
 ```python
 import torch
 from llm_trainer import TrainerTools, train_configs
-from llama import LlamaConfig, RoPEConfig, MoEConfig
+from llm_model import ModelConfig, RoPEConfig, MoEConfig
 import os
+
 
 def init_env():
     #  Of the allocated memory 33.98 GiB is allocated by PyTorch,
@@ -29,62 +30,29 @@ def init_env():
     # os.environ['DTYPE'] = 'float32'
 
 def get_model_config():
-    moe_config = MoEConfig(
-        num_experts_per_tok=2,
-        n_routed_experts=6,
-        n_shared_experts=1,
-        aux_loss_alpha=0.1,
-        seq_aux=True,
-        norm_topk_prob=True
-    )
-
-    attention_implementation = 'sdpa' if hasattr(torch.nn.functional, 'scaled_dot_product_attention') else 'default'
-
-    print(f'attention_implementation={attention_implementation}')
-
-    return LlamaConfig(
+    return ModelConfig(
         vocab_size=TrainerTools().tokenizer.vocab_size,
-        hidden_size=1152,
-        intermediate_size=3072,
-        moe_intermediate_size=512,
+        hidden_size=768,
+        intermediate_size=2048,
+        moe_intermediate_size=1024,
         moe_n_dense_layer=1,
         num_hidden_layers=24,
         num_attention_heads=12,
-        num_key_value_heads=4,
+        num_key_value_heads=2,
         max_position_embeddings=1024,
-        attention_implementation=attention_implementation,
-        rope_config=RoPEConfig(rope_theta=1e6),
-        moe_config=moe_config
+        attention_implementation='auto',
+        rope_config=RoPEConfig(
+            rope_theta=1e6
+        ),
+        moe_config=MoEConfig(
+            num_experts_per_tok=2,
+            n_routed_experts=8,
+            n_shared_experts=1,
+            aux_loss_alpha=0.1,
+            seq_aux=True,
+            norm_topk_prob=True
+        )
     )
-
-
-    # moe_config = MoEConfig(
-    #     num_experts_per_tok=2,
-    #     n_routed_experts=4,
-    #     n_shared_experts=1,
-    #     aux_loss_alpha=0.1,
-    #     seq_aux=True,
-    #     norm_topk_prob=True
-    # )
-    #
-    # attention_implementation = 'sdpa' if hasattr(torch.nn.functional, 'scaled_dot_product_attention') else 'default'
-    #
-    # print(f'attention_implementation={attention_implementation}')
-    #
-    # return LlamaConfig(
-    #     vocab_size=TrainerTools().tokenizer.vocab_size,
-    #     hidden_size=768,
-    #     intermediate_size=2048,
-    #     moe_intermediate_size=1024,
-    #     moe_n_dense_layer=1,
-    #     num_hidden_layers=16,
-    #     num_attention_heads=8,
-    #     num_key_value_heads=2,
-    #     max_position_embeddings=1024,
-    #     attention_implementation=attention_implementation,
-    #     rope_config=RoPEConfig(rope_theta=1e6),
-    #     moe_config=moe_config
-    # )
 
 def _get_train_config(
         n_epochs: int,
@@ -94,7 +62,7 @@ def _get_train_config(
         is_grpo: bool,
         real_batch_size: int,
         all_files: list[str],
-        llama_config: LlamaConfig
+        model_config: ModelConfig
 ):
     desire_batch_size = real_batch_size * 3
     gradient_accumulation_steps = desire_batch_size // real_batch_size
@@ -201,7 +169,7 @@ def _get_train_config(
     train_config = train_configs.TrainConfig(
         n_epochs=n_epochs,
         batch_size=real_batch_size,
-        llama_config=llama_config,
+        model_config=model_config,
         all_files=all_files,
         gradient_accumulation_steps=gradient_accumulation_steps,
         eval_batch_interval=eval_batch_interval,
@@ -225,7 +193,9 @@ def get_pretrain_config():
         './data/deepctrl_long_3.pkl',
         './data/deepctrl_long_4.pkl',
         './data/deepctrl_long_final.pkl',
-        './data/deepctrl_short.pkl',
+        './data/deepctrl_short_0.pkl',
+        './data/deepctrl_short_1.pkl',
+        './data/deepctrl_short_final.pkl',
     ]
 
     return _get_train_config(
@@ -234,9 +204,9 @@ def get_pretrain_config():
         is_sft=False,
         is_dpo=False,
         is_grpo=False,
-        real_batch_size=10,
+        real_batch_size=14,
         all_files=pretrain_data_list,
-        llama_config=get_model_config()
+        model_config=get_model_config()
     )
 
 def get_sft_config():
@@ -246,9 +216,9 @@ def get_sft_config():
         is_sft=True,
         is_dpo=False,
         is_grpo=False,
-        real_batch_size=8,
+        real_batch_size=12,
         all_files=['./data/sft_deepctrl_short.pkl'],
-        llama_config=get_model_config()
+        model_config=get_model_config()
     )
 
 
@@ -259,9 +229,9 @@ def get_dpo_config():
         is_sft=False,
         is_dpo=True,
         is_grpo=False,
-        real_batch_size=8,
+        real_batch_size=6,
         all_files=['./data/dpo.pkl'],
-        llama_config=get_model_config()
+        model_config=get_model_config()
     )
 
 def get_reasoning_config():
@@ -271,9 +241,9 @@ def get_reasoning_config():
         is_dpo=False,
         is_sft=True,
         is_grpo=False,
-        real_batch_size=6,
+        real_batch_size=12,
         all_files=['./data/r1_mix_1024.pkl'],
-        llama_config=get_model_config()
+        model_config=get_model_config()
     )
 
 
@@ -284,9 +254,9 @@ def get_grpo_config():
         is_dpo=False,
         is_sft=False,
         is_grpo=True,
-        real_batch_size=2,
+        real_batch_size=4,
         all_files=['./data/grpo.pkl'],
-        llama_config=get_model_config()
+        model_config=get_model_config()
     )
 
 

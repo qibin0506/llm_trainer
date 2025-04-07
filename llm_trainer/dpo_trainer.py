@@ -5,7 +5,7 @@ from torch.utils.data import Dataset
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from llama import LlamaModel
+from llm_model import LlmModel
 
 from .parallel_ds import DsParallel
 from .parallel_fsdp import FsdpParallel
@@ -39,7 +39,7 @@ class DPOTrainer(Trainer):
     def _init_reference_model(self):
         parallel = TrainerTools().new_parallel()
 
-        reference_model = LlamaModel(self.train_config.llama_config)
+        reference_model = LlmModel(self.train_config.model_config)
         load_checkpoint_for_eval(model=reference_model, device=parallel.device)
 
         reference_model, _ = parallel.process(
@@ -106,7 +106,7 @@ class DPOTrainer(Trainer):
         return parallel_kwargs, data_loader_kwargs, sampler_kwargs
 
     def _create_dataset(self, file_path) -> Dataset:
-        max_position_embeddings = self.train_config.llama_config.max_position_embeddings
+        max_position_embeddings = self.train_config.model_config.max_position_embeddings
         return DPODataset(file_path, max_position_embeddings)
 
     def _calc_loss(self, inputs, attention_mask, logits, labels):

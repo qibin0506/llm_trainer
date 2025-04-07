@@ -1,6 +1,6 @@
 from typing import Optional, Union, Set, Type, Callable, List
 from torch import nn
-from llama import LlamaConfig
+from llm_model import ModelConfig
 
 class DsOffloadConfig:
     def __init__(
@@ -356,8 +356,8 @@ class TrainConfig:
                 训练epochs
             batch_size (`int`):
                 每个batch的大小
-            llama_config (`LlamaConfig`):
-                llama模型的配置
+            model_config (`ModelConfig`):
+                模型的配置
             all_data_size (`int`):
                 所有训练数据大小
             all_files (`list`):
@@ -382,7 +382,7 @@ class TrainConfig:
             n_epochs: int,
             batch_size: int,
             *,
-            llama_config: LlamaConfig,
+            model_config: ModelConfig,
             all_files: Optional[list[any]] = None,
             gradient_accumulation_steps: int = 0,
             eval_batch_interval: int = 100,
@@ -397,7 +397,7 @@ class TrainConfig:
     ):
         self.n_epochs = n_epochs
         self.batch_size = batch_size
-        self.llama_config = llama_config
+        self.model_config = model_config
         self.all_files = all_files
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.eval_batch_interval = eval_batch_interval

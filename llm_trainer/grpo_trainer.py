@@ -7,7 +7,7 @@ from torch.nn.utils.rnn import pad_sequence
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from llama import LlamaModel
+from llm_model import LlmModel
 
 from .parallel_ds import DsParallel
 from .trainer import Trainer
@@ -45,7 +45,7 @@ class GRPOTrainer(Trainer):
         self._use_origin_pad_sequence = True
 
     def _init_reference_model(self):
-        reference_model = LlamaModel(self.train_config.llama_config)
+        reference_model = LlmModel(self.train_config.model_config)
 
         device = 'cpu' # TrainerTools().parallel.device
         reference_model.to(device)
@@ -59,7 +59,7 @@ class GRPOTrainer(Trainer):
 
     def _init_generate_model(self):
         return copy.deepcopy(self.reference_model)
-        # generate_model = LlamaModel(self.train_config.llama_config)
+        # generate_model = LlmModel(self.train_config.model_config)
         #
         # device = 'cpu' #TrainerTools().parallel.device
         # generate_model.to(device)
@@ -199,7 +199,7 @@ class GRPOTrainer(Trainer):
             tokens=prompt_ids,
             pad_token_id=pad_token_id,
             attention_mask=prompt_masks,
-            max_position_embeddings=self.train_config.llama_config.max_position_embeddings,
+            max_position_embeddings=self.train_config.model_config.max_position_embeddings,
             max_new_tokens=self.train_config.grpo_config.gen_max_new_tokens,
             temperature=self.train_config.grpo_config.gen_temperature,
             k=self.train_config.grpo_config.gen_k,

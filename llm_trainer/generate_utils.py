@@ -2,7 +2,7 @@ from typing import Union, Optional
 from contextlib import nullcontext
 import torch
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from llama import KVCache
+from llm_model import KVCache
 from .tools import TrainerTools
 
 

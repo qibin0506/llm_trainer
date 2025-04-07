@@ -13,6 +13,8 @@ def try_load_pkl(file_path: str):
     try:
         with open(file_path, 'rb') as f:
             tokens = pickle.load(f)
+    except Exception as e:
+        raise e
     finally:
         return tokens
 

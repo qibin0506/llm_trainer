@@ -8,7 +8,7 @@ from torch import nn
 import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.utils.data import Dataset
-from llama import LlamaModel
+from llm_model import LlmModel
 
 from .parallel_ds import DsParallel
 from .parallel_fsdp import FsdpParallel
@@ -102,7 +102,7 @@ class Trainer:
             initial_lr: float,
             parallel_kwargs
     ):
-        model = LlamaModel(self.train_config.llama_config)
+        model = LlmModel(self.train_config.model_config)
         if TrainerTools().parallel.is_main_process:
             total_params = sum(p.numel() for p in model.parameters())
             log(f"Total number of parameters: {total_params:,}")
@@ -122,7 +122,7 @@ class Trainer:
 
     def _init_eval_model(self) -> Optional[nn.Module]:
         if TrainerTools().parallel.is_main_process:
-            return LlamaModel(self.train_config.llama_config).to('cpu')
+            return LlmModel(self.train_config.model_config).to('cpu')
 
         return None
 
@@ -275,7 +275,7 @@ class Trainer:
         return parallel_kwargs, data_loader_kwargs, sampler_kwargs
 
     def _create_dataset(self, file_path) -> Dataset:
-        max_position_embeddings = self.train_config.llama_config.max_position_embeddings
+        max_position_embeddings = self.train_config.model_config.max_position_embeddings
         return TextDataset(file_path, max_position_embeddings, max_position_embeddings)
 
     def _calc_loss(self, inputs, attention_mask, logits, labels):
@@ -351,7 +351,7 @@ class Trainer:
                 self.eval_model,
                 tag=f'sign:batch/{tag}',
                 prompt=self._get_eval_prompt(),
-                max_position_embeddings=self.train_config.llama_config.max_position_embeddings
+                max_position_embeddings=self.train_config.model_config.max_position_embeddings
             )
 
     def _on_epoch_end(
@@ -363,7 +363,7 @@ class Trainer:
                 self.eval_model,
                 tag=f'sign:epoch/{tag}',
                 prompt=self._get_eval_prompt(),
-                max_position_embeddings=self.train_config.llama_config.max_position_embeddings
+                max_position_embeddings=self.train_config.model_config.max_position_embeddings
             )
 
     def _on_file_start(

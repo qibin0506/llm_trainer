@@ -26,5 +26,5 @@ class SFTTrainer(Trainer):
         return parallel_kwargs, data_loader_kwargs, sampler_kwargs
 
     def _create_dataset(self, file_path) -> Dataset:
-        max_position_embeddings = self.train_config.llama_config.max_position_embeddings
+        max_position_embeddings = self.train_config.model_config.max_position_embeddings
         return LineByLineTextDataset(file_path, max_position_embeddings)

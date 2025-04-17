@@ -105,9 +105,9 @@ def _generate(
         temperature: Optional[float],
         k: Optional[int],
         p: Optional[float],
-        suppress_tokens: Optional[List[int]] = None,
         pixel_values: Optional[torch.Tensor] = None,
         tokens_per_image: int = -1,
+        suppress_tokens: Optional[List[int]] = None,
         device: Union[str, torch.device, int]
 ):
     """
@@ -207,9 +207,9 @@ def _streaming_generate(
         temperature: Optional[float] = 1.0,
         k: Optional[int] = 50,
         p: Optional[float] = 1.0,
-        suppress_tokens: Optional[List[int]] = None,
         pixel_values: Optional[torch.Tensor] = None,
         tokens_per_image: int = -1,
+        suppress_tokens: Optional[List[int]] = None,
         device: Union[str, torch.device, int] = None,
 ):
     device = TrainerTools().parallel.device if not device else device
@@ -223,9 +223,9 @@ def _streaming_generate(
         temperature=temperature,
         k=k,
         p=p,
-        suppress_tokens=suppress_tokens,
         pixel_values=pixel_values,
         tokens_per_image=tokens_per_image,
+        suppress_tokens=suppress_tokens,
         device=device
     )
 
@@ -242,9 +242,9 @@ def streaming_generate(
         temperature: Optional[float] = 1.0,
         k: Optional[int] = 50,
         p: Optional[float] = 1.0,
-        suppress_tokens: Optional[List[int]] = None,
         pixel_values: Optional[torch.Tensor] = None,
         tokens_per_image: int = -1,
+        suppress_tokens: Optional[List[int]] = None,
         device: Union[str, torch.device, int] = None,
 ):
     text_iterator = _streaming_generate(
@@ -255,9 +255,9 @@ def streaming_generate(
         temperature=temperature,
         k=k,
         p=p,
-        suppress_tokens=suppress_tokens,
         pixel_values=pixel_values,
         tokens_per_image=tokens_per_image,
+        suppress_tokens=suppress_tokens,
         device=device
     )
 
@@ -275,9 +275,9 @@ def generate(
         temperature: Optional[float] = 1.0,
         k: Optional[int] = 50,
         p: Optional[float] = 1.0,
-        suppress_tokens: Optional[List[int]] = None,
         pixel_values: Optional[torch.Tensor] = None,
         tokens_per_image: int = -1,
+        suppress_tokens: Optional[List[int]] = None,
         device: Union[str, torch.device, int] = None,
 ):
     text_iterator = _streaming_generate(
@@ -310,9 +310,9 @@ def batch_generate(
         temperature: Optional[float],
         k: Optional[int],
         p: Optional[float],
-        suppress_tokens: Optional[List[int]] = None,
         pixel_values: Optional[torch.Tensor] = None,
         tokens_per_image: int = -1,
+        suppress_tokens: Optional[List[int]] = None,
         device: Union[str, torch.device, int]
 ):
     use_kv_cache = True

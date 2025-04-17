@@ -1,4 +1,4 @@
-from typing import Tuple, List
+from typing import Optional, Tuple, List
 
 from torch.utils.data import Dataset
 
@@ -13,11 +13,13 @@ class SFTTrainer(Trainer):
             self,
             *,
             train_config: TrainConfig,
-            eval_prompts: List[str]
+            eval_prompts: List[str],
+            eval_image_tags: Optional[List[int]] = None
     ):
         super().__init__(
             train_config=train_config,
-            eval_prompts=eval_prompts
+            eval_prompts=eval_prompts,
+            eval_image_tags=eval_image_tags
         )
 
     def _convert_train_args(self) -> Tuple[dict, dict, dict]:

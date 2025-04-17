@@ -25,17 +25,19 @@ def pretrain_collate_fn(batch_data):
 
 
 def _mask_prompt(labels):
+    tokenizer = TrainerTools().tokenizer
     # 支持多轮会话的mask
     for batch, label in enumerate(labels):
         start_index = -1
         for index, token in enumerate(label):
-            if token == TrainerTools().tokenizer.user:
+            if token == tokenizer.system or token == tokenizer.user:
                 start_index = index
-            elif token == TrainerTools().tokenizer.assistant and start_index != -1:
+            elif token == tokenizer.end and start_index != -1:
                 labels[batch, start_index:index + 1] = -100
                 start_index = -1
 
     return labels
+
 
 def sft_collate_fn(batch_data):
     """

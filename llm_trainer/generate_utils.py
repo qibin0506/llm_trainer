@@ -137,6 +137,9 @@ def _generate(
     if isinstance(model, VlmModel):
         tokens = batch_repeat_image_tok(tokens, tokens_per_image)
 
+    if pixel_values:
+        pixel_values = pixel_values.to(device)
+
     kv_cache: Optional[KVCache] = None
     generate_tokens = tokens.clone()
 
@@ -326,6 +329,9 @@ def batch_generate(
 
     if isinstance(model, VlmModel):
         tokens = batch_repeat_image_tok(tokens, tokens_per_image)
+
+    if pixel_values:
+        pixel_values = pixel_values.to(device)
 
     kv_cache: Optional[KVCache] = None
     generate_tokens = tokens.clone()

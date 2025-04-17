@@ -14,7 +14,7 @@ from .train_configs import TrainConfig
 from .dataset import DPODataset
 from .loss import DPOLoss
 from .tools import TrainerTools
-from .utils import dpo_collate_fn
+from .utils import get_dpo_collate_fn
 
 from .checkpoint import (
     save_checkpoint,
@@ -100,6 +100,7 @@ class DPOTrainer(Trainer):
         return criterion, None
 
     def _convert_train_args(self) -> Tuple[dict, dict, dict]:
+        dpo_collate_fn = get_dpo_collate_fn(self.train_config.mask_prompt)
         parallel_kwargs, data_loader_kwargs, sampler_kwargs = super()._convert_train_args()
         data_loader_kwargs.update({"collate_fn": dpo_collate_fn})
 

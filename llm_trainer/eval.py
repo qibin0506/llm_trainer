@@ -8,7 +8,15 @@ from .checkpoint import load_checkpoint_for_eval
 from .log import get_log_dir
 
 
-def _eval_task(eval_model, tag, prompt, max_position_embeddings, is_new_process):
+def _eval_task(
+        eval_model,
+        tag,
+        prompt,
+        pixel_values,
+        max_position_embeddings,
+        tokens_per_image,
+        is_new_process
+):
     log_dir = get_log_dir()
 
     # 当eval_model不是独立model时可以尝试这个
@@ -38,6 +46,8 @@ def _eval_task(eval_model, tag, prompt, max_position_embeddings, is_new_process)
         temperature=0.7,
         k=None,
         p=0.6,
+        pixel_values=pixel_values,
+        tokens_per_image=tokens_per_image,
         device='cpu'
     )
 
@@ -45,8 +55,23 @@ def _eval_task(eval_model, tag, prompt, max_position_embeddings, is_new_process)
         f.write(f"{tag}, gen->{gen_result}\n")
 
 
-def submit_gen_task(eval_model: torch.nn.Module, tag, prompt, max_position_embeddings):
+def submit_gen_task(
+        eval_model: torch.nn.Module,
+        tag,
+        prompt,
+        pixel_values,
+        max_position_embeddings,
+        tokens_per_image
+):
     # 等待5s，防止deepspeed模式下，找不到checkpoint问题
     time.sleep(5)
-    threading.Thread(target=_eval_task, args=(eval_model, tag, prompt, max_position_embeddings, False)).start()
-    # Process(target=_eval_task, args=(eval_model, tag, prompt, max_position_embeddings, True)).start()
+    args = (
+        eval_model,
+        tag,
+        prompt,
+        pixel_values,
+        max_position_embeddings,
+        tokens_per_image,
+        False
+    )
+    threading.Thread(target=_eval_task, args=args).start()

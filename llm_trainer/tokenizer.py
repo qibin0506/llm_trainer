@@ -33,6 +33,8 @@ class Tokenizer:
 
         self.text_system = '<system>'
 
+        self.text_image = '<image>'
+
         if token_type == TOKEN_TYPE_QWEN:
             self.tokenizer = Qwen2TokenizerFast(
                 vocab_file=f"{os.environ['TOKEN_DIR']}qwen_vocab.json",
@@ -49,6 +51,7 @@ class Tokenizer:
                 AddedToken(self.text_answer_start, lstrip=False, rstrip=False),
                 AddedToken(self.text_answer_end, lstrip=False, rstrip=False),
                 AddedToken(self.text_system, lstrip=False, rstrip=False),
+                AddedToken(self.text_image, lstrip=False, rstrip=False),
             ]
 
             self.tokenizer.add_special_tokens({"additional_special_tokens": additional_special_tokens})
@@ -72,6 +75,7 @@ class Tokenizer:
         self.answer_end = self.tokenizer.convert_tokens_to_ids(self.text_answer_end)
 
         self.system = self.tokenizer.convert_tokens_to_ids(self.text_system)
+        self.image = self.tokenizer.convert_tokens_to_ids(self.text_image)
 
         self.vocab_size = len(self.tokenizer)
 

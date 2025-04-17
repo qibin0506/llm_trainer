@@ -1,5 +1,5 @@
-import os
 import random
+from typing import Tuple, Optional
 import torch
 from torch.nn.utils.rnn import pad_sequence
 import torch.nn.functional as F
@@ -15,7 +15,75 @@ def set_seed(seed=42):
     torch.cuda.manual_seed_all(seed)
 
 
-def pretrain_collate_fn(batch_data):
+def extra_image_tag_and_repeat_image_tok(
+        inputs: list[int],
+        tokens_per_image: int
+) -> Tuple[list[int], Optional[int]]:
+    # tokens_per_image=3 -> <image>{image_tag}...xxxx -> <image><image><image>...xxx
+    image_tok = TrainerTools().tokenizer.image
+    if image_tok not in inputs:
+        return inputs, None
+
+    image_tok_idx = inputs.index(image_tok)
+    image_tag_idx = image_tok_idx + 1
+
+    if image_tag_idx < len(inputs):
+        # remove it
+        image_tag = inputs.pop(image_tag_idx)
+    else:
+        image_tag = None
+
+    # repeat image_tok
+    new_inputs = inputs[:image_tok_idx] + [image_tok] * tokens_per_image + inputs[image_tok_idx + 1:]
+    return new_inputs, image_tag
+
+
+def batch_extra_image_tag_and_repeat_image_tok(
+        tokens: torch.Tensor,
+        tokens_per_image: int
+) -> Tuple[torch.Tensor, list[int]]:
+    new_tokens = []
+    image_tags = []
+
+    tokens_list = tokens.cpu().detach().tolist()
+    for token in tokens_list:
+        new_token, image_tag = extra_image_tag_and_repeat_image_tok(token, tokens_per_image)
+        new_tokens.append(new_token)
+        image_tags.append(image_tag)
+
+    return torch.tensor(new_tokens, dtype=tokens.dtype, device=tokens.device), image_tags
+
+
+def repeat_image_tok(
+        tokens: torch.Tensor,
+        tokens_per_image: int
+) -> torch.Tensor:
+    # tokens_per_image=3 -> <image>...xxxx -> <image><image><image>...xxx
+    image_tok = TrainerTools().tokenizer.image
+    if image_tok not in tokens:
+        return tokens
+
+    image_tok_idx = torch.where(tokens == image_tok)[0].item()
+    repeat_image_toks = torch.tensor([image_tok] * tokens_per_image, dtype=tokens.dtype, device=tokens.device)
+
+    # repeat image_tok
+    new_tokens = torch.concat([tokens[:image_tok_idx], repeat_image_toks, tokens[image_tok_idx + 1:]], dim=-1)
+    return new_tokens
+
+
+def batch_repeat_image_tok(
+        tokens: torch.Tensor,
+        tokens_per_image: int
+) -> torch.Tensor:
+    new_tokens = []
+
+    for token in tokens:
+        new_tokens.append(repeat_image_tok(token, tokens_per_image))
+
+    return torch.stack(new_tokens, dim=0)
+
+
+def _pad_sequence(batch_data):
     # [[x,x,x], [y,y,y]]
     inputs = pad_sequence(batch_data, batch_first=True, padding_value=TrainerTools().tokenizer.pad)
     # crossEntropy默认的ignore_index是-100
@@ -37,71 +105,6 @@ def _mask_prompt(labels):
 
     return labels
 
-def sft_collate_fn(batch_data):
-    """
-     如果是sft，则不计算prompt部分的loss, 例如：
-    logits: [USER]你好[BOT]我好[SEP]
-    labels: [USER]你好[BOT]我好[SEP]
-
-    shift_logits: [USER]你好[BOT]我好
-    shift_labels: 你好[BOT]我好[SEP]
-
-    mask_labels: mask mask mask mask 我好[SEP]
-        * mask=-100和pad一样
-
-
-    多轮对话场景
-    [USER]你好[BOT]我好[SEP][USER]很好[BOT]不好[SEP]
-    mask: mask mask mask mask 我好[SEP] mask mask mask mask 不好[SEP]
-    """
-
-    inputs, labels = pretrain_collate_fn(batch_data)
-    labels = _mask_prompt(labels)
-
-    # 支持单轮会话的mask
-    # inputs, labels = pretrain_collate_fn(batch_data)
-    # batch_size = len(labels)
-    # batch_bot_idx = torch.nonzero(torch.eq(labels, TrainerTools().tokenizer.assistant), as_tuple=True)[1]
-    #
-    # for batch in range(batch_size):
-    #     bot_idx = batch_bot_idx[batch].item() + 1
-    #     labels[batch, :bot_idx] = torch.tensor([-100] * bot_idx)
-
-    return inputs, labels
-
-
-def dpo_collate_fn(batch_data):
-    # batch_data: [{'chosen': chosen, 'rejected': rejected}, {'chosen': chosen, 'rejected': rejected}]
-    chosen_inputs = []
-    chosen_labels = []
-    rejected_inputs = []
-    rejected_labels = []
-
-    max_len = 0
-    for key in ['chosen', 'rejected']:
-        max_len = max(max(len(item[key]) for item in batch_data), max_len)
-
-    for item in batch_data:
-        chosen_sequence = item['chosen']
-        chosen_inputs.append(chosen_sequence + [TrainerTools().tokenizer.pad] * (max_len - len(chosen_sequence)))
-        chosen_labels.append(chosen_sequence + [-100] * (max_len - len(chosen_sequence)))
-
-        rejected_sequence = item['rejected']
-        rejected_inputs.append(rejected_sequence + [TrainerTools().tokenizer.pad] * (max_len - len(rejected_sequence)))
-        rejected_labels.append(rejected_sequence + [-100] * (max_len - len(rejected_sequence)))
-
-    chosen_inputs = torch.tensor(chosen_inputs).long()
-    chosen_labels = _mask_prompt(torch.tensor(chosen_labels).long())
-
-    rejected_inputs = torch.tensor(rejected_inputs).long()
-    rejected_labels = _mask_prompt(torch.tensor(rejected_labels).long())
-
-    return {
-        'chosen_inputs': chosen_inputs,
-        'chosen_labels': chosen_labels,
-        'rejected_inputs': rejected_inputs,
-        'rejected_labels': rejected_labels
-    }
 
 def _zero_pad_sequences(
     sequences: list[torch.Tensor], side: str = "left"
@@ -114,6 +117,87 @@ def _zero_pad_sequences(
         padding = (pad_len, 0) if side == "left" else (0, pad_len)
         padded_sequences.append(F.pad(seq, padding))
     return torch.stack(padded_sequences, dim=0)
+
+
+def pretrain_collate_fn(batch_data):
+    inputs, labels = _pad_sequence(batch_data)
+
+    # inputs, labels
+    return {'inputs': inputs, 'labels': labels}
+
+
+def get_sft_collate_fn(mask_prompt: bool):
+    def sft_collate_fn(batch_data):
+        """
+         如果是sft，则不计算prompt部分的loss, 例如：
+        logits: [USER]你好[BOT]我好[SEP]
+        labels: [USER]你好[BOT]我好[SEP]
+
+        shift_logits: [USER]你好[BOT]我好
+        shift_labels: 你好[BOT]我好[SEP]
+
+        mask_labels: mask mask mask mask 我好[SEP]
+            * mask=-100和pad一样
+
+
+        多轮对话场景
+        [USER]你好[BOT]我好[SEP][USER]很好[BOT]不好[SEP]
+        mask: mask mask mask mask 我好[SEP] mask mask mask mask 不好[SEP]
+        """
+        batch_train_data = []
+        image_tags = []
+        for item in batch_data:
+            batch_train_data.append(item['inputs'])
+            image_tags.append(item['image_tag'])
+
+        inputs, labels = _pad_sequence(batch_train_data)
+        if mask_prompt:
+            labels = _mask_prompt(labels)
+
+        return {'inputs': inputs, 'labels': labels, 'image_tags': image_tags}
+
+    return sft_collate_fn
+
+
+def get_dpo_collate_fn(mask_prompt: bool):
+    def dpo_collate_fn(batch_data):
+        # batch_data: [{'chosen': chosen, 'rejected': rejected}, {'chosen': chosen, 'rejected': rejected}]
+        chosen_inputs = []
+        chosen_labels = []
+        rejected_inputs = []
+        rejected_labels = []
+
+        max_len = 0
+        for key in ['chosen', 'rejected']:
+            max_len = max(max(len(item[key]) for item in batch_data), max_len)
+
+        for item in batch_data:
+            chosen_sequence = item['chosen']
+            chosen_inputs.append(chosen_sequence + [TrainerTools().tokenizer.pad] * (max_len - len(chosen_sequence)))
+            chosen_labels.append(chosen_sequence + [-100] * (max_len - len(chosen_sequence)))
+
+            rejected_sequence = item['rejected']
+            rejected_inputs.append(rejected_sequence + [TrainerTools().tokenizer.pad] * (max_len - len(rejected_sequence)))
+            rejected_labels.append(rejected_sequence + [-100] * (max_len - len(rejected_sequence)))
+
+        chosen_inputs = torch.tensor(chosen_inputs).long()
+        chosen_labels = torch.tensor(chosen_labels).long()
+        if mask_prompt:
+            chosen_labels = _mask_prompt(chosen_labels)
+
+        rejected_inputs = torch.tensor(rejected_inputs).long()
+        rejected_labels = torch.tensor(rejected_labels).long()
+        if mask_prompt:
+            rejected_labels = _mask_prompt(rejected_labels)
+
+        return {
+            'chosen_inputs': chosen_inputs,
+            'chosen_labels': chosen_labels,
+            'rejected_inputs': rejected_inputs,
+            'rejected_labels': rejected_labels
+        }
+
+    return dpo_collate_fn
 
 
 def split_batch(data_per_batch: dict) -> list[dict]:

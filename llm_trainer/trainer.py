@@ -1,14 +1,13 @@
 import time
 from contextlib import nullcontext
 from typing import Optional, Tuple, List
-import random
 
 import torch
 from torch import nn
 import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.utils.data import Dataset
-from llm_model import LlmModel
+from llm_model import LlmModel, VlmModel
 
 from .parallel_ds import DsParallel
 from .parallel_fsdp import FsdpParallel
@@ -18,6 +17,7 @@ from .dataset import TextDataset
 
 from .train_configs import (
     TrainConfig,
+    VLMConfig,
     DsZero2Config,
     DsZero3Config
 )
@@ -51,12 +51,18 @@ class Trainer:
             self,
             *,
             train_config: TrainConfig,
-            eval_prompts: List[str]
+            eval_prompts: List[str],
+            eval_image_tags: Optional[List[int]] = None
     ):
         set_seed()
 
         self.train_config: TrainConfig = train_config
         self.eval_prompts = eval_prompts
+        self.eval_image_tags = eval_image_tags
+        self.eval_idx = -1
+
+        if self.eval_image_tags:
+            assert len(self.eval_prompts) == len(self.eval_image_tags)
 
         parallel_kwargs, data_loader_kwargs, sampler_kwargs = self._convert_train_args()
         self.data_loader_kwargs: dict[str, any] = data_loader_kwargs
@@ -97,12 +103,23 @@ class Trainer:
         if last_lr_steps != -1:
             self.lr_scheduler.update_steps(last_lr_steps)
 
+        if isinstance(train_config.model_config, VLMConfig):
+            self.pixel_values_provider = train_config.pixel_values_provider
+            self.tokens_per_image = train_config.model_config.tokens_per_image
+        else:
+            self.pixel_values_provider = None
+            self.tokens_per_image = -1
+
     def _init_train_model_and_optim(
             self,
             initial_lr: float,
             parallel_kwargs
     ):
-        model = LlmModel(self.train_config.model_config)
+        if isinstance(self.train_config.model_config, VLMConfig):
+            model = VlmModel(self.train_config.model_config)
+        else:
+            model = LlmModel(self.train_config.model_config)
+
         if TrainerTools().parallel.is_main_process:
             total_params = sum(p.numel() for p in model.parameters())
             log(f"Total number of parameters: {total_params:,}")
@@ -122,7 +139,10 @@ class Trainer:
 
     def _init_eval_model(self) -> Optional[nn.Module]:
         if TrainerTools().parallel.is_main_process:
-            return LlmModel(self.train_config.model_config).to('cpu')
+            if isinstance(self.train_config.model_config, VLMConfig):
+                return VlmModel(self.train_config.model_config).to('cpu')
+            else:
+                return LlmModel(self.train_config.model_config).to('cpu')
 
         return None
 
@@ -309,11 +329,18 @@ class Trainer:
 
         TrainerTools().parallel.synchronize()
 
-    def _get_eval_prompt(self) -> str:
+    def _get_eval_data(self) -> Tuple[str, Optional[int]]:
         if len(self.eval_prompts) == 0:
-            return ''
+            return '', None
 
-        return random.choice(self.eval_prompts)
+        self.eval_idx += 1
+        if self.eval_idx == len(self.eval_prompts):
+            self.eval_idx = 0
+
+        if not self.eval_image_tags:
+            return self.eval_prompts[self.eval_idx], None
+
+        return self.eval_prompts[self.eval_idx], self.eval_image_tags[self.eval_idx]
 
     def _log_loss(
             self,
@@ -347,11 +374,19 @@ class Trainer:
             tag: str
     ):
         if TrainerTools().parallel.is_main_process:
+            eval_prompt, eval_image_tag = self._get_eval_data()
+            if eval_image_tag:
+                eval_pixel_values = self.pixel_values_provider(eval_image_tag)
+            else:
+                eval_pixel_values = None
+
             submit_gen_task(
                 self.eval_model,
                 tag=f'sign:batch/{tag}',
-                prompt=self._get_eval_prompt(),
-                max_position_embeddings=self.train_config.model_config.max_position_embeddings
+                prompt=eval_prompt,
+                pixel_values=eval_pixel_values,
+                max_position_embeddings=self.train_config.model_config.max_position_embeddings,
+                tokens_per_image=self.tokens_per_image
             )
 
     def _on_epoch_end(
@@ -359,11 +394,19 @@ class Trainer:
             tag: str
     ):
         if TrainerTools().parallel.is_main_process:
+            eval_prompt, eval_image_tag = self._get_eval_data()
+            if eval_image_tag:
+                eval_pixel_values = self.pixel_values_provider(eval_image_tag)
+            else:
+                eval_pixel_values = None
+
             submit_gen_task(
                 self.eval_model,
                 tag=f'sign:epoch/{tag}',
-                prompt=self._get_eval_prompt(),
-                max_position_embeddings=self.train_config.model_config.max_position_embeddings
+                prompt=eval_prompt,
+                pixel_values=eval_pixel_values,
+                max_position_embeddings=self.train_config.model_config.max_position_embeddings,
+                tokens_per_image=self.tokens_per_image
             )
 
     def _on_file_start(
@@ -401,7 +444,7 @@ class Trainer:
                 TrainerTools().parallel.on_epoch_start(epoch)
                 self._on_file_start(epoch, file_path)
 
-                for batch, (inputs, labels) in enumerate(train_data_loader):
+                for batch, batch_data in enumerate(train_data_loader):
                     global_steps += 1
                     if global_steps < self.last_global_steps:
                         skipping_train = True
@@ -415,6 +458,9 @@ class Trainer:
                     else:
                         need_update_grad = True
 
+                    inputs = batch_data['inputs']
+                    labels = batch_data['labels']
+
                     try:
                         inputs, labels = inputs.to(TrainerTools().parallel.device), labels.to(TrainerTools().parallel.device)
                         attention_mask = inputs != TrainerTools().tokenizer.pad
@@ -422,8 +468,19 @@ class Trainer:
                         if TrainerTools().parallel.parallel_train:
                             self.train_model.require_backward_grad_sync = need_update_grad
 
+                        if self.pixel_values_provider and 'image_tags' in batch_data:
+                            image_tags = batch_data['image_tags']
+                            pixel_values = self.pixel_values_provider(image_tags).to(TrainerTools().parallel.device)
+                        else:
+                            pixel_values = None
+
                         with self.ctx:
-                            result = self.train_model(inputs, attention_mask=attention_mask)
+                            result = self.train_model(
+                                inputs,
+                                attention_mask=attention_mask,
+                                pixel_values=pixel_values
+                            )
+
                             # calc loss
                             loss = self._calc_loss(inputs, attention_mask, result['logits'], labels)
                             if result['aux_loss'] and self.train_config.loss_config.aux_loss_coef:
@@ -479,12 +536,3 @@ class Trainer:
         # 等待checkpoint保存完成
         time.sleep(10)
         TrainerTools().parallel.destroy()
-
-"""
-todo: 
-1. 处理异常重启
-2. Yarn和phi3的Phi3LongRoPEScaledRotaryEmbedding调研
-3. MLA调研
-5. inference使用缓存model，每个进程缓存一个
-6. 多模态
-"""

@@ -54,7 +54,7 @@ class LineByLineTextDataset(Dataset):
     """
     适用于sft阶段
     """
-    def __init__(self, file_path, max_len, tokens_per_image):
+    def __init__(self, file_path, max_len, tokens_per_image=-1):
         super().__init__()
 
         self.max_len = max_len

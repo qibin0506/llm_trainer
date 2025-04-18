@@ -120,6 +120,9 @@ class Trainer:
         else:
             model = LlmModel(self.train_config.model_config)
 
+        if self.train_config.init_state_dict:
+            model.load_state_dict(self.train_config.init_state_dict, strict=False)
+
         if TrainerTools().parallel.is_main_process:
             total_params = sum(p.numel() for p in model.parameters())
             log(f"Total number of parameters: {total_params:,}")

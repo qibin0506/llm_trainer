@@ -1,6 +1,6 @@
 import time
 import copy
-from typing import Tuple, List, Union, Callable
+from typing import Tuple, List, Union, Callable, Optional
 import torch
 from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
@@ -29,11 +29,13 @@ class GRPOTrainer(Trainer):
             *,
             train_config: TrainConfig,
             reward_func: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], List[float]],
-            eval_prompts: List[str]
+            eval_prompts: List[str],
+            eval_image_tags: Optional[List[int]] = None
     ):
         super().__init__(
             train_config=train_config,
-            eval_prompts=eval_prompts
+            eval_prompts=eval_prompts,
+            eval_image_tags=eval_image_tags
         )
 
         self.reward_func = reward_func

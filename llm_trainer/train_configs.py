@@ -1,4 +1,4 @@
-from typing import Optional, Union, Set, Type, Callable, List
+from typing import Optional, Union, Set, Type, Callable, List, Mapping, Any
 
 import torch
 from torch import nn
@@ -399,7 +399,8 @@ class TrainConfig:
             fsdp_config: FsdpConfig = FsdpConfig(),
             data_loader_config: DataLoaderConfig = DataLoaderConfig(),
             kd_config: Optional[KDConfig] = None,
-            pixel_values_provider: Optional[Callable[[list[int]], torch.Tensor]] = None
+            pixel_values_provider: Optional[Callable[[list[int]], torch.Tensor]] = None,
+            init_state_dict: Optional[Mapping[str, Any]] = None,
     ):
         self.n_epochs = n_epochs
         self.batch_size = batch_size
@@ -417,5 +418,6 @@ class TrainConfig:
         self.data_loader_config = data_loader_config
         self.kd_config = kd_config
         self.pixel_values_provider = pixel_values_provider
+        self.init_state_dict = init_state_dict
 
 

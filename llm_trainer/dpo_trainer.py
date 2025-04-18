@@ -1,5 +1,5 @@
 import time
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 import torch
 from torch.utils.data import Dataset
 import torch.distributed as dist
@@ -27,11 +27,13 @@ class DPOTrainer(Trainer):
             self,
             *,
             train_config: TrainConfig,
-            eval_prompts: List[str]
+            eval_prompts: List[str],
+            eval_image_tags: Optional[List[int]] = None
     ):
         super().__init__(
             train_config=train_config,
-            eval_prompts=eval_prompts
+            eval_prompts=eval_prompts,
+            eval_image_tags=eval_image_tags
         )
 
         self.reference_model = self._init_reference_model()
@@ -40,6 +42,8 @@ class DPOTrainer(Trainer):
         parallel = TrainerTools().new_parallel()
 
         reference_model = LlmModel(self.train_config.model_config)
+        if self.train_config.init_state_dict:
+            reference_model.load_state_dict(self.train_config.init_state_dict, strict=False)
         load_checkpoint_for_eval(model=reference_model, device=parallel.device)
 
         reference_model, _ = parallel.process(

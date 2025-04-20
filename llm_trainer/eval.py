@@ -44,7 +44,6 @@ def _eval_task(
         max_position_embeddings=max_position_embeddings,
         max_new_tokens=max_position_embeddings,
         temperature=0.7,
-        k=None,
         p=0.6,
         pixel_values=pixel_values,
         tokens_per_image=tokens_per_image,

@@ -137,7 +137,7 @@ def _generate(
     if isinstance(model, VlmModel):
         tokens = batch_repeat_image_tok(tokens, tokens_per_image)
 
-    if pixel_values:
+    if pixel_values is not None:
         pixel_values = pixel_values.to(device)
 
     kv_cache: Optional[KVCache] = None
@@ -208,7 +208,7 @@ def _streaming_generate(
         max_position_embeddings: int,
         max_new_tokens: int,
         temperature: Optional[float] = 1.0,
-        k: Optional[int] = 50,
+        k: Optional[int] = None,
         p: Optional[float] = 1.0,
         pixel_values: Optional[torch.Tensor] = None,
         tokens_per_image: int = -1,
@@ -276,7 +276,7 @@ def generate(
         max_position_embeddings: int,
         max_new_tokens: int,
         temperature: Optional[float] = 1.0,
-        k: Optional[int] = 50,
+        k: Optional[int] = None,
         p: Optional[float] = 1.0,
         pixel_values: Optional[torch.Tensor] = None,
         tokens_per_image: int = -1,
@@ -330,7 +330,7 @@ def batch_generate(
     if isinstance(model, VlmModel):
         tokens = batch_repeat_image_tok(tokens, tokens_per_image)
 
-    if pixel_values:
+    if pixel_values is not None:
         pixel_values = pixel_values.to(device)
 
     kv_cache: Optional[KVCache] = None

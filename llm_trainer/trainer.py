@@ -379,7 +379,7 @@ class Trainer:
         if TrainerTools().parallel.is_main_process:
             eval_prompt, eval_image_tag = self._get_eval_data()
             if eval_image_tag:
-                eval_pixel_values = self.pixel_values_provider(eval_image_tag)
+                eval_pixel_values = self.pixel_values_provider([eval_image_tag])
             else:
                 eval_pixel_values = None
 
@@ -399,7 +399,7 @@ class Trainer:
         if TrainerTools().parallel.is_main_process:
             eval_prompt, eval_image_tag = self._get_eval_data()
             if eval_image_tag:
-                eval_pixel_values = self.pixel_values_provider(eval_image_tag)
+                eval_pixel_values = self.pixel_values_provider([eval_image_tag])
             else:
                 eval_pixel_values = None
 

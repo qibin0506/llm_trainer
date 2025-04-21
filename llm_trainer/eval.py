@@ -6,6 +6,7 @@ import torch
 from .generate_utils import generate
 from .checkpoint import load_checkpoint_for_eval
 from .log import get_log_dir
+from .tools import TrainerTools
 
 
 def _eval_task(
@@ -15,7 +16,7 @@ def _eval_task(
         pixel_values,
         max_position_embeddings,
         tokens_per_image,
-        is_new_process
+        device
 ):
     log_dir = get_log_dir()
 
@@ -42,12 +43,12 @@ def _eval_task(
         eval_model,
         prompt=prompt,
         max_position_embeddings=max_position_embeddings,
-        max_new_tokens=max_position_embeddings,
+        max_new_tokens=512,
         temperature=0.7,
         p=0.6,
         pixel_values=pixel_values,
         tokens_per_image=tokens_per_image,
-        device='cpu'
+        device=device
     )
 
     with open(f'{log_dir}gen.txt', 'a') as f:
@@ -62,15 +63,18 @@ def submit_gen_task(
         max_position_embeddings,
         tokens_per_image
 ):
-    # 等待5s，防止deepspeed模式下，找不到checkpoint问题
-    time.sleep(5)
-    args = (
-        eval_model,
-        tag,
-        prompt,
-        pixel_values,
-        max_position_embeddings,
-        tokens_per_image,
-        False
+    # 等待1s，防止deepspeed模式下，找不到checkpoint问题
+    time.sleep(1)
+    eval_model.to(TrainerTools().parallel.device)
+    _eval_task(
+        eval_model=eval_model,
+        tag=tag,
+        prompt=prompt,
+        pixel_values=pixel_values,
+        max_position_embeddings=max_position_embeddings,
+        tokens_per_image=tokens_per_image,
+        device=TrainerTools().parallel.device
     )
-    threading.Thread(target=_eval_task, args=args).start()
+    eval_model.to('cpu')
+
+    # threading.Thread(target=_eval_task, args=args).start()

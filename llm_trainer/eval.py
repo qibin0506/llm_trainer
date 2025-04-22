@@ -1,4 +1,3 @@
-import threading
 import time
 
 import torch
@@ -37,7 +36,7 @@ def _eval_task(
 
     # ---------
 
-    load_checkpoint_for_eval(eval_model, device='cpu')
+    load_checkpoint_for_eval(eval_model, device=device)
 
     gen_result = generate(
         eval_model,

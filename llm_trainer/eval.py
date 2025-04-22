@@ -6,9 +6,18 @@ import torch
 from .generate_utils import generate
 from .checkpoint import load_checkpoint_for_eval
 from .log import get_log_dir
+from .tools import TrainerTools
 
 
-def _eval_task(eval_model, tag, prompt, max_position_embeddings, is_new_process):
+def _eval_task(
+        eval_model,
+        tag,
+        prompt,
+        pixel_values,
+        max_position_embeddings,
+        tokens_per_image,
+        device
+):
     log_dir = get_log_dir()
 
     # 当eval_model不是独立model时可以尝试这个
@@ -34,19 +43,38 @@ def _eval_task(eval_model, tag, prompt, max_position_embeddings, is_new_process)
         eval_model,
         prompt=prompt,
         max_position_embeddings=max_position_embeddings,
-        max_new_tokens=max_position_embeddings,
+        max_new_tokens=512,
         temperature=0.7,
-        k=None,
         p=0.6,
-        device='cpu'
+        pixel_values=pixel_values,
+        tokens_per_image=tokens_per_image,
+        device=device
     )
 
     with open(f'{log_dir}gen.txt', 'a') as f:
         f.write(f"{tag}, gen->{gen_result}\n")
 
 
-def submit_gen_task(eval_model: torch.nn.Module, tag, prompt, max_position_embeddings):
-    # 等待5s，防止deepspeed模式下，找不到checkpoint问题
-    time.sleep(5)
-    threading.Thread(target=_eval_task, args=(eval_model, tag, prompt, max_position_embeddings, False)).start()
-    # Process(target=_eval_task, args=(eval_model, tag, prompt, max_position_embeddings, True)).start()
+def submit_gen_task(
+        eval_model: torch.nn.Module,
+        tag,
+        prompt,
+        pixel_values,
+        max_position_embeddings,
+        tokens_per_image
+):
+    # 等待1s，防止deepspeed模式下，找不到checkpoint问题
+    time.sleep(1)
+    eval_model.to(TrainerTools().parallel.device)
+    _eval_task(
+        eval_model=eval_model,
+        tag=tag,
+        prompt=prompt,
+        pixel_values=pixel_values,
+        max_position_embeddings=max_position_embeddings,
+        tokens_per_image=tokens_per_image,
+        device=TrainerTools().parallel.device
+    )
+    eval_model.to('cpu')
+
+    # threading.Thread(target=_eval_task, args=args).start()

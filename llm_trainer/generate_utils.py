@@ -1,12 +1,13 @@
-from typing import Union, Optional
+from typing import Union, Optional, List
 from contextlib import nullcontext
 import torch
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from llm_model import KVCache
+from llm_model import VlmModel, KVCache
 from .tools import TrainerTools
+from .utils import batch_repeat_image_tok
 
 
-def _suppress_warper(logits: torch.Tensor, suppress_tokens: list[int]) -> torch.Tensor:
+def _suppress_warper(logits: torch.Tensor, suppress_tokens: List[int]) -> torch.Tensor:
     """
     抑制特殊token输出
     :param logits:
@@ -104,7 +105,9 @@ def _generate(
         temperature: Optional[float],
         k: Optional[int],
         p: Optional[float],
-        suppress_tokens: Optional[list[int]] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        tokens_per_image: int = -1,
+        suppress_tokens: Optional[List[int]] = None,
         device: Union[str, torch.device, int]
 ):
     """
@@ -131,6 +134,12 @@ def _generate(
         cache_enabled=False if isinstance(model, FSDP) else None
     ) if TrainerTools().use_amp else nullcontext()
 
+    if isinstance(model, VlmModel):
+        tokens = batch_repeat_image_tok(tokens, tokens_per_image)
+
+    if pixel_values is not None:
+        pixel_values = pixel_values.to(device)
+
     kv_cache: Optional[KVCache] = None
     generate_tokens = tokens.clone()
 
@@ -140,7 +149,13 @@ def _generate(
             # 是否需要截取？？
             t = tokens[:, -max_position_embeddings:]
             with ctx:
-                result = model(t, past_key_values=kv_cache, use_cache=use_kv_cache)
+                result = model(
+                    t,
+                    past_key_values=kv_cache,
+                    use_cache=use_kv_cache,
+                    pixel_values=pixel_values
+                )
+
                 # logits (batch, seq_len, vocab_size)
                 logits = result['logits']
                 kv_cache = result['past_key_values']
@@ -193,9 +208,11 @@ def _streaming_generate(
         max_position_embeddings: int,
         max_new_tokens: int,
         temperature: Optional[float] = 1.0,
-        k: Optional[int] = 50,
+        k: Optional[int] = None,
         p: Optional[float] = 1.0,
-        suppress_tokens: Optional[list[int]] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        tokens_per_image: int = -1,
+        suppress_tokens: Optional[List[int]] = None,
         device: Union[str, torch.device, int] = None,
 ):
     device = TrainerTools().parallel.device if not device else device
@@ -209,8 +226,10 @@ def _streaming_generate(
         temperature=temperature,
         k=k,
         p=p,
-        device=device,
-        suppress_tokens=suppress_tokens
+        pixel_values=pixel_values,
+        tokens_per_image=tokens_per_image,
+        suppress_tokens=suppress_tokens,
+        device=device
     )
 
     for (token, is_full_result) in generate_text_iterator:
@@ -226,7 +245,9 @@ def streaming_generate(
         temperature: Optional[float] = 1.0,
         k: Optional[int] = 50,
         p: Optional[float] = 1.0,
-        suppress_tokens: Optional[list[int]] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        tokens_per_image: int = -1,
+        suppress_tokens: Optional[List[int]] = None,
         device: Union[str, torch.device, int] = None,
 ):
     text_iterator = _streaming_generate(
@@ -237,8 +258,10 @@ def streaming_generate(
         temperature=temperature,
         k=k,
         p=p,
-        device=device,
-        suppress_tokens=suppress_tokens
+        pixel_values=pixel_values,
+        tokens_per_image=tokens_per_image,
+        suppress_tokens=suppress_tokens,
+        device=device
     )
 
     for (token, is_full_result) in text_iterator:
@@ -253,9 +276,11 @@ def generate(
         max_position_embeddings: int,
         max_new_tokens: int,
         temperature: Optional[float] = 1.0,
-        k: Optional[int] = 50,
+        k: Optional[int] = None,
         p: Optional[float] = 1.0,
-        suppress_tokens: Optional[list[int]] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        tokens_per_image: int = -1,
+        suppress_tokens: Optional[List[int]] = None,
         device: Union[str, torch.device, int] = None,
 ):
     text_iterator = _streaming_generate(
@@ -266,8 +291,10 @@ def generate(
         temperature=temperature,
         k=k,
         p=p,
-        device=device,
-        suppress_tokens=suppress_tokens
+        suppress_tokens=suppress_tokens,
+        pixel_values=pixel_values,
+        tokens_per_image=tokens_per_image,
+        device=device
     )
 
     for (token, is_full_result) in text_iterator:
@@ -286,7 +313,9 @@ def batch_generate(
         temperature: Optional[float],
         k: Optional[int],
         p: Optional[float],
-        suppress_tokens: Optional[list[int]] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        tokens_per_image: int = -1,
+        suppress_tokens: Optional[List[int]] = None,
         device: Union[str, torch.device, int]
 ):
     use_kv_cache = True
@@ -297,6 +326,12 @@ def batch_generate(
         enabled=True,
         cache_enabled=False if isinstance(model, FSDP) else None
     ) if TrainerTools().use_amp else nullcontext()
+
+    if isinstance(model, VlmModel):
+        tokens = batch_repeat_image_tok(tokens, tokens_per_image)
+
+    if pixel_values is not None:
+        pixel_values = pixel_values.to(device)
 
     kv_cache: Optional[KVCache] = None
     generate_tokens = tokens.clone()
@@ -319,7 +354,8 @@ def batch_generate(
                     t,
                     attention_mask=attention_mask,
                     past_key_values=kv_cache,
-                    use_cache=use_kv_cache
+                    use_cache=use_kv_cache,
+                    pixel_values=pixel_values
                 )
 
                 logits = result['logits']

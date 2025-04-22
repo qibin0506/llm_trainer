@@ -1,6 +1,8 @@
-from typing import Optional, Union, Set, Type, Callable, List
+from typing import Optional, Union, Set, Type, Callable, List, Mapping, Any
+
+import torch
 from torch import nn
-from llm_model import ModelConfig
+from llm_model import ModelConfig, VLMConfig
 
 class DsOffloadConfig:
     def __init__(
@@ -331,7 +333,7 @@ class KDConfig:
         知识蒸馏模式配置项
 
         Args:
-            teacher_logits_provider (`Callable[..., nn.Module]`):
+            teacher_logits_provider (`Callable[[torch.Tensor, torch.Tensor], torch.Tensor]`):
                 知识蒸馏教师模型logits的提供者
             kd_coef (`float`, *optional*, default is 0.4):
                 蒸馏loss的占比，loss = kd_coef * kd_loss + (1 - kd_coef) * lm_loss
@@ -340,7 +342,7 @@ class KDConfig:
     def __init__(
             self,
             *,
-            teacher_logits_provider: Callable[..., nn.Module],
+            teacher_logits_provider: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
             kd_coef: float = 0.4
     ):
         self.teacher_logits_provider = teacher_logits_provider
@@ -358,10 +360,10 @@ class TrainConfig:
                 每个batch的大小
             model_config (`ModelConfig`):
                 模型的配置
-            all_data_size (`int`):
-                所有训练数据大小
             all_files (`list`):
                 所有训练文件
+            mask_prompt (`bool`)
+                指定是否mask prompt部分的token
             gradient_accumulation_steps (`int`, *Optional*, default is 0):
                 梯度累积步数，为0时不使用梯度累积
                 grpo训练时不生效该配置！
@@ -375,6 +377,8 @@ class TrainConfig:
                 data loader配置项
             kd_config: (`KDConfig`, *Optional*, default is None):
                 知识蒸馏配置项，为None时不使用知识蒸馏
+            pixel_values_provider: (`Callable[[list[str]], torch.Tensor]`, *Optional*, default is None):
+                训练vlm时根据image_tag提供pixel_values信息
         """
 
     def __init__(
@@ -382,8 +386,9 @@ class TrainConfig:
             n_epochs: int,
             batch_size: int,
             *,
-            model_config: ModelConfig,
+            model_config: Union[ModelConfig, VLMConfig],
             all_files: Optional[list[any]] = None,
+            mask_prompt: bool = True,
             gradient_accumulation_steps: int = 0,
             eval_batch_interval: int = 100,
             loss_config: LossConfig = LossConfig(),
@@ -393,12 +398,15 @@ class TrainConfig:
             ds_config: DsConfig = DsConfig(),
             fsdp_config: FsdpConfig = FsdpConfig(),
             data_loader_config: DataLoaderConfig = DataLoaderConfig(),
-            kd_config: Optional[KDConfig] = None
+            kd_config: Optional[KDConfig] = None,
+            pixel_values_provider: Optional[Callable[[list[int]], torch.Tensor]] = None,
+            init_state_dict: Optional[Mapping[str, Any]] = None,
     ):
         self.n_epochs = n_epochs
         self.batch_size = batch_size
         self.model_config = model_config
         self.all_files = all_files
+        self.mask_prompt = mask_prompt
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.eval_batch_interval = eval_batch_interval
         self.loss_config = loss_config
@@ -409,5 +417,7 @@ class TrainConfig:
         self.fsdp_config = fsdp_config
         self.data_loader_config = data_loader_config
         self.kd_config = kd_config
+        self.pixel_values_provider = pixel_values_provider
+        self.init_state_dict = init_state_dict
 
 

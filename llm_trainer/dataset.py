@@ -5,10 +5,10 @@ from torch.utils.data import Dataset
 import pickle
 
 from .tools import TrainerTools
-from .utils import split_batch
+from .utils import extra_image_tag_and_repeat_image_tok
 
 
-def try_load_pkl(file_path: str):
+def _try_load_pkl(file_path: str):
     tokens = None
     try:
         with open(file_path, 'rb') as f:
@@ -28,11 +28,11 @@ class TextDataset(Dataset):
 
         self.input_ids = []
 
-        tokens = try_load_pkl(file_path)
+        tokens = _try_load_pkl(file_path)
         if not tokens:
             cache_file = f'{file_path}.cache'
             if os.path.exists(cache_file):
-                tokens = try_load_pkl(cache_file)
+                tokens = _try_load_pkl(cache_file)
             else:
                 with open(file_path, 'r') as f:
                     tokens = TrainerTools().tokenizer.encode_to_token(f.read(), False, covert_tensor=False)
@@ -54,17 +54,18 @@ class LineByLineTextDataset(Dataset):
     """
     适用于sft阶段
     """
-    def __init__(self, file_path, max_len):
+    def __init__(self, file_path, max_len, tokens_per_image=-1):
         super().__init__()
 
         self.max_len = max_len
+        self.tokens_per_image = tokens_per_image
         self.input_ids = []
 
-        tokens = try_load_pkl(file_path)
+        tokens = _try_load_pkl(file_path)
         if not tokens:
             cache_file = f'{file_path}.cache'
             if os.path.exists(cache_file):
-                tokens = try_load_pkl(cache_file)
+                tokens = _try_load_pkl(cache_file)
             else:
                 tokens = []
                 with open(file_path, 'r') as f:
@@ -81,8 +82,14 @@ class LineByLineTextDataset(Dataset):
 
     def __getitem__(self, item):
         inputs = self.input_ids[item]
+        if self.tokens_per_image != -1:
+            inputs, image_tag = extra_image_tag_and_repeat_image_tok(inputs, self.tokens_per_image)
+        else:
+            image_tag = None
+
         inputs = inputs[:self.max_len]
-        return torch.tensor(inputs).long()
+
+        return {'inputs': torch.tensor(inputs).long(), 'image_tag': image_tag}
 
 
 class DPODataset(Dataset):
@@ -92,7 +99,7 @@ class DPODataset(Dataset):
         self.rejected_ids = []
 
         # [{'chosen': xxx, 'rejected': xxx} ...]
-        tokens = try_load_pkl(file_path)
+        tokens = _try_load_pkl(file_path)
         for token in tokens:
             self.chosen_ids.append(token['chosen'])
             self.rejected_ids.append(token['rejected'])
@@ -113,7 +120,7 @@ class GRPORolloutDataset(Dataset):
         self.answers = []
 
         # [{'question': xxx, 'answer': ''}]
-        tokens = try_load_pkl(file_path)
+        tokens = _try_load_pkl(file_path)
         for token in tokens:
             self.questions.append(token['prompt'])
             self.answers.append(token['answer'])

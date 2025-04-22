@@ -35,8 +35,10 @@ def _eval_task(
     #         )
 
     # ---------
-
-    load_checkpoint_for_eval(eval_model, device=device)
+    try:
+        load_checkpoint_for_eval(eval_model, device=device)
+    except:
+        return
 
     gen_result = generate(
         eval_model,

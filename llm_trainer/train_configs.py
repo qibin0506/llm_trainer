@@ -254,12 +254,13 @@ class DataLoaderConfig:
         self.data_loader_drop_last = data_loader_drop_last
 
 
-class LrSchedulerConfig:
+class LrConfig:
     def __init__(
             self,
             *,
             enable_lr_scheduler: bool = False,
             initial_lr: Optional[float] = None,
+            weight_decay: float = 0.1,
             max_lr: Optional[float] = None,
             min_lr: Optional[float] = None,
             period: Optional[int] = None,
@@ -268,6 +269,7 @@ class LrSchedulerConfig:
     ):
         self.enable_lr_scheduler = enable_lr_scheduler
         self.initial_lr = initial_lr
+        self.weight_decay = weight_decay
         self.max_lr = max_lr
         self.min_lr = min_lr
         self.period = period
@@ -369,8 +371,8 @@ class TrainConfig:
                 grpo训练时不生效该配置！
             eval_batch_interval (`int`, default is 100):
                 每隔多少个batch进行模型eval
-            lr_scheduler_config (`LrSchedulerConfig`):
-                lr scheduler配置项
+            lr_config (`LrConfig`):
+                lr配置项
             fsdp_config: (`FsdpConfig`):
                 fsdp训练模式配置项
             data_loader_config: (`DataLoaderConfig`):
@@ -387,14 +389,14 @@ class TrainConfig:
             batch_size: int,
             *,
             model_config: Union[ModelConfig, VLMConfig],
-            all_files: Optional[list[any]] = None,
+            all_files: Optional[list[Any]] = None,
             mask_prompt: bool = True,
             gradient_accumulation_steps: int = 0,
             eval_batch_interval: int = 100,
             loss_config: LossConfig = LossConfig(),
             dpo_config: Optional[DPOConfig] = None,
             grpo_config: Optional[GRPOConfig] = None,
-            lr_scheduler_config: LrSchedulerConfig = LrSchedulerConfig(),
+            lr_config: LrConfig = LrConfig(),
             ds_config: DsConfig = DsConfig(),
             fsdp_config: FsdpConfig = FsdpConfig(),
             data_loader_config: DataLoaderConfig = DataLoaderConfig(),
@@ -412,7 +414,7 @@ class TrainConfig:
         self.loss_config = loss_config
         self.dpo_config = dpo_config
         self.grpo_config = grpo_config
-        self.lr_scheduler_config = lr_scheduler_config
+        self.lr_config = lr_config
         self.ds_config = ds_config
         self.fsdp_config = fsdp_config
         self.data_loader_config = data_loader_config

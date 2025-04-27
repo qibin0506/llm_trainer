@@ -73,7 +73,7 @@ class Trainer:
 
         # 注意：学习率要根据GPU的数量进行倍增：
         # 在训练的过程中，损失梯度决定下降的方向，学习率决定下降的步长。如果有两块gpu，前进的综合步长为：平均学习率*2
-        initial_lr = train_config.lr_scheduler_config.initial_lr
+        initial_lr = train_config.lr_config.initial_lr
 
         self.train_model, self.optimizer = self._init_train_model_and_optim(initial_lr, parallel_kwargs)
         self.lr_scheduler = self._init_lr_scheduler(initial_lr)
@@ -131,7 +131,11 @@ class Trainer:
             total_size_mb = total_size_bytes / (1024 * 1024)
             log(f"Total size of the model: {total_size_mb:.2f} MB")
 
-        origin_optim = torch.optim.AdamW(model.parameters(), lr=initial_lr, weight_decay=0.1)
+        origin_optim = torch.optim.AdamW(
+            model.parameters(),
+            lr=initial_lr,
+            weight_decay=self.train_config.lr_config.weight_decay
+        )
         model, optim = TrainerTools().parallel.process(
             model=model,
             optimizer=origin_optim,
@@ -150,12 +154,12 @@ class Trainer:
         return None
 
     def _init_lr_scheduler(self, initial_lr: float) -> LRScheduler:
-        if self.train_config.lr_scheduler_config.enable_lr_scheduler:
-            min_lr = self.train_config.lr_scheduler_config.min_lr
-            max_lr = self.train_config.lr_scheduler_config.max_lr
-            warmup_iters = self.train_config.lr_scheduler_config.warmup_iters
-            period = self.train_config.lr_scheduler_config.period
-            period_mul = self.train_config.lr_scheduler_config.period_mul
+        if self.train_config.lr_config.enable_lr_scheduler:
+            min_lr = self.train_config.lr_config.min_lr
+            max_lr = self.train_config.lr_config.max_lr
+            warmup_iters = self.train_config.lr_config.warmup_iters
+            period = self.train_config.lr_config.period
+            period_mul = self.train_config.lr_config.period_mul
 
             return WarmupCosineAnnealingLRScheduler(
                 optimizer=self.optimizer,

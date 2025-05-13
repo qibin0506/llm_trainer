@@ -2,9 +2,19 @@
 
 ```python
 import torch
-from llm_trainer import TrainerTools, train_configs
+from llm_trainer import TrainerTools, FileDataset, train_configs
 from llm_model import ModelConfig, RoPEConfig, MoEConfig
 import os
+
+class ListFileDataset(FileDataset):
+    def __init__(self, files):
+        self.files = files
+
+    def __len__(self) -> int:
+        return len(self.files)
+
+    def __getitem__(self, idx) -> str:
+        return self.files[idx]
 
 
 def init_env():
@@ -18,7 +28,7 @@ def init_env():
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
     os.environ['TOKENIZERS_TYPE'] = 'zh_llama'  # or qwen
-    os.environ['TOKEN_DIR'] = './tokens/'
+    os.environ['TOKEN_DIR'] = '../llm_model_tokens/'
 
     os.environ['LOG_DIR'] = './log/'
 
@@ -29,8 +39,63 @@ def init_env():
 
     # os.environ['DTYPE'] = 'float32'
 
+
 def get_model_config():
     return ModelConfig(
+        vocab_size=TrainerTools().tokenizer.vocab_size,
+        hidden_size=768,
+        intermediate_size=2048,
+        moe_intermediate_size=1024,
+        moe_n_dense_layer=1,
+        num_hidden_layers=24,
+        num_attention_heads=12,
+        num_key_value_heads=2,
+        max_position_embeddings=1024,
+        attention_implementation='auto',
+        rope_config=RoPEConfig(
+            rope_theta=1e6
+        ),
+        moe_config=MoEConfig(
+            num_experts_per_tok=2,
+            n_routed_experts=8,
+            n_shared_experts=1,
+            aux_loss_alpha=0.1,
+            seq_aux=True,
+            norm_topk_prob=True
+        )
+    )
+
+
+def get_vision_tower():
+    model: torch.nn.Module = SiglipVisionModel.from_pretrained("google/siglip-base-patch16-224")
+    model.to(device=TrainerTools().parallel.device, dtype=TrainerTools().dtype)
+
+    for param in model.parameters():
+        param.requires_grad = False
+    model.eval()
+
+    def vision_tower(pixel_values: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            outputs = model(pixel_values=pixel_values)
+            # (1, 196, 768)
+            last_hidden_state = outputs.last_hidden_state.to(pixel_values.dtype)
+
+        return last_hidden_state
+
+    return vision_tower
+
+
+def get_vlm_config():
+    assert int(image_size // patch_size) == 14
+    assert int(image_size // patch_size) // int(tokens_per_image**0.5) > 0
+
+    return VLMConfig(
+        image_tok=TrainerTools().tokenizer.image,
+        image_size=image_size,
+        patch_size=patch_size,
+        tokens_per_image=tokens_per_image,
+        vision_hidden_size=768,
+        vision_tower=get_vision_tower(),
         vocab_size=TrainerTools().tokenizer.vocab_size,
         hidden_size=768,
         intermediate_size=2048,
@@ -61,7 +126,7 @@ def _get_train_config(
         is_dpo: bool,
         is_grpo: bool,
         real_batch_size: int,
-        all_files: list[str],
+        file_dataset: FileDataset,
         model_config: ModelConfig
 ):
     desire_batch_size = real_batch_size * 3
@@ -149,7 +214,7 @@ def _get_train_config(
         period_mul = 1
         warmup_iters = 3000
 
-    lr_scheduler_config = train_configs.LrSchedulerConfig(
+    lr_config = train_configs.LrConfig(
         enable_lr_scheduler=True,
         initial_lr=initial_lr,
         max_lr=max_lr,
@@ -170,13 +235,13 @@ def _get_train_config(
         n_epochs=n_epochs,
         batch_size=real_batch_size,
         model_config=model_config,
-        all_files=all_files,
+        file_dataset=file_dataset,
         gradient_accumulation_steps=gradient_accumulation_steps,
         eval_batch_interval=eval_batch_interval,
         loss_config=loss_config,
         dpo_config=dpo_config,
         grpo_config=grpo_config,
-        lr_scheduler_config=lr_scheduler_config,
+        lr_config=lr_config,
         ds_config=ds_config,
         data_loader_config=data_loader_config,
         kd_config=None
@@ -205,9 +270,10 @@ def get_pretrain_config():
         is_dpo=False,
         is_grpo=False,
         real_batch_size=14,
-        all_files=pretrain_data_list,
+        file_dataset=ListFileDataset(pretrain_data_list),
         model_config=get_model_config()
     )
+
 
 def get_sft_config():
     return _get_train_config(
@@ -217,7 +283,7 @@ def get_sft_config():
         is_dpo=False,
         is_grpo=False,
         real_batch_size=12,
-        all_files=['./data/sft_deepctrl_short.pkl'],
+        file_dataset=ListFileDataset(['./data/sft_deepctrl_short.pkl']),
         model_config=get_model_config()
     )
 
@@ -230,9 +296,10 @@ def get_dpo_config():
         is_dpo=True,
         is_grpo=False,
         real_batch_size=6,
-        all_files=['./data/dpo.pkl'],
+        file_dataset=ListFileDataset(['./data/dpo.pkl']),
         model_config=get_model_config()
     )
+
 
 def get_reasoning_config():
     return _get_train_config(
@@ -242,20 +309,20 @@ def get_reasoning_config():
         is_sft=True,
         is_grpo=False,
         real_batch_size=12,
-        all_files=['./data/r1_mix_1024.pkl'],
+        file_dataset=ListFileDataset(['./data/r1_mix_1024.pkl']),
         model_config=get_model_config()
     )
 
 
 def get_grpo_config():
     return _get_train_config(
-        n_epochs=1,
+        n_epochs=2,
         train_reasoning_model=False,
         is_dpo=False,
         is_sft=False,
         is_grpo=True,
         real_batch_size=4,
-        all_files=['./data/grpo.pkl'],
+        file_dataset=ListFileDataset(['./data/grpo.pkl']),
         model_config=get_model_config()
     )
 

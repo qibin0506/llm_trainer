@@ -4,7 +4,7 @@ from setuptools import setup, find_packages
 # 2. pip3 install dist/project_llm_trainer-0.1.tar.gz
 setup(
     name='project_llm_trainer',
-    version='0.2',
+    version='0.2.1',
     description='llm trainer',
     scripts=[
         'scripts/smart_train',

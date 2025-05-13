@@ -436,10 +436,10 @@ class Trainer:
 
         for epoch in range(self.train_config.n_epochs):
             self.train_model.train()
-            file_count = len(self.train_config.all_files)
+            file_count = len(self.train_config.file_dataset)
 
             for file_idx in range(file_count):
-                file_path = self.train_config.all_files[file_idx]
+                file_path = self.train_config.file_dataset[file_idx]
 
                 dataset = self._create_dataset(file_path)
                 train_data_loader = TrainerTools().parallel.process_dataloader(
@@ -533,8 +533,7 @@ class Trainer:
                             self._on_batch_end(tag=f'epoch:{epoch}/batch:{batch}')
                         try:
                             del loss
-                        except UnboundLocalError:
-                            pass
+                        except UnboundLocalError: ...
 
             # end epoch
             if not skipping_train:

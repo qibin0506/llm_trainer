@@ -34,11 +34,9 @@ class DsParallel(Parallel):
         self.model = model
         return model, optim
 
-    def synchronize(self):
-        pass
+    def synchronize(self): ...
 
-    def destroy(self):
-        pass
+    def destroy(self): ...
 
 
 

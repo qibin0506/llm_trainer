@@ -9,25 +9,20 @@ from .log import (
 class LRScheduler(ABC):
     @property
     @abstractmethod
-    def cur_steps(self):
-        pass
+    def cur_steps(self): ...
 
     @property
     @abstractmethod
-    def cur_lr(self):
-        pass
+    def cur_lr(self): ...
 
     @abstractmethod
-    def update_steps(self, steps):
-        pass
+    def update_steps(self, steps): ...
 
     @abstractmethod
-    def step(self):
-        pass
+    def step(self): ...
 
     @abstractmethod
-    def can_clip_grad(self):
-        pass
+    def can_clip_grad(self): ...
 
 
 class WarmupCosineAnnealingLRScheduler(LRScheduler):
@@ -135,11 +130,9 @@ class NoneLRScheduler(LRScheduler):
     def cur_lr(self):
         return self._current_lr
 
-    def update_steps(self, steps):
-        pass
+    def update_steps(self, steps): ...
 
-    def step(self):
-        pass
+    def step(self): ...
 
     def can_clip_grad(self):
         return True

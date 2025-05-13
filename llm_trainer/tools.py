@@ -1,4 +1,5 @@
 import os
+from abc import ABC, abstractmethod
 import torch
 from .tokenizer import Tokenizer
 from .parallel_ds import DsParallel
@@ -54,8 +55,16 @@ class TrainerTools:
         return TrainerTools._instance
 
 
+class FileDataset(ABC):
+    @abstractmethod
+    def __len__(self) -> int: ...
+
+    @abstractmethod
+    def __getitem__(self, idx) -> str: ...
+
+
 def estimate_data_size(
-        all_files: list[str],
+        file_dataset: FileDataset,
         max_position_embeddings: int,
         type: str
 ) -> int:
@@ -63,27 +72,28 @@ def estimate_data_size(
     估计数据集大小
     """
     data_size = 0
+    files_count = len(file_dataset)
 
     if type == 'sft':
         from .dataset import LineByLineTextDataset
-        for file_path in all_files:
-            dataset = LineByLineTextDataset(file_path, max_position_embeddings)
+        for idx in range(files_count):
+            dataset = LineByLineTextDataset(file_dataset[idx], max_position_embeddings)
             data_size += len(dataset)
     elif type == 'dpo':
         from .dataset import DPODataset
-        for file_path in all_files:
-            dataset = DPODataset(file_path, max_position_embeddings)
+        for idx in range(files_count):
+            dataset = DPODataset(file_dataset[idx], max_position_embeddings)
             data_size += len(dataset)
     elif type == 'grpo':
         from .dataset import GRPORolloutDataset
-        for file_path in all_files:
-            dataset = GRPORolloutDataset(file_path)
+        for idx in range(files_count):
+            dataset = GRPORolloutDataset(file_dataset[idx])
             data_size += len(dataset)
     else:
         from .dataset import TextDataset
-        for file_path in all_files:
+        for idx in range(files_count):
             dataset = TextDataset(
-                file_path,
+                file_dataset[idx],
                 max_position_embeddings,
                 max_position_embeddings
             )

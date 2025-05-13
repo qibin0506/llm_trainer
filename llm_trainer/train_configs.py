@@ -3,6 +3,7 @@ from typing import Optional, Union, Set, Type, Callable, List, Mapping, Any
 import torch
 from torch import nn
 from llm_model import ModelConfig, VLMConfig
+from .tools import FileDataset
 
 class DsOffloadConfig:
     def __init__(
@@ -362,8 +363,8 @@ class TrainConfig:
                 每个batch的大小
             model_config (`ModelConfig`):
                 模型的配置
-            all_files (`list`):
-                所有训练文件
+            file_dataset (`FileDataset`):
+                训练文件dataset
             mask_prompt (`bool`)
                 指定是否mask prompt部分的token
             gradient_accumulation_steps (`int`, *Optional*, default is 0):
@@ -389,7 +390,7 @@ class TrainConfig:
             batch_size: int,
             *,
             model_config: Union[ModelConfig, VLMConfig],
-            all_files: Optional[list[Any]] = None,
+            file_dataset: FileDataset,
             mask_prompt: bool = True,
             gradient_accumulation_steps: int = 0,
             eval_batch_interval: int = 100,
@@ -407,7 +408,7 @@ class TrainConfig:
         self.n_epochs = n_epochs
         self.batch_size = batch_size
         self.model_config = model_config
-        self.all_files = all_files
+        self.file_dataset = file_dataset
         self.mask_prompt = mask_prompt
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.eval_batch_interval = eval_batch_interval

@@ -114,8 +114,7 @@ class DPOTrainer(Trainer):
         max_position_embeddings = self.train_config.model_config.max_position_embeddings
         return DPODataset(file_path, max_position_embeddings)
 
-    def _calc_loss(self, inputs, attention_mask, logits, labels):
-        pass
+    def _calc_loss(self, inputs, attention_mask, logits, labels): ...
 
     def _log_probs_from_logits(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         # https://github.com/OpenRLHF/OpenRLHF/pull/718#issuecomment-2641081881
@@ -180,10 +179,10 @@ class DPOTrainer(Trainer):
 
         for epoch in range(self.train_config.n_epochs):
             self.train_model.train()
-            file_count = len(self.train_config.all_files)
+            file_count = len(self.train_config.file_dataset)
 
             for file_idx in range(file_count):
-                file_path = self.train_config.all_files[file_idx]
+                file_path = self.train_config.file_dataset[file_idx]
 
                 dataset = self._create_dataset(file_path)
                 train_data_loader = TrainerTools().parallel.process_dataloader(

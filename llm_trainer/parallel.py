@@ -65,8 +65,7 @@ class Parallel(ABC):
             model: nn.Module,
             optimizer: torch.optim.Optimizer,
             kwargs: Optional[dict] = None
-    ) -> Tuple[nn.Module, torch.optim.Optimizer]:
-        pass
+    ) -> Tuple[nn.Module, torch.optim.Optimizer]: ...
 
     def process_dataloader(
             self,
@@ -99,8 +98,7 @@ class Parallel(ABC):
         if self._sampler:
             self._sampler.set_epoch(epoch)
 
-    def on_epoch_end(self, epoch):
-        pass
+    def on_epoch_end(self, epoch): ...
 
     def synchronize(self):
         if self._use_parallel:
@@ -144,6 +142,5 @@ class Parallel(ABC):
         try:
             log(f'wait at {self.device}')
             dist.barrier()
-        except:
-            pass
+        except: ...
         log(f'continue at {self.device}')

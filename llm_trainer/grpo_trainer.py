@@ -90,8 +90,7 @@ class GRPOTrainer(Trainer):
     def _create_dataset(self, file_path) -> Dataset:
         return GRPORolloutDataset(file_path)
 
-    def _calc_loss(self, inputs, attention_mask, logits, labels):
-        pass
+    def _calc_loss(self, inputs, attention_mask, logits, labels): ...
 
     def _left_pad_sequence(
             self,
@@ -296,12 +295,11 @@ class GRPOTrainer(Trainer):
 
         for epoch in range(self.train_config.n_epochs):
             load_checkpoint_for_eval(model=self.reference_model, device=device)
-
             self.train_model.train()
-            file_count = len(self.train_config.all_files)
+            file_count = len(self.train_config.file_dataset)
 
             for file_idx in range(file_count):
-                file_path = self.train_config.all_files[file_idx]
+                file_path = self.train_config.file_dataset[file_idx]
                 dataset = self._create_dataset(file_path)
 
                 train_data_loader = TrainerTools().parallel.process_dataloader(
@@ -376,8 +374,7 @@ class GRPOTrainer(Trainer):
                             self._on_batch_end(tag=f'epoch:{epoch}/batch:{batch}')
                         try:
                             del loss
-                        except UnboundLocalError:
-                            pass
+                        except UnboundLocalError: ...
 
             # end epoch
             if not skipping_train:

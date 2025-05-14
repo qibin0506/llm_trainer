@@ -3,8 +3,10 @@ from typing import Optional
 from glob import glob
 import shutil
 from torch import nn
-from deepspeed import DeepSpeedEngine
-from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
+try:
+    from deepspeed import DeepSpeedEngine
+    from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
+except: ...
 
 """
 函数	功能	是否加载模型到内存	是否保存到文件 主要用途

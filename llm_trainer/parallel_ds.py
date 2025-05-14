@@ -1,8 +1,11 @@
 from typing import Optional, Tuple
 import torch
 from torch import nn
-import deepspeed
 from .parallel import Parallel
+
+try:
+    import deepspeed
+except: ...
 
 class DsParallel(Parallel):
     def __init__(self):

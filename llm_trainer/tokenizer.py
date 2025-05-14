@@ -2,8 +2,8 @@ import os
 from typing import List
 from transformers import Qwen2TokenizerFast
 from transformers import AddedToken
-from transformers import LlamaTokenizer
-import torch, json
+from transformers import LlamaTokenizer, LlamaTokenizerFast
+import torch
 
 TOKEN_TYPE_QWEN = 'qwen'
 TOKEN_TYPE_ZH_LLAMA = "zh_llama"
@@ -56,7 +56,7 @@ class Tokenizer:
 
             self.tokenizer.add_special_tokens({"additional_special_tokens": additional_special_tokens})
         else:
-            self.tokenizer = LlamaTokenizer.from_pretrained(os.environ['TOKEN_DIR'])
+            self.tokenizer = LlamaTokenizerFast.from_pretrained(os.environ['TOKEN_DIR'])
             # self.tokenizer = AutoTokenizer.from_pretrained(os.environ['TOKEN_DIR'])
             # self.tokenizer = PreTrainedTokenizerFast.from_pretrained(os.environ['TOKEN_DIR'], trust_remote_code=True)
 

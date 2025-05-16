@@ -1,5 +1,6 @@
 import os
-from typing import List
+import warnings
+from typing import List, Dict, Union
 from transformers import Qwen2TokenizerFast
 from transformers import AddedToken
 from transformers import LlamaTokenizer, LlamaTokenizerFast
@@ -79,7 +80,12 @@ class Tokenizer:
 
         self.vocab_size = len(self.tokenizer)
 
-    def encode_to_token(self, text: str, unsqueeze=True, covert_tensor=True):
+    def encode(
+            self,
+            text: str,
+            unsqueeze: bool = False,
+            covert_tensor: bool = False
+    ) -> Union[torch.Tensor, List[int]]:
         # [x,x,x]
         encoded = self.tokenizer.encode(text, add_special_tokens=False)
 
@@ -98,9 +104,55 @@ class Tokenizer:
 
             return encoded
 
-    def decode_to_text(self, token: torch.Tensor, skip_special_tokens: bool = False) -> str:
-        return self.tokenizer.decode(token.squeeze(0), skip_special_tokens=skip_special_tokens)
+    def decode(
+            self,
+            token: Union[torch.Tensor, List[int]],
+            skip_special_tokens: bool = False
+    ) -> str:
+        return self.tokenizer.decode(token, skip_special_tokens=skip_special_tokens)
 
-
-    def batch_decode(self, tokens: torch.Tensor, skip_special_tokens: bool = False) -> List[str]:
+    def batch_decode(
+            self,
+            tokens: Union[torch.Tensor, List[int], List[List[int]]],
+            skip_special_tokens: bool = False
+    ) -> List[str]:
         return self.tokenizer.batch_decode(tokens, skip_special_tokens=skip_special_tokens)
+
+    def encode_to_token(self, text: str, unsqueeze=True, covert_tensor=True):
+        warnings.warn('encode_to_token is deprecated. Please use `encode` instead.')
+        return self.encode(text, unsqueeze, covert_tensor)
+
+    def decode_to_text(self, token: torch.Tensor, skip_special_tokens: bool = False) -> str:
+        warnings.warn('decode_to_text is deprecated. Please use `decode` instead.')
+        return self.decode(token.squeeze(0), skip_special_tokens)
+
+    def apply_chat_template(
+            self,
+            conversations: List[Dict[str, str]],
+            tokenizer: bool = True,
+            unsqueeze=False,
+            covert_tensor=False
+    ):
+        """
+            [
+                {"role":"system", "content":"system prompt"},
+                {"role":"user", "content":"hello?"},
+                {"role":"assistant", "content":"hello"},
+                {"role":"user", "content":"hello hello?"},
+                {"role":"assistant", "content":"hello hello"},
+            ]
+            <system>{system_prompt}</s><user>hello?</s><assistant>hello</s><user>hello hello?</s><assistant>hello hello</s>
+        """
+
+        chat_template = ''
+        support_roles = {'system': self.text_system, 'user': self.text_user, 'assistant': self.text_assistant}
+        for conversation in conversations:
+            content = conversation['content']
+            if conversation['role'] in support_roles:
+                chat_template = f"{chat_template}{support_roles[conversation['role']]}{content}{self.text_end}"
+
+        if tokenizer:
+            return self.encode(chat_template, unsqueeze, covert_tensor)
+
+        return chat_template
+

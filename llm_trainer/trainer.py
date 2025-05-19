@@ -1,6 +1,6 @@
 import time
 from contextlib import nullcontext
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict, Any
 
 import torch
 from torch import nn
@@ -64,9 +64,9 @@ class Trainer:
         if self.eval_image_tags:
             assert len(self.eval_prompts) == len(self.eval_image_tags)
 
-        parallel_kwargs, data_loader_kwargs, sampler_kwargs = self._convert_train_args()
-        self.data_loader_kwargs: dict[str, any] = data_loader_kwargs
-        self.sampler_kwargs: dict[str, any] = sampler_kwargs
+        parallel_kwargs, data_loader_kwargs, sampler_kwargs, use_ds_optim = self._convert_train_args()
+        self.data_loader_kwargs: dict[str, Any] = data_loader_kwargs
+        self.sampler_kwargs: dict[str, Any] = sampler_kwargs
 
         # initialize a GradScaler. If enabled=False scaler is a no-op
         self.scalar = torch.GradScaler(enabled=TrainerTools().use_amp)
@@ -75,7 +75,7 @@ class Trainer:
         # 在训练的过程中，损失梯度决定下降的方向，学习率决定下降的步长。如果有两块gpu，前进的综合步长为：平均学习率*2
         initial_lr = train_config.lr_config.initial_lr
 
-        self.train_model, self.optimizer = self._init_train_model_and_optim(initial_lr, parallel_kwargs)
+        self.train_model, self.optimizer = self._init_train_model_and_optim(initial_lr, parallel_kwargs, use_ds_optim)
         self.lr_scheduler = self._init_lr_scheduler(initial_lr)
         self.eval_model: Optional[nn.Module] = self._init_eval_model()
 
@@ -113,7 +113,8 @@ class Trainer:
     def _init_train_model_and_optim(
             self,
             initial_lr: float,
-            parallel_kwargs
+            parallel_kwargs: dict,
+            use_ds_optim: bool
     ):
         if isinstance(self.train_config.model_config, VLMConfig):
             model = VlmModel(self.train_config.model_config)
@@ -131,11 +132,19 @@ class Trainer:
             total_size_mb = total_size_bytes / (1024 * 1024)
             log(f"Total size of the model: {total_size_mb:.2f} MB")
 
-        origin_optim = torch.optim.AdamW(
-            model.parameters(),
-            lr=initial_lr,
-            weight_decay=self.train_config.lr_config.weight_decay
-        )
+        if use_ds_optim:
+            import deepspeed
+            origin_optim = deepspeed.ops.adam.DeepSpeedCPUAdam(
+                model.parameters(),
+                lr=initial_lr,
+                weight_decay=self.train_config.lr_config.weight_decay
+            )
+        else:
+            origin_optim = torch.optim.AdamW(
+                model.parameters(),
+                lr=initial_lr,
+                weight_decay=self.train_config.lr_config.weight_decay
+            )
         model, optim = TrainerTools().parallel.process(
             model=model,
             optimizer=origin_optim,
@@ -143,6 +152,10 @@ class Trainer:
         )
 
         return model, optim
+
+    def __use_ds_optim(self, parallel_kwargs):
+        return parallel_kwargs
+
 
     def _init_eval_model(self) -> Optional[nn.Module]:
         if TrainerTools().parallel.is_main_process:
@@ -191,7 +204,9 @@ class Trainer:
 
         return criterion, kd_loss
 
-    def _convert_train_args(self) -> Tuple[dict, dict, dict]:
+    def _convert_train_args(self) -> Tuple[dict, dict, dict, bool]:
+        parallel_kwargs: Optional[Dict[str, Any]] = None
+        use_ds_optim: bool = False
         if isinstance(TrainerTools().parallel, DsParallel) and self.train_config.ds_config:
             parallel_kwargs = {
                 'gradient_accumulation_steps': 1,
@@ -201,7 +216,7 @@ class Trainer:
 
             if self.train_config.ds_config.zero_config:
                 zero_config = self.train_config.ds_config.zero_config
-                zero_optimization = {'stage': zero_config.stage}
+                zero_optimization: Dict[str, Any] = {'stage': zero_config.stage}
 
                 if zero_config.allgather_partitions is not None:
                     zero_optimization['allgather_partitions'] = zero_config.allgather_partitions
@@ -218,9 +233,16 @@ class Trainer:
 
                 if isinstance(zero_config, DsZero2Config) or isinstance(zero_config, DsZero3Config):
                     if zero_config.offload_optimizer is not None:
-                        zero_optimization['offload_optimizer'] = zero_config.offload_optimizer
+                        zero_optimization['offload_optimizer'] = {
+                            "device": zero_config.offload_optimizer.device,
+                            "pin_memory": zero_config.offload_optimizer.pin_memory
+                        }
+                        use_ds_optim = True
                     if zero_config.offload_param is not None:
-                        zero_optimization['offload_param'] = zero_config.offload_param
+                        zero_optimization['offload_param'] = {
+                            "device": zero_config.offload_param.device,
+                            "pin_memory": zero_config.offload_param.pin_memory
+                        }
 
                 if isinstance(zero_config, DsZero3Config):
                     if zero_config.sub_group_size is not None:
@@ -263,7 +285,7 @@ class Trainer:
 
             if self.train_config.ds_config.activation_checkpointing:
                 activation_checkpointing_config = self.train_config.ds_config.activation_checkpointing
-                activation_checkpointing = {
+                activation_checkpointing: Dict[str, Any] = {
                     'partition_activations': activation_checkpointing_config.partition_activations,
                     'cpu_checkpointing': activation_checkpointing_config.cpu_checkpointing,
                     'contiguous_memory_optimization': activation_checkpointing_config.contiguous_memory_optimization,
@@ -282,8 +304,6 @@ class Trainer:
                 'cpu_offload': self.train_config.fsdp_config.cpu_offload,
                 'offload_params': self.train_config.fsdp_config.offload_params
             }
-        else:
-            parallel_kwargs = None
 
         dataloader_args = self.train_config.data_loader_config
         data_loader_kwargs = {
@@ -299,7 +319,7 @@ class Trainer:
             "drop_last": dataloader_args.data_loader_drop_last,
         }
 
-        return parallel_kwargs, data_loader_kwargs, sampler_kwargs
+        return parallel_kwargs, data_loader_kwargs, sampler_kwargs, use_ds_optim
 
     def _create_dataset(self, file_path) -> Dataset:
         max_position_embeddings = self.train_config.model_config.max_position_embeddings

@@ -81,11 +81,11 @@ class GRPOTrainer(Trainer):
 
         return criterion, None
 
-    def _convert_train_args(self) -> Tuple[dict, dict, dict]:
-        parallel_kwargs, data_loader_kwargs, sampler_kwargs = super()._convert_train_args()
+    def _convert_train_args(self) -> Tuple[dict, dict, dict, bool]:
+        parallel_kwargs, data_loader_kwargs, sampler_kwargs, use_ds_optim = super()._convert_train_args()
         data_loader_kwargs.update({"collate_fn": lambda x: x})
 
-        return parallel_kwargs, data_loader_kwargs, sampler_kwargs
+        return parallel_kwargs, data_loader_kwargs, sampler_kwargs, use_ds_optim
 
     def _create_dataset(self, file_path) -> Dataset:
         return GRPORolloutDataset(file_path)

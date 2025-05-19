@@ -103,12 +103,12 @@ class DPOTrainer(Trainer):
 
         return criterion, None
 
-    def _convert_train_args(self) -> Tuple[dict, dict, dict]:
+    def _convert_train_args(self) -> Tuple[dict, dict, dict, bool]:
         dpo_collate_fn = get_dpo_collate_fn(self.train_config.mask_prompt)
-        parallel_kwargs, data_loader_kwargs, sampler_kwargs = super()._convert_train_args()
+        parallel_kwargs, data_loader_kwargs, sampler_kwargs, use_ds_optim = super()._convert_train_args()
         data_loader_kwargs.update({"collate_fn": dpo_collate_fn})
 
-        return parallel_kwargs, data_loader_kwargs, sampler_kwargs
+        return parallel_kwargs, data_loader_kwargs, sampler_kwargs, use_ds_optim
 
     def _create_dataset(self, file_path) -> Dataset:
         max_position_embeddings = self.train_config.model_config.max_position_embeddings

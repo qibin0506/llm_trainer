@@ -10,7 +10,7 @@ class DsOffloadConfig:
             self,
             *,
             device: str = 'cpu',
-            pin_memory: bool = False
+            pin_memory: bool = True
     ):
         self.device = device
         self.pin_memory = pin_memory

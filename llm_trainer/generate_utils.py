@@ -216,7 +216,7 @@ def _streaming_generate(
         device: Union[str, torch.device, int] = None,
 ):
     device = TrainerTools().parallel.device if not device else device
-    encoded_tokens = TrainerTools().tokenizer.encode_to_token(prompt).to(device)
+    encoded_tokens = TrainerTools().tokenizer.encode(prompt, unsqueeze=True, covert_tensor=True).to(device)
 
     generate_text_iterator = _generate(
         model=model,
@@ -266,7 +266,7 @@ def streaming_generate(
 
     for (token, is_full_result) in text_iterator:
         if not is_full_result:
-            yield TrainerTools().tokenizer.decode_to_text(token)
+            yield TrainerTools().tokenizer.decode(token.squeeze(0))
 
 
 def generate(
@@ -299,7 +299,7 @@ def generate(
 
     for (token, is_full_result) in text_iterator:
         if is_full_result:
-            return TrainerTools().tokenizer.decode_to_text(token)
+            return TrainerTools().tokenizer.decode(token.squeeze(0))
 
 
 def batch_generate(

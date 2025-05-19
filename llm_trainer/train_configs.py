@@ -20,12 +20,12 @@ class DsActivationCheckpointingConfig:
     def __init__(
             self,
             *,
-            partition_activations: bool = False,
-            cpu_checkpointing: bool = False,
-            contiguous_memory_optimization: bool = False,
+            partition_activations: bool = True,
+            cpu_checkpointing: bool = True,
+            contiguous_memory_optimization: bool = True,
             number_checkpoints: Optional[int] = None,
-            synchronize_checkpoint_boundary: bool = False,
-            profile: bool = False
+            synchronize_checkpoint_boundary: bool = True,
+            profile: bool = True
     ):
         self.partition_activations =partition_activations
         self.cpu_checkpointing = cpu_checkpointing
@@ -174,7 +174,7 @@ class DsBf16Config:
     def __init__(
             self,
             *,
-            enabled: bool = False
+            enabled: bool = True
     ):
         self.enabled = enabled
 

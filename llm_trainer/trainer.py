@@ -238,7 +238,14 @@ class Trainer:
 
                 parallel_kwargs['zero_optimization'] = zero_optimization
 
-            if self.train_config.ds_config.fp16_config:
+            if (self.train_config.ds_config.bf16_config is not None
+                    and self.train_config.ds_config.bf16_config.enabled):
+                bf16_config = self.train_config.ds_config.bf16_config
+                bf16 = {
+                    'enabled': bf16_config.enabled
+                }
+                parallel_kwargs['bf16'] = bf16
+            elif self.train_config.ds_config.fp16_config:
                 fb16_config = self.train_config.ds_config.fp16_config
                 fp16 = {
                     'enabled': fb16_config.enabled,
@@ -253,13 +260,6 @@ class Trainer:
                     fp16['fp16_opt_level'] = fb16_config.fp16_opt_level
 
                 parallel_kwargs['fp16'] = fp16
-
-            if self.train_config.ds_config.bf16_config:
-                bf16_config = self.train_config.ds_config.bf16_config
-                bf16 = {
-                    'enabled': bf16_config.enabled
-                }
-                parallel_kwargs['bf16'] = bf16
 
             if self.train_config.ds_config.activation_checkpointing:
                 activation_checkpointing_config = self.train_config.ds_config.activation_checkpointing

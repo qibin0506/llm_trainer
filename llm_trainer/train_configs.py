@@ -87,8 +87,8 @@ class DsZero2Config(DsZeROConfig):
             reduce_scatter: Optional[bool] = True,
             reduce_bucket_size: Optional[Union[str, int]] = 5e8,
             contiguous_gradients: Optional[bool] = True,
-            offload_optimizer: Optional[DsOffloadConfig] = DsOffloadConfig(),
-            offload_param: Optional[DsOffloadConfig] = DsOffloadConfig(),
+            offload_optimizer: Optional[DsOffloadConfig] = None,
+            offload_param: Optional[DsOffloadConfig] = None,
 
     ):
         super().__init__(

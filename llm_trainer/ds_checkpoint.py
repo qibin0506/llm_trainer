@@ -24,8 +24,11 @@ def save_ds_checkpoint(
     if suffix:
         ckpt_dir = f"{ckpt_dir}_{suffix}"
 
-    # 包括model、optimizer等状态
-    model.save_checkpoint(save_dir=ckpt_dir)
+    try:
+        # 包括model、optimizer等状态
+        model.save_checkpoint(save_dir=ckpt_dir)
+    except:
+        return
 
     # 删除历史checkpoint
     ckpt_paths = glob(os.path.join(ckpt_dir, "global_*"))

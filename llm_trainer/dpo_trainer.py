@@ -281,8 +281,7 @@ class DPOTrainer(Trainer):
 
                         try:
                             del loss
-                        except UnboundLocalError:
-                            pass
+                        except UnboundLocalError: ...
 
             # end epoch
             if not skipping_train:

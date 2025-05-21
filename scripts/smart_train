@@ -5,14 +5,14 @@ if __name__ == '__main__':
     arguments = sys.argv[1:]
     run_file_name = arguments[0]
 
-    gpu_count = torch.cuda.device_count()
-    if gpu_count <= 1:
-        parallel_type = 'none'
-    else:
-        try:
-            import deepspeed
-            parallel_type = 'ds'
-        except:
+    try:
+        import deepspeed
+        parallel_type = 'ds'
+    except:
+        gpu_count = torch.cuda.device_count()
+        if gpu_count <= 1:
+            parallel_type = 'none'
+        else:
             parallel_type = 'ddp'
 
     os.environ['PARALLEL_TYPE'] = parallel_type

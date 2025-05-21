@@ -37,8 +37,7 @@ class TextDataset(Dataset):
                 tokens = []
                 with open(file_path, 'r') as f:
                     for line in f:
-                        tokens.append(TrainerTools().tokenizer.encode_to_token(line, False, covert_tensor=False))
-                    # tokens = TrainerTools().tokenizer.encode_to_token(f.read(), False, covert_tensor=False)
+                        tokens.extend(TrainerTools().tokenizer.encode(line))
 
                 with open(cache_file, 'wb') as f:
                     pickle.dump(tokens, f)
@@ -73,7 +72,7 @@ class LineByLineTextDataset(Dataset):
                 tokens = []
                 with open(file_path, 'r') as f:
                     for line in f:
-                        tokens.append(TrainerTools().tokenizer.encode_to_token(line, False, covert_tensor=False))
+                        tokens.append(TrainerTools().tokenizer.encode(line))
 
                 with open(cache_file, 'wb') as f:
                     pickle.dump(tokens, f)

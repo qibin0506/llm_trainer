@@ -153,10 +153,6 @@ class Trainer:
 
         return model, optim
 
-    def __use_ds_optim(self, parallel_kwargs):
-        return parallel_kwargs
-
-
     def _init_eval_model(self) -> Optional[nn.Module]:
         if TrainerTools().parallel.is_main_process:
             if isinstance(self.train_config.model_config, VLMConfig):

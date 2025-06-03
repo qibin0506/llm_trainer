@@ -33,6 +33,7 @@ def _can_use_dcp(model: nn.Module) -> bool:
 
     return False
 
+
 def save_checkpoint(
         model: nn.Module,
         optimizer: Optional[Optimizer] = None,
@@ -138,6 +139,7 @@ def load_checkpoint_for_eval(
             os.remove(pth_name)
     else:
         load_checkpoint(model, None, device, suffix=suffix)
+
 
 def save_steps(global_steps: int, lr_scheduler: Optional[LRScheduler] = None):
     # 暂时只保存主进程的

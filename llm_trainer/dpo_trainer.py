@@ -273,11 +273,13 @@ class DPOTrainer(Trainer):
                     except Exception as e:
                         self._on_exception(e, epoch, batch)
                     finally:
-                        if need_update_grad and (batch - last_ckpt_batch) >= self.train_config.eval_batch_interval:
-                            save_checkpoint(model=self.train_model, optimizer=self.optimizer)
+                        if need_update_grad:
                             save_steps(global_steps=global_steps, lr_scheduler=self.lr_scheduler)
-                            last_ckpt_batch = batch
-                            self._on_batch_end(tag=f'epoch:{epoch}/batch:{batch}')
+
+                            if (batch - last_ckpt_batch) >= self.train_config.eval_batch_interval:
+                                save_checkpoint(model=self.train_model, optimizer=self.optimizer)
+                                last_ckpt_batch = batch
+                                self._on_batch_end(tag=f'epoch:{epoch}/batch:{batch}')
 
                         try:
                             del loss

@@ -367,11 +367,13 @@ class GRPOTrainer(Trainer):
                     except Exception as e:
                         self._on_exception(e, epoch, batch)
                     finally:
+                        save_steps(global_steps=global_steps, lr_scheduler=self.lr_scheduler)
+
                         if (batch - last_ckpt_batch) >= self.train_config.eval_batch_interval:
                             save_checkpoint(model=self.train_model, optimizer=self.optimizer)
-                            save_steps(global_steps=global_steps, lr_scheduler=self.lr_scheduler)
                             last_ckpt_batch = batch
                             self._on_batch_end(tag=f'epoch:{epoch}/batch:{batch}')
+
                         try:
                             del loss
                         except UnboundLocalError: ...

@@ -405,6 +405,7 @@ class Trainer:
 
             submit_gen_task(
                 self.eval_model,
+                self.train_config.eval_config,
                 tag=f'sign:batch/{tag}',
                 prompt=eval_prompt,
                 pixel_values=eval_pixel_values,
@@ -426,6 +427,7 @@ class Trainer:
 
             submit_gen_task(
                 self.eval_model,
+                self.train_config.eval_config,
                 tag=f'sign:epoch/{tag}',
                 prompt=eval_prompt,
                 pixel_values=eval_pixel_values,

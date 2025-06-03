@@ -129,8 +129,8 @@ class Tokenizer:
     def apply_chat_template(
             self,
             conversations: List[Dict[str, str]],
-            add_answer_tag: bool = True,
             tokenizer: bool = True,
+            add_answer_tag_for_assistant: bool = True,
             unsqueeze=False,
             covert_tensor=False
     ):
@@ -148,15 +148,16 @@ class Tokenizer:
         chat_template = ''
         support_roles = {'system': self.text_system, 'user': self.text_user, 'assistant': self.text_assistant}
         for conversation in conversations:
-            if conversation['role'] in support_roles:
+            role = conversation['role']
+            if role in support_roles:
                 content = conversation['content']
-                if add_answer_tag:
+                if add_answer_tag_for_assistant and role == 'assistant':
                     content = f"{self.text_answer_start}{content}{self.text_answer_end}"
 
                 if 'reasoning' in conversation:
                     content = f"{self.text_reasoning_start}{conversation['reasoning']}{self.text_reasoning_end}{content}"
 
-                chat_template = f"{chat_template}{support_roles[conversation['role']]}{content}{self.text_end}"
+                chat_template = f"{chat_template}{support_roles[role]}{content}{self.text_end}"
 
         if tokenizer:
             return self.encode(chat_template, unsqueeze, covert_tensor)

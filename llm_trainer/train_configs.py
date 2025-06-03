@@ -5,6 +5,7 @@ from torch import nn
 from llm_model import ModelConfig, VLMConfig
 from .tools import FileDataset
 
+
 class DsOffloadConfig:
     def __init__(
             self,
@@ -77,6 +78,7 @@ class DsZero1Config(DsZeROConfig):
             contiguous_gradients=contiguous_gradients
         )
 
+
 class DsZero2Config(DsZeROConfig):
     def __init__(
             self,
@@ -144,6 +146,7 @@ class DsZero3Config(DsZeROConfig):
 
         self.offload_optimizer = offload_optimizer
         self.offload_param = offload_param
+
 
 class DsFp16Config:
     """
@@ -352,6 +355,20 @@ class KDConfig:
         self.kd_coef = kd_coef
 
 
+class EvalConfig:
+    def __init__(
+            self,
+            max_new_tokens: int = 512,
+            temperature: float = 1.0,
+            top_p: float = 0.95,
+            top_k: Optional[float] = None
+    ):
+        self.max_new_tokens = max_new_tokens
+        self.temperature = temperature
+        self.top_p = top_p
+        self.top_k = top_k
+
+
 class TrainConfig:
     """
         训练参数配置项
@@ -404,6 +421,7 @@ class TrainConfig:
             kd_config: Optional[KDConfig] = None,
             pixel_values_provider: Optional[Callable[[list[int]], torch.Tensor]] = None,
             init_state_dict: Optional[Mapping[str, Any]] = None,
+            eval_config: EvalConfig = EvalConfig()
     ):
         self.n_epochs = n_epochs
         self.batch_size = batch_size
@@ -422,5 +440,6 @@ class TrainConfig:
         self.kd_config = kd_config
         self.pixel_values_provider = pixel_values_provider
         self.init_state_dict = init_state_dict
+        self.eval_config = eval_config
 
 

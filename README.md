@@ -1,5 +1,11 @@
 # llm_trainer
 
+## install
+``` python
+pip3 install project_llm_trainer
+```
+
+## usage
 ```python
 import torch
 from llm_trainer import TrainerTools, FileDataset, train_configs

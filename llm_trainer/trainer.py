@@ -123,6 +123,7 @@ class Trainer:
 
         if self.train_config.init_state_dict:
             model.load_state_dict(self.train_config.init_state_dict, strict=False)
+            self.train_config.init_state_dict = None
 
         if TrainerTools().parallel.is_main_process:
             total_params = sum(p.numel() for p in model.parameters())

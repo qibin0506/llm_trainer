@@ -44,7 +44,9 @@ class DPOTrainer(Trainer):
         reference_model = LlmModel(self.train_config.model_config)
         if self.train_config.init_state_dict:
             reference_model.load_state_dict(self.train_config.init_state_dict, strict=False)
-        load_checkpoint_for_eval(model=reference_model, device=parallel.device)
+            self.train_config.init_state_dict = None
+        else:
+            load_checkpoint_for_eval(model=reference_model, device=parallel.device)
 
         reference_model, _ = parallel.process(
             model=reference_model,

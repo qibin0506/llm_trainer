@@ -46,6 +46,9 @@ class GRPOTrainer(Trainer):
         # 如果pad_sequence不支持padding_side参数，则将改参数置为False，使用反转的方式
         self._use_origin_pad_sequence = True
 
+        # 保存一下train model的checkpoint，方便下面reference_model使用
+        save_checkpoint(self.train_model, self.optimizer)
+
     def _init_reference_model(self):
         reference_model = LlmModel(self.train_config.model_config)
 

@@ -144,7 +144,7 @@ def load_checkpoint_for_eval(
 def save_steps(global_steps: int, lr_scheduler: Optional[LRScheduler] = None):
     # 暂时只保存主进程的
     if TrainerTools().parallel.is_main_process:
-        steps_checkpoint_name = f"{os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)}.steps"
+        steps_checkpoint_name = f"{os.environ.get('LOG_DIR', './')}steps.pt"
         ckpt = {'global_steps': global_steps, 'lr_steps': lr_scheduler.cur_steps}
         torch.save(ckpt, steps_checkpoint_name)
 
@@ -153,7 +153,7 @@ def load_steps(
         default_global_steps: int = 0,
         default_lr_steps: int = 0
 ) -> Tuple[Optional[int], Optional[int]]:
-    steps_checkpoint_name = f"{os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)}.steps"
+    steps_checkpoint_name = f"{os.environ.get('LOG_DIR', './')}steps.pt"
     if os.path.exists(steps_checkpoint_name):
         ckpt = torch.load(steps_checkpoint_name, weights_only=True)
         return ckpt['global_steps'], ckpt['lr_steps']

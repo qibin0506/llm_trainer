@@ -28,7 +28,7 @@ class DPOTrainer(Trainer):
             *,
             train_config: TrainConfig,
             eval_prompts: List[str],
-            eval_image_tags: Optional[List[int]] = None
+            eval_image_tags: Optional[List[str]] = None
     ):
         super().__init__(
             train_config=train_config,
@@ -112,9 +112,10 @@ class DPOTrainer(Trainer):
 
         return parallel_kwargs, data_loader_kwargs, sampler_kwargs, use_ds_optim
 
-    def _create_dataset(self, file_path) -> Dataset:
+    def _create_dataset(self, file_idx) -> Tuple[Dataset, str]:
+        file_path = self.train_config.file_dataset[file_idx]
         max_position_embeddings = self.train_config.model_config.max_position_embeddings
-        return DPODataset(file_path, max_position_embeddings)
+        return DPODataset(file_path, max_position_embeddings), file_path
 
     def _calc_loss(self, inputs, attention_mask, logits, labels): ...
 
@@ -184,9 +185,7 @@ class DPOTrainer(Trainer):
             file_count = len(self.train_config.file_dataset)
 
             for file_idx in range(file_count):
-                file_path = self.train_config.file_dataset[file_idx]
-
-                dataset = self._create_dataset(file_path)
+                dataset, file_path = self._create_dataset(file_idx)
                 train_data_loader = TrainerTools().parallel.process_dataloader(
                     dataset=dataset,
                     data_loader_kwargs=self.data_loader_kwargs,

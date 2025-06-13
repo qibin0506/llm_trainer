@@ -408,6 +408,7 @@ class TrainConfig:
             *,
             model_config: Union[ModelConfig, VLMConfig],
             file_dataset: FileDataset,
+            image_tags_file_dataset: Optional[FileDataset] = None,
             mask_prompt: bool = True,
             gradient_accumulation_steps: int = 0,
             eval_batch_interval: int = 100,
@@ -419,7 +420,7 @@ class TrainConfig:
             fsdp_config: FsdpConfig = FsdpConfig(),
             data_loader_config: DataLoaderConfig = DataLoaderConfig(),
             kd_config: Optional[KDConfig] = None,
-            pixel_values_provider: Optional[Callable[[list[int]], torch.Tensor]] = None,
+            pixel_values_provider: Optional[Callable[[list[str]], torch.Tensor]] = None,
             init_state_dict: Optional[Mapping[str, Any]] = None,
             eval_config: EvalConfig = EvalConfig()
     ):
@@ -427,6 +428,7 @@ class TrainConfig:
         self.batch_size = batch_size
         self.model_config = model_config
         self.file_dataset = file_dataset
+        self.image_tags_file_dataset = image_tags_file_dataset
         self.mask_prompt = mask_prompt
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.eval_batch_interval = eval_batch_interval

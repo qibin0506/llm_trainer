@@ -15,45 +15,6 @@ def set_seed(seed=42):
     torch.cuda.manual_seed_all(seed)
 
 
-def extra_image_tag_and_repeat_image_tok(
-        inputs: list[int],
-        tokens_per_image: int
-) -> Tuple[list[int], Optional[int]]:
-    # tokens_per_image=3 -> <image>{image_tag}...xxxx -> <image><image><image>...xxx
-    image_tok = TrainerTools().tokenizer.image
-    if image_tok not in inputs:
-        return inputs, None
-
-    image_tok_idx = inputs.index(image_tok)
-    image_tag_idx = image_tok_idx + 1
-
-    if image_tag_idx < len(inputs):
-        # remove it
-        image_tag = inputs.pop(image_tag_idx)
-    else:
-        image_tag = None
-
-    # repeat image_tok
-    new_inputs = inputs[:image_tok_idx] + [image_tok] * tokens_per_image + inputs[image_tok_idx + 1:]
-    return new_inputs, image_tag
-
-
-def batch_extra_image_tag_and_repeat_image_tok(
-        tokens: torch.Tensor,
-        tokens_per_image: int
-) -> Tuple[torch.Tensor, list[int]]:
-    new_tokens = []
-    image_tags = []
-
-    tokens_list = tokens.cpu().detach().tolist()
-    for token in tokens_list:
-        new_token, image_tag = extra_image_tag_and_repeat_image_tok(token, tokens_per_image)
-        new_tokens.append(new_token)
-        image_tags.append(image_tag)
-
-    return torch.tensor(new_tokens, dtype=tokens.dtype, device=tokens.device), image_tags
-
-
 def repeat_image_tok(
         tokens: torch.Tensor,
         tokens_per_image: int

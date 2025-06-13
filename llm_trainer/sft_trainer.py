@@ -14,7 +14,7 @@ class SFTTrainer(Trainer):
             *,
             train_config: TrainConfig,
             eval_prompts: List[str],
-            eval_image_tags: Optional[List[int]] = None
+            eval_image_tags: Optional[List[str]] = None
     ):
         super().__init__(
             train_config=train_config,
@@ -29,11 +29,14 @@ class SFTTrainer(Trainer):
 
         return parallel_kwargs, data_loader_kwargs, sampler_kwargs, use_ds_optim
 
-    def _create_dataset(self, file_path) -> Dataset:
+    def _create_dataset(self, file_idx) -> Tuple[Dataset, str]:
+        file_path = self.train_config.file_dataset[file_idx]
         max_position_embeddings = self.train_config.model_config.max_position_embeddings
         if isinstance(self.train_config.model_config, VLMConfig):
+            image_tag_file_path = self.train_config.image_tags_file_dataset[file_idx]
             tokens_per_image = self.train_config.model_config.tokens_per_image
         else:
+            image_tag_file_path = None
             tokens_per_image = -1
 
-        return LineByLineTextDataset(file_path, max_position_embeddings, tokens_per_image)
+        return LineByLineTextDataset(file_path, max_position_embeddings, image_tag_file_path, tokens_per_image), file_path

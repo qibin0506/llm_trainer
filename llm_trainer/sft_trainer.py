@@ -32,11 +32,15 @@ class SFTTrainer(Trainer):
     def _create_dataset(self, file_idx) -> Tuple[Dataset, str]:
         file_path = self.train_config.file_dataset[file_idx]
         max_position_embeddings = self.train_config.model_config.max_position_embeddings
+
+        image_tag_file_path = None
+        tokens_per_image = -1
+
         if isinstance(self.train_config.model_config, VLMConfig):
-            image_tag_file_path = self.train_config.image_tags_file_dataset[file_idx]
-            tokens_per_image = self.train_config.model_config.tokens_per_image
-        else:
-            image_tag_file_path = None
-            tokens_per_image = -1
+            if self.train_config.image_tags_file_dataset:
+                image_tag_file_path = self.train_config.image_tags_file_dataset[file_idx]
+
+            if self.train_config.model_config.tokens_per_image:
+                tokens_per_image = self.train_config.model_config.tokens_per_image
 
         return LineByLineTextDataset(file_path, max_position_embeddings, image_tag_file_path, tokens_per_image), file_path

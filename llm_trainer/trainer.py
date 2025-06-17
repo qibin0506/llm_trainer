@@ -1,6 +1,6 @@
 import time
 from contextlib import nullcontext
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Optional, Tuple, List, Dict, Any, Union
 
 import torch
 from torch import nn
@@ -110,16 +110,19 @@ class Trainer:
             self.pixel_values_provider = None
             self.tokens_per_image = -1
 
+    def _new_model(self, train_config: TrainConfig):
+        if isinstance(train_config.model_config, VLMConfig):
+            return VlmModel(train_config.model_config)
+        else:
+            return LlmModel(train_config.model_config)
+
     def _init_train_model_and_optim(
             self,
             initial_lr: float,
             parallel_kwargs: dict,
             use_ds_optim: bool
     ):
-        if isinstance(self.train_config.model_config, VLMConfig):
-            model = VlmModel(self.train_config.model_config)
-        else:
-            model = LlmModel(self.train_config.model_config)
+        model = self._new_model(self.train_config)
 
         if self.train_config.init_state_dict:
             model.load_state_dict(self.train_config.init_state_dict, strict=False)
@@ -156,10 +159,7 @@ class Trainer:
 
     def _init_eval_model(self) -> Optional[nn.Module]:
         if TrainerTools().parallel.is_main_process:
-            if isinstance(self.train_config.model_config, VLMConfig):
-                return VlmModel(self.train_config.model_config).to('cpu')
-            else:
-                return LlmModel(self.train_config.model_config).to('cpu')
+            return self._new_model(self.train_config).to('cpu')
 
         return None
 
@@ -400,7 +400,7 @@ class Trainer:
     ):
         if TrainerTools().parallel.is_main_process:
             eval_prompt, eval_image_tag = self._get_eval_data()
-            if isinstance(self.train_config.model_config, VLMConfig) and eval_image_tag:
+            if isinstance(self.train_model, VlmModel) and self.pixel_values_provider and eval_image_tag:
                 eval_pixel_values = self.pixel_values_provider([eval_image_tag])
             else:
                 eval_pixel_values = None
@@ -422,7 +422,7 @@ class Trainer:
     ):
         if TrainerTools().parallel.is_main_process:
             eval_prompt, eval_image_tag = self._get_eval_data()
-            if isinstance(self.train_config.model_config, VLMConfig) and eval_image_tag:
+            if isinstance(self.train_model, VlmModel) and self.pixel_values_provider and eval_image_tag:
                 eval_pixel_values = self.pixel_values_provider([eval_image_tag])
             else:
                 eval_pixel_values = None

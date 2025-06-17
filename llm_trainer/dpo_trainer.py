@@ -5,8 +5,6 @@ from torch.utils.data import Dataset
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from llm_model import LlmModel
-
 from .parallel_ds import DsParallel
 from .parallel_fsdp import FsdpParallel
 from .trainer import Trainer
@@ -41,7 +39,7 @@ class DPOTrainer(Trainer):
     def _init_reference_model(self):
         parallel = TrainerTools().new_parallel()
 
-        reference_model = LlmModel(self.train_config.model_config)
+        reference_model = self._new_model(self.train_config)
         if self.train_config.init_state_dict:
             reference_model.load_state_dict(self.train_config.init_state_dict, strict=False)
             self.train_config.init_state_dict = None

@@ -7,8 +7,6 @@ from torch.nn.utils.rnn import pad_sequence
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from llm_model import LlmModel
-
 from .parallel_ds import DsParallel
 from .trainer import Trainer
 from .train_configs import TrainConfig
@@ -50,7 +48,7 @@ class GRPOTrainer(Trainer):
         save_checkpoint(self.train_model, self.optimizer)
 
     def _init_reference_model(self):
-        reference_model = LlmModel(self.train_config.model_config)
+        reference_model = self._new_model(self.train_config)
 
         device = 'cpu' # TrainerTools().parallel.device
         reference_model.to(device)
@@ -64,7 +62,7 @@ class GRPOTrainer(Trainer):
 
     def _init_generate_model(self):
         return copy.deepcopy(self.reference_model)
-        # generate_model = LlmModel(self.train_config.model_config)
+        # generate_model = self._new_model(self.train_config)
         #
         # device = 'cpu' #TrainerTools().parallel.device
         # generate_model.to(device)

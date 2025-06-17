@@ -69,19 +69,29 @@ class DPOTrainer(Trainer):
                 zero_optimization = {'stage': 0}
                 parallel_kwargs['zero_optimization'] = zero_optimization
 
-            if self.train_config.ds_config.fp16_config:
+
+            if (self.train_config.ds_config.bf16_config is not None
+                    and self.train_config.ds_config.bf16_config.enabled):
+                bf16_config = self.train_config.ds_config.bf16_config
+                bf16 = {
+                    'enabled': bf16_config.enabled
+                }
+                parallel_kwargs['bf16'] = bf16
+            elif self.train_config.ds_config.fp16_config:
                 fb16_config = self.train_config.ds_config.fp16_config
-                fp16 = { 'enabled': fb16_config.enabled }
+                fp16 = {
+                    'enabled': fb16_config.enabled,
+                    'loss_scale': fb16_config.loss_scale,
+                    'loss_scale_window': fb16_config.loss_scale_window,
+                    'initial_scale_power': fb16_config.initial_scale_power,
+                    'hysteresis': fb16_config.hysteresis,
+                    'min_loss_scale': fb16_config.min_loss_scale
+                }
 
                 if fb16_config.fp16_opt_level is not None:
                     fp16['fp16_opt_level'] = fb16_config.fp16_opt_level
 
                 parallel_kwargs['fp16'] = fp16
-
-            if self.train_config.ds_config.bf16_config:
-                bf16_config = self.train_config.ds_config.bf16_config
-                bf16 = { 'enabled': bf16_config.enabled }
-                parallel_kwargs['bf16'] = bf16
         elif isinstance(TrainerTools().parallel, FsdpParallel) and self.train_config.fsdp_config:
             parallel_kwargs = {
                 'transformer_layer_cls': self.train_config.fsdp_config.transformer_layer_cls,

@@ -424,6 +424,7 @@ class Trainer:
                 eval_pixel_values = None
 
             submit_gen_task(
+                self.train_model,
                 self.eval_model,
                 self.train_config.eval_config,
                 tag=f'sign:batch/{tag}',
@@ -446,6 +447,7 @@ class Trainer:
                 eval_pixel_values = None
 
             submit_gen_task(
+                self.train_model,
                 self.eval_model,
                 self.train_config.eval_config,
                 tag=f'sign:epoch/{tag}',

@@ -3,6 +3,7 @@ from typing import Optional, Union, Tuple
 import torch
 from torch import nn
 from torch.optim import Optimizer
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from .parallel_ds import DsParallel
 from .parallel_fsdp import FsdpParallel
@@ -44,39 +45,22 @@ def save_checkpoint(
         save_ds_checkpoint(model, suffix)
     elif _can_use_dcp(model):
         save_dcp(model, optimizer, suffix)
+    elif isinstance(model, FSDP):
+        from .fsdp_checkpoint import save_fsdp_checkpoint
+        save_fsdp_checkpoint(model, optimizer, suffix)
     else:
-        if isinstance(model, FSDP):
-            # 未经过测试 参考：https://doc.hfai.high-flyer.cn/haiscale/haiscale_fsdp.html
-            # 是否使用rank0_only=True？
-            with FSDP.summon_full_params(
-                    module=model,
-                    rank0_only=True,
-                    writeback=False,
-                    offload_to_cpu=True
-            ):
-                if TrainerTools().parallel.is_main_process:
-                    checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)
-                    if suffix:
-                        checkpoint_name = f"{checkpoint_name}_{suffix}"
+        if TrainerTools().parallel.is_main_process:
+            checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)
+            if suffix:
+                checkpoint_name = f"{checkpoint_name}_{suffix}"
 
-                    ckpt = {'model_state_dict': model.state_dict()}
+            raw_model = model if not isinstance(model, DDP) else model.module
+            ckpt = {'model_state_dict': raw_model.state_dict()}
 
-                    if optimizer:
-                        ckpt.update({'optim_state_dict': optimizer.state_dict()})
+            if optimizer:
+                ckpt.update({'optim_state_dict': optimizer.state_dict()})
 
-                    torch.save(ckpt, checkpoint_name)
-        else:
-            if TrainerTools().parallel.is_main_process:
-                checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)
-                if suffix:
-                    checkpoint_name = f"{checkpoint_name}_{suffix}"
-
-                ckpt = {'model_state_dict': TrainerTools().parallel.raw_model.state_dict()}
-
-                if optimizer:
-                    ckpt.update({'optim_state_dict': optimizer.state_dict()})
-
-                torch.save(ckpt, checkpoint_name)
+            torch.save(ckpt, checkpoint_name)
 
 
 def load_checkpoint(
@@ -91,26 +75,20 @@ def load_checkpoint(
         load_ds_checkpoint(model, load_module_only=load_module_only, suffix=suffix)
     elif _can_use_dcp(model):
         load_dcp(model, optimizer, suffix)
+    elif isinstance(model, FSDP):
+        from .fsdp_checkpoint import load_fsdp_checkpoint
+        load_fsdp_checkpoint(model, optimizer, device, suffix)
     else:
         checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)
         if suffix:
             checkpoint_name = f"{checkpoint_name}_{suffix}"
 
-        if os.path.exists(checkpoint_name):
-            # 未经过测试，else的逻辑经过测试在fsdp下也没问题
-            if isinstance(model, FSDP):
-                with FSDP.summon_full_params(module=model):
-                    state_dict = torch.load(checkpoint_name, weights_only=True, map_location=device)
-                    model.load_state_dict(state_dict['model_state_dict'])
+        state_dict = torch.load(checkpoint_name, weights_only=True, map_location=device)
+        raw_model = model.module if isinstance(model, DDP) else model
+        raw_model.load_state_dict(state_dict['model_state_dict'])
 
-                    if optimizer:
-                        optimizer.load_state_dict(state_dict['optim_state_dict'])
-            else:
-                state_dict = torch.load(checkpoint_name, weights_only=True, map_location=device)
-                model.load_state_dict(state_dict['model_state_dict'])
-
-                if optimizer:
-                    optimizer.load_state_dict(state_dict['optim_state_dict'])
+        if optimizer:
+            optimizer.load_state_dict(state_dict['optim_state_dict'])
 
 
 def load_checkpoint_for_eval(
@@ -139,6 +117,25 @@ def load_checkpoint_for_eval(
             os.remove(pth_name)
     else:
         load_checkpoint(model, None, device, suffix=suffix)
+
+
+def copy_model_params(
+        _from: nn.Module,
+        _to: nn.Module
+):
+    if isinstance(TrainerTools().parallel, DsParallel):
+        from .ds_checkpoint import get_ds_model_params
+        state_dict = get_ds_model_params(_from)
+    elif isinstance(TrainerTools().parallel, FsdpParallel):
+        from .fsdp_checkpoint import get_fsdp_model_params
+        state_dict = get_fsdp_model_params(_from)
+    elif isinstance(_from, DDP):
+        state_dict = _from.module.state_dict()
+    else:
+        state_dict = _from.state_dict()
+
+    if state_dict:
+        _to.load_state_dict(state_dict)
 
 
 def save_steps(global_steps: int, lr_scheduler: Optional[LRScheduler] = None):

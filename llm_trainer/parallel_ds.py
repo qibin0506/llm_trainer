@@ -16,16 +16,20 @@ class DsParallel(Parallel):
             self,
             model: nn.Module,
             optimizer: torch.optim.Optimizer,
-            kwargs: Optional[dict] = None
+            kwargs: Optional[dict] = None,
+            save_instance: bool = True
     ) -> Tuple[nn.Module, torch.optim.Optimizer]:
         """
-        :param model:
-        :param optimizer:
-        :param kwargs:
-            参考deepspeed配置
-        :return:
+            :param model:
+            :param optimizer:
+            :param kwargs:
+                参考deepspeed配置
+            :param save_instance
+            :return:
         """
-        self.raw_model = model
+
+        if save_instance:
+            self.raw_model = model
 
         model, optim, _, _ = deepspeed.initialize(
             model=model,
@@ -34,7 +38,9 @@ class DsParallel(Parallel):
             config_params=kwargs
         )
 
-        self.model = model
+        if save_instance:
+            self.model = model
+
         return model, optim
 
     def synchronize(self): ...

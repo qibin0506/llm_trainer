@@ -21,7 +21,8 @@ class DdpParallel(Parallel):
             self,
             model: nn.Module,
             optimizer: torch.optim.Optimizer,
-            kwargs: Optional[dict] = None
+            kwargs: Optional[dict] = None,
+            save_instance: bool = True
     ) -> Tuple[nn.Module, torch.optim.Optimizer]:
         model.to(self.device)
 
@@ -30,10 +31,14 @@ class DdpParallel(Parallel):
 
         if self._use_parallel:
             # self.model = DDP(module=model, broadcast_buffers=False, find_unused_parameters=True)
-            self.model = DDP(module=model, device_ids=[self._local_rank], output_device=self._local_rank)
-            self.raw_model = self.model.module
+            model = DDP(module=model, device_ids=[self._local_rank], output_device=self._local_rank)
+            raw_model = model.module
         else:
-            self.model = model
-            self.raw_model = model
+            model = model
+            raw_model = model
 
-        return self.model, optimizer
+        if save_instance:
+            self.model = model
+            self.raw_model = raw_model
+
+        return model, optimizer

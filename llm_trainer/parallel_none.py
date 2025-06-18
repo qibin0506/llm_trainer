@@ -12,17 +12,19 @@ class NoneParallel(Parallel):
             self,
             model: nn.Module,
             optimizer: torch.optim.Optimizer,
-            kwargs: Optional[dict] = None
+            kwargs: Optional[dict] = None,
+            save_instance: bool = True
     ) -> Tuple[nn.Module, torch.optim.Optimizer]:
         model.to(self.device)
 
         if self._use_compile:
             model = torch.compile(model)
 
-        self.raw_model = model
-        self.model = model
+        if save_instance:
+            self.raw_model = model
+            self.model = model
 
-        return self.model, optimizer
+        return model, optimizer
 
 
 

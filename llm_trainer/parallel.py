@@ -64,7 +64,8 @@ class Parallel(ABC):
             self,
             model: nn.Module,
             optimizer: torch.optim.Optimizer,
-            kwargs: Optional[dict] = None
+            kwargs: Optional[dict] = None,
+            save_instance: bool = True
     ) -> Tuple[nn.Module, torch.optim.Optimizer]: ...
 
     def process_dataloader(

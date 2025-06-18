@@ -16,7 +16,7 @@ from .utils import get_dpo_collate_fn
 
 from .checkpoint import (
     save_checkpoint,
-    load_checkpoint_for_eval,
+    copy_model_params,
     save_steps,
 )
 
@@ -37,23 +37,18 @@ class DPOTrainer(Trainer):
         self.reference_model = self._init_reference_model()
 
     def _init_reference_model(self):
-        parallel = TrainerTools().new_parallel()
-
         reference_model = self._new_model(self.train_config)
-        if self.train_config.init_state_dict:
-            reference_model.load_state_dict(self.train_config.init_state_dict, strict=False)
-            self.train_config.init_state_dict = None
-        else:
-            load_checkpoint_for_eval(model=reference_model, device=parallel.device)
+        copy_model_params(_from=self.train_model, _to=reference_model)
 
-        reference_model, _ = parallel.process(
+        reference_model, _ = TrainerTools().parallel.process(
             model=reference_model,
             optimizer=None,
-            kwargs=self._init_reference_args()
+            kwargs=self._init_reference_args(),
+            save_instance=False
         )
 
-        parallel.raw_model.eval()
-        for param in parallel.raw_model.parameters():
+        reference_model.eval()
+        for param in reference_model.parameters():
             param.requires_grad = False
 
         return reference_model

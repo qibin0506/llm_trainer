@@ -17,7 +17,7 @@ from .generate_utils import batch_generate
 
 from .checkpoint import (
     save_checkpoint,
-    load_checkpoint_for_eval,
+    copy_model_params,
     save_steps,
 )
 
@@ -43,9 +43,6 @@ class GRPOTrainer(Trainer):
         # 默认使用torch提供的pad_sequence
         # 如果pad_sequence不支持padding_side参数，则将改参数置为False，使用反转的方式
         self._use_origin_pad_sequence = True
-
-        # 保存一下train model的checkpoint，方便下面reference_model使用
-        save_checkpoint(self.train_model, self.optimizer)
 
     def _init_reference_model(self):
         reference_model = self._new_model(self.train_config)
@@ -296,7 +293,7 @@ class GRPOTrainer(Trainer):
         aux_loss_coef = self.train_config.loss_config.aux_loss_coef
 
         for epoch in range(self.train_config.n_epochs):
-            load_checkpoint_for_eval(model=self.reference_model, device=device)
+            copy_model_params(_from=self.train_model, _to=self.reference_model)
             self.train_model.train()
             file_count = len(self.train_config.file_dataset)
 
@@ -325,11 +322,11 @@ class GRPOTrainer(Trainer):
 
                     # start generate
                     # 使用单独的模型生成数据， 原因是在deepspeed并行训练时，使用train_model生成数据会卡死
-                    self.generate_model.to(TrainerTools().parallel.device)
-                    self.reference_model.to(TrainerTools().parallel.device)
+                    self.generate_model.to(device)
+                    self.reference_model.to(device)
 
                     # 保存了train_model checkpoint后，这里保证生成模型使用的参数是最新
-                    load_checkpoint_for_eval(self.generate_model, TrainerTools().parallel.device)
+                    copy_model_params(_from=self.train_model, _to=self.generate_model)
                     # 生成数据
                     rollout_data = self._generate_rollout_data(batch_data)
 

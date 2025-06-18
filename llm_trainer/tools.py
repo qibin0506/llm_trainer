@@ -28,7 +28,7 @@ class TrainerTools:
         if not hasattr(TrainerTools, "_first_init"):
             TrainerTools._first_init = True
 
-            self.parallel = self.new_parallel()
+            self.parallel = self._new_parallel()
 
             self.tokenizer = Tokenizer(os.environ.get('TOKENIZERS_TYPE', 'zh_llama'))
             self.use_amp = 'cuda' in self.parallel.device and not isinstance(self.parallel, DsParallel)
@@ -43,7 +43,7 @@ class TrainerTools:
                 f' use_amp={self.use_amp},'
                 f' dtype={self.dtype}')
 
-    def new_parallel(self):
+    def _new_parallel(self):
         parallel_type = os.environ.get('PARALLEL_TYPE', 'none')
         log(f'parallel_type={parallel_type}')
         return parallel_types[parallel_type]()

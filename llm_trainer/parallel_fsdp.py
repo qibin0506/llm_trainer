@@ -28,16 +28,18 @@ class FsdpParallel(Parallel):
             self,
             model: nn.Module,
             optimizer: torch.optim.Optimizer,
-            kwargs: Optional[dict] = None
+            kwargs: Optional[dict] = None,
+            save_instance: bool = True
     ) -> Tuple[nn.Module, torch.optim.Optimizer]:
         """
-        :param model:
-        :param optimizer:
-        :param kwargs:
-            "wrap_policy_num_params" int size_based_auto_wrap_policy的最小参数量
-            "cpu_offload" bool 是否使用cpu卸载
-            "offload_params" bool 是否卸载参数，在cpu_offload为True时生效
-        :return:
+            :param model:
+            :param optimizer:
+            :param kwargs:
+                "wrap_policy_num_params" int size_based_auto_wrap_policy的最小参数量
+                "cpu_offload" bool 是否使用cpu卸载
+                "offload_params" bool 是否卸载参数，在cpu_offload为True时生效
+            :param save_instance
+            :return:
         """
 
         model.to(self.device)
@@ -81,10 +83,10 @@ class FsdpParallel(Parallel):
             else:
                 mixed_precision = None
 
-            self.raw_model = model
+            raw_model = model
 
             # device_mesh = init_device_mesh("cuda", (self.world_size,))
-            # self.model = FSDP(
+            # model = FSDP(
             #     model,
             #     auto_wrap_policy=auto_wrap_policy,
             #     mixed_precision=mixed_precision,
@@ -93,7 +95,7 @@ class FsdpParallel(Parallel):
             #     device_mesh=device_mesh
             # )
 
-            self.model = FSDP(
+            model = FSDP(
                 model,
                 sharding_strategy=ShardingStrategy.FULL_SHARD,
                 auto_wrap_policy=auto_wrap_policy,
@@ -107,9 +109,13 @@ class FsdpParallel(Parallel):
                 # forward_prefetch=True,
             )
         else:
-            self.model = model
-            self.raw_model = model
+            model = model
+            raw_model = model
 
-        return self.model, optimizer
+        if save_instance:
+            self.raw_model = raw_model
+            self.model = model
+
+        return model, optimizer
 
 

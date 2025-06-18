@@ -422,7 +422,8 @@ class TrainConfig:
             kd_config: Optional[KDConfig] = None,
             pixel_values_provider: Optional[Callable[[list[str]], torch.Tensor]] = None,
             init_state_dict: Optional[Mapping[str, Any]] = None,
-            eval_config: EvalConfig = EvalConfig()
+            eval_config: EvalConfig = EvalConfig(),
+            freeze_llm_model: bool = False
     ):
         self.n_epochs = n_epochs
         self.batch_size = batch_size
@@ -443,5 +444,6 @@ class TrainConfig:
         self.pixel_values_provider = pixel_values_provider
         self.init_state_dict = init_state_dict
         self.eval_config = eval_config
+        self.freeze_llm_model = freeze_llm_model
 
 

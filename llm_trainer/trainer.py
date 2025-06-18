@@ -116,6 +116,10 @@ class Trainer:
         else:
             return LlmModel(train_config.model_config)
 
+    def _get_trainable_params(self, model):
+        freeze_llm_model = self.train_config.freeze_llm_model
+        return model.parameters() if not freeze_llm_model else filter(lambda p: p.requires_grad, model.parameters())
+
     def _init_train_model_and_optim(
             self,
             initial_lr: float,
@@ -128,9 +132,23 @@ class Trainer:
             model.load_state_dict(self.train_config.init_state_dict, strict=False)
             self.train_config.init_state_dict = None
 
+        # freeze llm model for vlm training
+        if self.train_config.freeze_llm_model:
+            for name, param in model.named_parameters():
+                if not any(sub_module in name for sub_module in ['vision_tower', 'multi_modal_projector']):
+                    param.requires_grad = False
+
+            model.embed_tokens.eval()
+            model.layers.eval()
+            model.head_norm.eval()
+            model.lm_head.eval()
+
         if TrainerTools().parallel.is_main_process:
             total_params = sum(p.numel() for p in model.parameters())
             log(f"Total number of parameters: {total_params:,}")
+
+            trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            log(f"Trainable number of parameters: {trainable_params:,}")
 
             total_size_bytes = total_params * 4
             total_size_mb = total_size_bytes / (1024 * 1024)
@@ -139,13 +157,13 @@ class Trainer:
         if use_ds_optim:
             import deepspeed
             origin_optim = deepspeed.ops.adam.DeepSpeedCPUAdam(
-                model.parameters(),
+                self._get_trainable_params(model),
                 lr=initial_lr,
                 weight_decay=self.train_config.lr_config.weight_decay
             )
         else:
             origin_optim = torch.optim.AdamW(
-                model.parameters(),
+                self._get_trainable_params(model),
                 lr=initial_lr,
                 weight_decay=self.train_config.lr_config.weight_decay
             )
@@ -529,7 +547,7 @@ class Trainer:
                             if not isinstance(TrainerTools().parallel, DsParallel) and self.lr_scheduler.can_clip_grad():
                                 # clip grad
                                 self.scalar.unscale_(self.optimizer)
-                                torch.nn.utils.clip_grad_norm_(self.train_model.parameters(), 1.0)
+                                torch.nn.utils.clip_grad_norm_(self._get_trainable_params(self.train_model), 1.0)
 
                             self._step()
 

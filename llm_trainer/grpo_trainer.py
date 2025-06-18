@@ -355,7 +355,7 @@ class GRPOTrainer(Trainer):
                             if not isinstance(TrainerTools().parallel, DsParallel) and self.lr_scheduler.can_clip_grad():
                                 # clip grad
                                 self.scalar.unscale_(self.optimizer)
-                                torch.nn.utils.clip_grad_norm_(self.train_model.parameters(), 1.0)
+                                torch.nn.utils.clip_grad_norm_(self._get_trainable_params(self.train_model), 1.0)
 
                             self._step()
 

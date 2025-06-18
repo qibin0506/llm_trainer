@@ -31,6 +31,7 @@ from .scheduler import (
 from .checkpoint import (
     load_checkpoint,
     save_checkpoint,
+    copy_model_params,
     load_steps,
     save_steps,
 )
@@ -416,6 +417,8 @@ class Trainer:
             self,
             tag: str
     ):
+        copy_model_params(_from=self.train_model, _to=self.eval_model)
+
         if TrainerTools().parallel.is_main_process:
             eval_prompt, eval_image_tag = self._get_eval_data()
             if isinstance(self.train_model, VlmModel) and self.pixel_values_provider and eval_image_tag:
@@ -424,7 +427,6 @@ class Trainer:
                 eval_pixel_values = None
 
             submit_gen_task(
-                self.train_model,
                 self.eval_model,
                 self.train_config.eval_config,
                 tag=f'sign:batch/{tag}',
@@ -439,6 +441,8 @@ class Trainer:
             self,
             tag: str
     ):
+        copy_model_params(_from=self.train_model, _to=self.eval_model)
+
         if TrainerTools().parallel.is_main_process:
             eval_prompt, eval_image_tag = self._get_eval_data()
             if isinstance(self.train_model, VlmModel) and self.pixel_values_provider and eval_image_tag:
@@ -447,7 +451,6 @@ class Trainer:
                 eval_pixel_values = None
 
             submit_gen_task(
-                self.train_model,
                 self.eval_model,
                 self.train_config.eval_config,
                 tag=f'sign:epoch/{tag}',

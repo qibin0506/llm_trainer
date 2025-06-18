@@ -121,8 +121,12 @@ def load_checkpoint_for_eval(
 
 def copy_model_params(
         _from: nn.Module,
-        _to: nn.Module
+        _to: Optional[nn.Module]
 ):
+    """
+        必须在所有rank上调用，非rank0, _to可以设置为None
+    """
+
     if isinstance(TrainerTools().parallel, DsParallel):
         from .ds_checkpoint import get_ds_model_params
         state_dict = get_ds_model_params(_from)
@@ -134,7 +138,7 @@ def copy_model_params(
     else:
         state_dict = _from.state_dict()
 
-    if state_dict:
+    if _to and state_dict:
         _to.load_state_dict(state_dict)
 
 

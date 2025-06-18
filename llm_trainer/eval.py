@@ -1,7 +1,6 @@
 import torch
 
 from .generate_utils import generate
-from .checkpoint import copy_model_params
 from .log import get_log_dir
 from .tools import TrainerTools
 from .train_configs import EvalConfig
@@ -37,7 +36,6 @@ def _eval_task(
 
 
 def submit_gen_task(
-        train_model: torch.nn.Module,
         eval_model: torch.nn.Module,
         eval_config: EvalConfig,
         tag,
@@ -46,13 +44,6 @@ def submit_gen_task(
         max_position_embeddings,
         tokens_per_image
 ):
-    try:
-        copy_model_params(_from=train_model, _to=eval_model)
-    except Exception as e:
-        if isinstance(e, KeyboardInterrupt):
-            raise e
-        return
-
     eval_model.to(TrainerTools().parallel.device)
     _eval_task(
         eval_model=eval_model,

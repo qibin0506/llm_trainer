@@ -1,6 +1,7 @@
 from typing import Union, Optional, List
 from contextlib import nullcontext
 import torch
+import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from llm_model import VlmModel, KVCache
 from .tools import TrainerTools

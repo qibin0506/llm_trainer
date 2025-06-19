@@ -14,6 +14,7 @@ from .dataset import GRPORolloutDataset
 from .loss import GRPOLoss
 from .tools import TrainerTools
 from .generate_utils import batch_generate
+from .log import log
 
 from .checkpoint import (
     save_checkpoint,
@@ -46,12 +47,9 @@ class GRPOTrainer(Trainer):
 
     def _init_reference_model(self):
         reference_model = self._new_model(self.train_config)
-
-        device = 'cpu' # TrainerTools().parallel.device
-        reference_model.to(device)
-        # load_checkpoint_for_eval(model=reference_model, device=device)
-
+        reference_model.to('cpu')
         reference_model.eval()
+
         for param in reference_model.parameters():
             param.requires_grad = False
 
@@ -59,17 +57,6 @@ class GRPOTrainer(Trainer):
 
     def _init_generate_model(self):
         return copy.deepcopy(self.reference_model)
-        # generate_model = self._new_model(self.train_config)
-        #
-        # device = 'cpu' #TrainerTools().parallel.device
-        # generate_model.to(device)
-        # # load_checkpoint_for_eval(model=generate_model, device=device)
-        #
-        # generate_model.eval()
-        # for param in generate_model.parameters():
-        #     param.requires_grad = False
-        #
-        # return generate_model
 
     def _init_loss(self):
         criterion = GRPOLoss(
@@ -194,7 +181,6 @@ class GRPOTrainer(Trainer):
 
         # [batch*group_size, max_prompt_len+max_gen_len]
         outputs: torch.Tensor = batch_generate(
-            # model=self.train_model,
             model=self.generate_model,
             tokens=prompt_ids,
             pad_token_id=pad_token_id,
@@ -325,10 +311,14 @@ class GRPOTrainer(Trainer):
                     self.generate_model.to(device)
                     self.reference_model.to(device)
 
-                    # 保存了train_model checkpoint后，这里保证生成模型使用的参数是最新
-                    copy_model_params(_from=self.train_model, _to=self.generate_model)
+                    if TrainerTools().parallel.is_main_process:
+                        log(f'start generate for batch {batch}/{batch_count_per_file}')
+
                     # 生成数据
-                    rollout_data = self._generate_rollout_data(batch_data)
+                    with torch.no_grad():
+                        # 保存了train_model checkpoint后，这里保证生成模型使用的参数是最新
+                        copy_model_params(_from=self.train_model, _to=self.generate_model)
+                        rollout_data = self._generate_rollout_data(batch_data)
 
                     # 卸载到cpu上，等待下次使用时再to gpu
                     self.generate_model.to('cpu')
@@ -337,6 +327,9 @@ class GRPOTrainer(Trainer):
                     # end generate
 
                     try:
+                        if TrainerTools().parallel.is_main_process:
+                            log(f'start train for batch {batch}/{batch_count_per_file}')
+
                         for grpo_step in range(self.train_config.grpo_config.grpo_steps):
                             with self.ctx:
                                 loss, aux_loss = self._maximize_grpo_objective(rollout_data)

@@ -139,10 +139,10 @@ class Trainer:
                 if not any(sub_module in name for sub_module in ['multi_modal_projector']):
                     param.requires_grad = False
 
-            model.embed_tokens.eval()
-            model.layers.eval()
-            model.head_norm.eval()
-            model.lm_head.eval()
+            # model.embed_tokens.eval()
+            # model.layers.eval()
+            # model.head_norm.eval()
+            # model.lm_head.eval()
 
         if TrainerTools().parallel.is_main_process:
             total_params = sum(p.numel() for p in model.parameters())

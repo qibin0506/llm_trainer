@@ -421,7 +421,7 @@ class Trainer:
 
         if TrainerTools().parallel.is_main_process:
             eval_prompt, eval_image_tag = self._get_eval_data()
-            if isinstance(self.train_model, VlmModel) and self.pixel_values_provider and eval_image_tag:
+            if isinstance(self.train_config, VLMConfig) and self.pixel_values_provider and eval_image_tag:
                 eval_pixel_values = self.pixel_values_provider([eval_image_tag])
             else:
                 eval_pixel_values = None
@@ -445,7 +445,7 @@ class Trainer:
 
         if TrainerTools().parallel.is_main_process:
             eval_prompt, eval_image_tag = self._get_eval_data()
-            if isinstance(self.train_model, VlmModel) and self.pixel_values_provider and eval_image_tag:
+            if isinstance(self.train_config, VLMConfig) and self.pixel_values_provider and eval_image_tag:
                 eval_pixel_values = self.pixel_values_provider([eval_image_tag])
             else:
                 eval_pixel_values = None

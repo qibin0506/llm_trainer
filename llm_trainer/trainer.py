@@ -136,7 +136,7 @@ class Trainer:
         # freeze llm model for vlm training
         if self.train_config.freeze_llm_model:
             for name, param in model.named_parameters():
-                if not any(sub_module in name for sub_module in ['vision_tower', 'multi_modal_projector']):
+                if not any(sub_module in name for sub_module in ['multi_modal_projector']):
                     param.requires_grad = False
 
             model.embed_tokens.eval()

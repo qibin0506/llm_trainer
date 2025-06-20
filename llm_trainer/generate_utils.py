@@ -244,7 +244,7 @@ def streaming_generate(
         max_position_embeddings: int,
         max_new_tokens: int,
         temperature: Optional[float] = 1.0,
-        k: Optional[int] = 50,
+        k: Optional[int] = None,
         p: Optional[float] = 1.0,
         pixel_values: Optional[torch.Tensor] = None,
         tokens_per_image: int = -1,

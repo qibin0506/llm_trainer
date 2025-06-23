@@ -69,7 +69,7 @@ def load_ds_checkpoint_for_eval(model: nn.Module):
 
 def _get_ds_full_state_dict_on_rank0(model: DeepSpeedEngine) -> Optional[dict]:
     """
-        可以在任意rank上调用，然后只有rank0有值
+        需要在所有rank上调用，然后只有rank0有值
     """
 
     if model.zero_optimization_stage() != 3:
@@ -77,18 +77,32 @@ def _get_ds_full_state_dict_on_rank0(model: DeepSpeedEngine) -> Optional[dict]:
             return {k: v.cpu().clone() for k, v in model.module.state_dict().items()}
         return None
 
-    # ZeRO-3
-    state_dict_on_rank_0 = {}
-    for param_name, param in model.module.named_parameters():
-        if hasattr(param, 'ds_id'):
-            with deepspeed.zero.GatheredParameters(param, modifier_rank=0):
-                if TrainerTools().parallel.is_main_process:
-                    state_dict_on_rank_0[param_name] = param.data.to(torch.float32).cpu().clone()
-        else:
-            if TrainerTools().parallel.is_main_process:
-                state_dict_on_rank_0[param_name] = param.data.to(torch.float32).cpu().clone()
+    # --- ZeRO-3 ---
+    # 只调用一次 GatheredParameters，传入所有参数
+    with deepspeed.zero.GatheredParameters(model.parameters(), modifier_rank=0):
+        if TrainerTools().parallel.is_main_process:
+            # 在这个 'with' 代码块内，rank 0 上的 model.module 拥有完整的参数
+            # 所以我们可以像操作普通模型一样直接调用 state_dict()
+            full_state_dict = model.module.state_dict()
 
-    return state_dict_on_rank_0 if TrainerTools().parallel.is_main_process else None
+            # 将其克隆到 CPU 并返回
+            return {k: v.cpu().clone() for k, v in full_state_dict.items()}
+
+    # 其他 rank 执行到这里时，上下文结束，直接返回 None
+    return None
+
+    # # ZeRO-3
+    # state_dict_on_rank_0 = {}
+    # for param_name, param in model.module.named_parameters():
+    #     if hasattr(param, 'ds_id'):
+    #         with deepspeed.zero.GatheredParameters(param, modifier_rank=0):
+    #             if TrainerTools().parallel.is_main_process:
+    #                 state_dict_on_rank_0[param_name] = param.data.to(torch.float32).cpu().clone()
+    #     else:
+    #         if TrainerTools().parallel.is_main_process:
+    #             state_dict_on_rank_0[param_name] = param.data.to(torch.float32).cpu().clone()
+    #
+    # return state_dict_on_rank_0 if TrainerTools().parallel.is_main_process else None
 
 
 def get_ds_model_params(model: nn.Module):

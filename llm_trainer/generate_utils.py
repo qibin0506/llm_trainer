@@ -1,7 +1,6 @@
 from typing import Union, Optional, List
 from contextlib import nullcontext
 import torch
-import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from llm_model import VlmModel, KVCache
 from .tools import TrainerTools
@@ -109,7 +108,8 @@ def _generate(
         pixel_values: Optional[torch.Tensor] = None,
         tokens_per_image: int = -1,
         suppress_tokens: Optional[List[int]] = None,
-        device: Union[str, torch.device, int]
+        device: Union[str, torch.device, int],
+        reasoning_budget: Optional[int] = None
 ):
     """
     :param model:
@@ -144,6 +144,27 @@ def _generate(
     kv_cache: Optional[KVCache] = None
     generate_tokens = tokens.clone()
 
+    reasoning_start = TrainerTools().tokenizer.reasoning_start
+    reasoning_end = TrainerTools().tokenizer.reasoning_end
+
+    # --- 状态初始化 ---
+    in_reasoning_block = False
+    reasoning_step_count = 0
+    # “冷静期”标志位。当强制结束思考后，在下一步抑制<reasoning>的生成。
+    suppress_reasoning_start_next = False
+
+    if reasoning_budget is not None:
+        prompt_tokens = tokens[0]
+        start_indices = (prompt_tokens == reasoning_start).nonzero(as_tuple=True)[0]
+        end_indices = (prompt_tokens == reasoning_end).nonzero(as_tuple=True)[0]
+
+        last_start_idx = start_indices[-1].item() if len(start_indices) > 0 else -1
+        last_end_idx = end_indices[-1].item() if len(end_indices) > 0 else -1
+
+        if last_start_idx > last_end_idx:
+            in_reasoning_block = True
+            reasoning_step_count = len(prompt_tokens) - 1 - last_start_idx
+
     model.eval()
     with torch.inference_mode():
         for _ in range(max_new_tokens):
@@ -163,6 +184,24 @@ def _generate(
 
             # (batch, vocab_size)
             logits = logits[:, -1, :]
+
+            # --- 推理预算逻辑 ---
+            force_end_reasoning_token = False
+            if reasoning_budget is not None:
+                # 检查是否需要在此步抑制 <reasoning>
+                should_suppress_this_step = suppress_reasoning_start_next
+                suppress_reasoning_start_next = False  # 立即重置标志位
+
+                # 修改: 检查是否超出预算
+                if in_reasoning_block and reasoning_step_count >= reasoning_budget:
+                    force_end_reasoning_token = True
+                    # 设置标志位，在下一步抑制 <reasoning>
+                    suppress_reasoning_start_next = True
+
+                # 如果上一轮设置了抑制标志，则在此轮执行抑制
+                if should_suppress_this_step:
+                    logits[:, reasoning_start] = -float("inf")
+
             # 抑制特殊token输出
             if suppress_tokens and len(suppress_tokens) != 0:
                 logits = _suppress_warper(logits, suppress_tokens)
@@ -178,6 +217,10 @@ def _generate(
             if p and 0 < p <= 1:
                 logits = _top_p_warper(logits, p)
 
+            if force_end_reasoning_token:
+                logits[:] = -float("inf")
+                logits[:, reasoning_end] = 0.0
+
             if multinomial:
                 prob = logits.softmax(dim=-1)
                 # 返回下标
@@ -185,6 +228,18 @@ def _generate(
             else:
                 # 返回下标
                 next_token = logits.argmax(dim=-1, keepdim=True)
+
+            if reasoning_budget is not None:
+                current_token_id = next_token.item()
+                if not in_reasoning_block and current_token_id == reasoning_start:
+                    in_reasoning_block = True
+                    reasoning_step_count = 0
+                elif in_reasoning_block:
+                    if current_token_id == reasoning_end:
+                        in_reasoning_block = False
+                        reasoning_step_count = 0
+                    else:
+                        reasoning_step_count += 1
 
             # token, is_full_result
             yield next_token, False
@@ -215,6 +270,7 @@ def _streaming_generate(
         tokens_per_image: int = -1,
         suppress_tokens: Optional[List[int]] = None,
         device: Union[str, torch.device, int] = None,
+        reasoning_budget: Optional[int] = None
 ):
     device = TrainerTools().parallel.device if not device else device
     encoded_tokens = TrainerTools().tokenizer.encode(prompt, unsqueeze=True, covert_tensor=True).to(device)
@@ -230,7 +286,8 @@ def _streaming_generate(
         pixel_values=pixel_values,
         tokens_per_image=tokens_per_image,
         suppress_tokens=suppress_tokens,
-        device=device
+        device=device,
+        reasoning_budget=reasoning_budget
     )
 
     for (token, is_full_result) in generate_text_iterator:
@@ -250,6 +307,7 @@ def streaming_generate(
         tokens_per_image: int = -1,
         suppress_tokens: Optional[List[int]] = None,
         device: Union[str, torch.device, int] = None,
+        reasoning_budget: Optional[int] = None
 ):
     text_iterator = _streaming_generate(
         model=model,
@@ -262,7 +320,8 @@ def streaming_generate(
         pixel_values=pixel_values,
         tokens_per_image=tokens_per_image,
         suppress_tokens=suppress_tokens,
-        device=device
+        device=device,
+        reasoning_budget=reasoning_budget
     )
 
     for (token, is_full_result) in text_iterator:
@@ -283,6 +342,7 @@ def generate(
         tokens_per_image: int = -1,
         suppress_tokens: Optional[List[int]] = None,
         device: Union[str, torch.device, int] = None,
+        reasoning_budget: Optional[int] = None
 ):
     text_iterator = _streaming_generate(
         model=model,
@@ -295,7 +355,8 @@ def generate(
         suppress_tokens=suppress_tokens,
         pixel_values=pixel_values,
         tokens_per_image=tokens_per_image,
-        device=device
+        device=device,
+        reasoning_budget=reasoning_budget
     )
 
     for (token, is_full_result) in text_iterator:

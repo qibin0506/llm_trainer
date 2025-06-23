@@ -175,7 +175,7 @@ def _generate(
             if k and k != 0:
                 logits = _top_k_warper(logits, k, device)
 
-            if p and p < 1:
+            if p and 0 < p <= 1:
                 logits = _top_p_warper(logits, p)
 
             if multinomial:
@@ -382,7 +382,7 @@ def batch_generate(
             if k and k != 0:
                 logits = _top_k_warper(logits, k, device)
 
-            if p and p < 1:
+            if p and 0 < p <= 1:
                 logits = _top_p_warper(logits, p)
 
             prob = logits.softmax(dim=-1)

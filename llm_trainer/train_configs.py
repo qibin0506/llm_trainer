@@ -22,11 +22,11 @@ class DsActivationCheckpointingConfig:
             self,
             *,
             partition_activations: bool = True,
-            cpu_checkpointing: bool = True,
+            cpu_checkpointing: bool = False,
             contiguous_memory_optimization: bool = True,
             number_checkpoints: Optional[int] = None,
-            synchronize_checkpoint_boundary: bool = True,
-            profile: bool = True
+            synchronize_checkpoint_boundary: bool = False,
+            profile: bool = False
     ):
         self.partition_activations =partition_activations
         self.cpu_checkpointing = cpu_checkpointing

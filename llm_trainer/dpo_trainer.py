@@ -250,13 +250,17 @@ class DPOTrainer(Trainer):
                         if gradient_accumulation_steps > 1:
                             loss = loss / gradient_accumulation_steps
 
-                        loss_accumulation += loss.detach()
+                        loss_accumulation += loss.detach().item()
                         self._backward_loss(loss)
 
                         if need_update_grad:
+                            loss_tensor = torch.tensor(loss_accumulation, device=TrainerTools().parallel.device)
+
                             # todo check all_reduce??
                             if TrainerTools().parallel.parallel_train:
-                                dist.all_reduce(loss_accumulation, dist.ReduceOp.AVG)
+                                dist.all_reduce(loss_tensor, dist.ReduceOp.AVG)
+
+                            final_log_loss = loss_tensor.item()
 
                             # ds模式已经集成gradient_clipping
                             if not isinstance(TrainerTools().parallel, DsParallel) and self.lr_scheduler.can_clip_grad():
@@ -270,7 +274,7 @@ class DPOTrainer(Trainer):
                                 epoch_tag=f'epoch: {epoch}',
                                 file_tag=f'file: {file_idx + 1}/{file_count}',
                                 batch_tag=f'batch: {batch}/{batch_count_per_file}',
-                                loss=loss_accumulation.item()
+                                loss=final_log_loss
                             )
                             # reset to default
                             loss_accumulation = 0.0

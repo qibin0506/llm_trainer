@@ -67,7 +67,7 @@ class DsFp16Config:
     initial_scale_power: int = 16
     hysteresis: int = 2
     min_loss_scale: int = 1
-    fp16_opt_level: Optional[str] = '02'
+    fp16_opt_level: Optional[str] = 'O2'
 
 
 @dataclass(kw_only=True)
@@ -77,9 +77,9 @@ class DsBf16Config:
 
 @dataclass(kw_only=True)
 class DsConfig:
-    zero_config: Optional[DsZeROConfig] = DsZero3Config()
-    fp16_config: Optional[DsFp16Config] = DsFp16Config()
-    bf16_config: Optional[DsBf16Config] = DsBf16Config()
+    zero_config: Optional[DsZeROConfig] = field(default_factory=DsZero3Config)
+    fp16_config: Optional[DsFp16Config] = field(default_factory=DsFp16Config)
+    bf16_config: Optional[DsBf16Config] = field(default_factory=DsBf16Config)
     gradient_clipping: Optional[float] = 1.0
     activation_checkpointing: Optional[DsActivationCheckpointingConfig] = None
 
@@ -224,14 +224,14 @@ class TrainConfig:
     model_config: Union[ModelConfig, VLMConfig]
 
     file_dataset: FileDataset
-    data_loader_config: DataLoaderConfig = DataLoaderConfig()
+    data_loader_config: DataLoaderConfig = field(default_factory=DataLoaderConfig)
     image_tags_file_dataset: Optional[FileDataset] = None
 
-    loss_config: LossConfig = LossConfig()
-    lr_config: LrConfig = LrConfig()
+    loss_config: LossConfig = field(default_factory=LossConfig)
+    lr_config: LrConfig = field(default_factory=LrConfig)
 
-    ds_config: DsConfig = DsConfig()
-    fsdp_config: FsdpConfig = FsdpConfig()
+    ds_config: DsConfig = field(default_factory=DsConfig)
+    fsdp_config: FsdpConfig = field(default_factory=FsdpConfig)
 
     kd_config: Optional[KDConfig] = None
     dpo_config: Optional[DPOConfig] = None
@@ -241,7 +241,7 @@ class TrainConfig:
     gradient_accumulation_steps: int = 0
     eval_batch_interval: int = 100
 
-    eval_config: EvalConfig = EvalConfig()
+    eval_config: EvalConfig = field(default_factory=EvalConfig)
     pixel_values_provider: Optional[Callable[[list[str]], torch.Tensor]] = None
 
     init_state_dict: Optional[Mapping[str, Any]] = None

@@ -12,12 +12,13 @@ from .dataset import DPODataset
 from .loss import DPOLoss
 from .tools import TrainerTools
 from .utils import get_dpo_collate_fn
+from .model_params import copy_model_params
 
 from .checkpoint import (
     save_checkpoint,
-    copy_model_params,
     save_steps,
 )
+
 
 class DPOTrainer(Trainer):
     def __init__(

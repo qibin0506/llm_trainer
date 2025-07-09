@@ -119,29 +119,6 @@ def load_checkpoint_for_eval(
         load_checkpoint(model, None, device, suffix=suffix)
 
 
-def copy_model_params(
-        _from: nn.Module,
-        _to: Optional[nn.Module]
-):
-    """
-        必须在所有rank上调用，非rank0, _to可以设置为None
-    """
-
-    if isinstance(TrainerTools().parallel, DsParallel):
-        from .ds_checkpoint import get_ds_model_params
-        state_dict = get_ds_model_params(_from, only_rank0=_to is None)
-    elif isinstance(TrainerTools().parallel, FsdpParallel):
-        from .fsdp_checkpoint import get_fsdp_model_params
-        state_dict = get_fsdp_model_params(_from, only_rank0=_to is None)
-    elif isinstance(_from, DDP):
-        state_dict = _from.module.state_dict()
-    else:
-        state_dict = _from.state_dict()
-
-    if _to and state_dict:
-        _to.load_state_dict(state_dict)
-
-
 def save_steps(global_steps: int, lr_scheduler: Optional[LRScheduler] = None):
     # 暂时只保存主进程的
     if TrainerTools().parallel.is_main_process:

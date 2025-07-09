@@ -15,10 +15,10 @@ from .loss import GRPOLoss
 from .tools import TrainerTools
 from .generate_utils import batch_generate
 from .log import log
+from .model_params import copy_model_params
 
 from .checkpoint import (
     save_checkpoint,
-    copy_model_params,
     save_steps,
 )
 

@@ -14,6 +14,8 @@ from .parallel_fsdp import FsdpParallel
 from .tools import TrainerTools
 from .loss import LMLoss, KDLoss
 from .dataset import TextDataset
+from .model_params import copy_model_params
+from .eval import submit_gen_task
 
 from .train_configs import (
     TrainConfig,
@@ -31,10 +33,10 @@ from .scheduler import (
 from .checkpoint import (
     load_checkpoint,
     save_checkpoint,
-    copy_model_params,
     load_steps,
     save_steps,
 )
+
 from .utils import (
     set_seed,
     pretrain_collate_fn,
@@ -44,8 +46,6 @@ from .log import(
     log,
     get_log_dir
 )
-
-from .eval import submit_gen_task
 
 class Trainer:
     def __init__(

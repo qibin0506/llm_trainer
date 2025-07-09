@@ -178,7 +178,7 @@ class Trainer:
 
     def _init_eval_model(self) -> Optional[nn.Module]:
         if TrainerTools().parallel.is_main_process:
-            return self._new_model(self.train_config).to('cpu')
+            return self._new_model(self.train_config).to(device='cpu', dtype=TrainerTools().dtype)
 
         return None
 
@@ -336,6 +336,34 @@ class Trainer:
         }
 
         return parallel_kwargs, data_loader_kwargs, sampler_kwargs, use_ds_optim
+
+    def _init_reference_args(self) -> dict:
+        parallel_kwargs, _, _, _ = self._convert_train_args()
+
+        if parallel_kwargs and isinstance(TrainerTools().parallel, DsParallel):
+            # reference to https://github.com/huggingface/trl/blob/main/trl/models/utils.py:prepare_deepspeed
+            # if model is not None:
+            #     hidden_size = (
+            #         max(model.config.hidden_sizes)
+            #         if getattr(model.config, "hidden_sizes", None)
+            #         else getattr(model.config, "hidden_size", None)
+            #     )
+            #     if hidden_size is not None and stage == 3:
+            #         # Note that `stage3_prefetch_bucket_size` can produce DeepSpeed messages like: `Invalidate trace cache
+            #         # @ step 0: expected module 1, but got module 0`
+            #         # This is expected and is not an error, see: https://github.com/microsoft/DeepSpeed/discussions/4081
+            #         config_kwargs.update(
+            #             {
+            #                 "zero_optimization.reduce_bucket_size": hidden_size * hidden_size,
+            #                 "zero_optimization.stage3_param_persistence_threshold": 10 * hidden_size,
+            #                 "zero_optimization.stage3_prefetch_bucket_size": 0.9 * hidden_size * hidden_size,
+            #             }
+            #         )
+
+            if parallel_kwargs['zero_optimization']['stage'] != 3:
+                parallel_kwargs['zero_optimization']['stage'] = 0
+
+        return parallel_kwargs
 
     def _create_dataset(self, file_idx) -> Tuple[Dataset, str]:
         file_path = self.train_config.file_dataset[file_idx]

@@ -6,7 +6,6 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from .parallel_ds import DsParallel
-from .parallel_fsdp import FsdpParallel
 from .trainer import Trainer
 from .train_configs import TrainConfig
 from .dataset import DPODataset
@@ -52,52 +51,6 @@ class DPOTrainer(Trainer):
             param.requires_grad = False
 
         return reference_model
-
-    def _init_reference_args(self):
-        if isinstance(TrainerTools().parallel, DsParallel) and self.train_config.ds_config:
-            parallel_kwargs = {
-                'gradient_accumulation_steps': 1,
-                'train_micro_batch_size_per_gpu': 1
-            }
-
-            if self.train_config.ds_config.zero_config:
-                zero_optimization = {'stage': 0}
-                parallel_kwargs['zero_optimization'] = zero_optimization
-
-
-            if (self.train_config.ds_config.bf16_config is not None
-                    and self.train_config.ds_config.bf16_config.enabled):
-                bf16_config = self.train_config.ds_config.bf16_config
-                bf16 = {
-                    'enabled': bf16_config.enabled
-                }
-                parallel_kwargs['bf16'] = bf16
-            elif self.train_config.ds_config.fp16_config:
-                fb16_config = self.train_config.ds_config.fp16_config
-                fp16 = {
-                    'enabled': fb16_config.enabled,
-                    'loss_scale': fb16_config.loss_scale,
-                    'loss_scale_window': fb16_config.loss_scale_window,
-                    'initial_scale_power': fb16_config.initial_scale_power,
-                    'hysteresis': fb16_config.hysteresis,
-                    'min_loss_scale': fb16_config.min_loss_scale
-                }
-
-                if fb16_config.fp16_opt_level is not None:
-                    fp16['fp16_opt_level'] = fb16_config.fp16_opt_level
-
-                parallel_kwargs['fp16'] = fp16
-        elif isinstance(TrainerTools().parallel, FsdpParallel) and self.train_config.fsdp_config:
-            parallel_kwargs = {
-                'transformer_layer_cls': self.train_config.fsdp_config.transformer_layer_cls,
-                'wrap_policy_num_params': self.train_config.fsdp_config.wrap_policy_num_params,
-                'cpu_offload': self.train_config.fsdp_config.cpu_offload,
-                'offload_params': self.train_config.fsdp_config.offload_params
-            }
-        else:
-            parallel_kwargs = None
-
-        return parallel_kwargs
 
     def _init_loss(self):
         criterion = DPOLoss(

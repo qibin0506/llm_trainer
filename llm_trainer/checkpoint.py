@@ -129,10 +129,10 @@ def copy_model_params(
 
     if isinstance(TrainerTools().parallel, DsParallel):
         from .ds_checkpoint import get_ds_model_params
-        state_dict = get_ds_model_params(_from)
+        state_dict = get_ds_model_params(_from, only_rank0=_to is None)
     elif isinstance(TrainerTools().parallel, FsdpParallel):
         from .fsdp_checkpoint import get_fsdp_model_params
-        state_dict = get_fsdp_model_params(_from)
+        state_dict = get_fsdp_model_params(_from, only_rank0=_to is None)
     elif isinstance(_from, DDP):
         state_dict = _from.module.state_dict()
     else:

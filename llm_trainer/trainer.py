@@ -425,6 +425,7 @@ class Trainer:
     def _eval(self, tag: str):
         with unwrap_model_for_generation(self.train_model) as generate_model:
             if TrainerTools().parallel.is_main_process:
+                generate_model.eval()
                 eval_prompt, eval_image_tag = self._get_eval_data()
 
                 if isinstance(self.train_config, VLMConfig) and self.pixel_values_provider and eval_image_tag:
@@ -441,7 +442,7 @@ class Trainer:
                     max_position_embeddings=self.train_config.model_config.max_position_embeddings,
                     tokens_per_image=self.tokens_per_image
                 )
-
+                generate_model.train()
 
         TrainerTools().parallel.wait()
 

@@ -44,7 +44,6 @@ def submit_gen_task(
         max_position_embeddings,
         tokens_per_image
 ):
-    eval_model.to(TrainerTools().parallel.device)
     _eval_task(
         eval_model=eval_model,
         eval_config=eval_config,
@@ -55,6 +54,5 @@ def submit_gen_task(
         tokens_per_image=tokens_per_image,
         device=TrainerTools().parallel.device
     )
-    eval_model.to('cpu')
 
     # threading.Thread(target=_eval_task, args=args).start()

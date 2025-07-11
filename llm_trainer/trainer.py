@@ -1,21 +1,18 @@
 import time
 from contextlib import nullcontext
-from typing import Optional, Tuple, List, Dict, Any, Union
+from typing import Optional, Tuple, List, Dict, Any
 
 import torch
-from torch import nn
 import torch.distributed as dist
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.utils.data import Dataset
 from llm_model import LlmModel, VlmModel
 
 from .parallel_ds import DsParallel
-from .parallel_fsdp import FsdpParallel
 from .tools import TrainerTools
 from .loss import LMLoss, KDLoss
 from .dataset import TextDataset
-from .model_params import copy_model_params
 from .eval import submit_gen_task
+from .partition_utils import unwrap_model_for_generation
 
 from .train_configs import (
     TrainConfig,
@@ -78,7 +75,6 @@ class Trainer:
 
         self.train_model, self.optimizer = self._init_train_model_and_optim(initial_lr, parallel_kwargs, use_ds_optim)
         self.lr_scheduler = self._init_lr_scheduler(initial_lr)
-        self.eval_model: Optional[nn.Module] = self._init_eval_model()
 
         self.criterion, self.kd_loss = self._init_loss()
 
@@ -86,9 +82,7 @@ class Trainer:
             device_type=TrainerTools().parallel.device_type,
             dtype=TrainerTools().dtype,
             enabled=True,
-            # fsdp模式，需要将cache_enabled设置为false
-            # https://www.zhihu.com/question/642793891
-            cache_enabled=False if isinstance(self.train_model, FSDP) else None
+            cache_enabled=None
         ) if TrainerTools().use_amp else nullcontext()
 
         load_checkpoint(
@@ -175,12 +169,6 @@ class Trainer:
         )
 
         return model, optim
-
-    def _init_eval_model(self) -> Optional[nn.Module]:
-        if TrainerTools().parallel.is_main_process:
-            return self._new_model(self.train_config).to(device='cpu', dtype=TrainerTools().dtype)
-
-        return None
 
     def _init_lr_scheduler(self, initial_lr: float) -> LRScheduler:
         if self.train_config.lr_config.enable_lr_scheduler:
@@ -313,13 +301,6 @@ class Trainer:
                     activation_checkpointing['number_checkpoints'] = activation_checkpointing_config.number_checkpoints
 
                 parallel_kwargs['activation_checkpointing'] = activation_checkpointing
-        elif isinstance(TrainerTools().parallel, FsdpParallel) and self.train_config.fsdp_config:
-            parallel_kwargs = {
-                'transformer_layer_cls': self.train_config.fsdp_config.transformer_layer_cls,
-                'wrap_policy_num_params': self.train_config.fsdp_config.wrap_policy_num_params,
-                'cpu_offload': self.train_config.fsdp_config.cpu_offload,
-                'offload_params': self.train_config.fsdp_config.offload_params
-            }
 
         dataloader_args = self.train_config.data_loader_config
         data_loader_kwargs = {
@@ -441,54 +422,34 @@ class Trainer:
 
         raise e
 
-    def _on_batch_end(
-            self,
-            tag: str
-    ):
-        copy_model_params(_from=self.train_model, _to=self.eval_model)
+    def _eval(self, tag: str):
+        with unwrap_model_for_generation(self.train_model) as generate_model:
+            if TrainerTools().parallel.is_main_process:
+                eval_prompt, eval_image_tag = self._get_eval_data()
 
-        if TrainerTools().parallel.is_main_process:
-            eval_prompt, eval_image_tag = self._get_eval_data()
-            if isinstance(self.train_config, VLMConfig) and self.pixel_values_provider and eval_image_tag:
-                eval_pixel_values = self.pixel_values_provider([eval_image_tag])
-            else:
-                eval_pixel_values = None
+                if isinstance(self.train_config, VLMConfig) and self.pixel_values_provider and eval_image_tag:
+                    eval_pixel_values = self.pixel_values_provider([eval_image_tag])
+                else:
+                    eval_pixel_values = None
 
-            submit_gen_task(
-                self.eval_model,
-                self.train_config.eval_config,
-                tag=f'sign:batch/{tag}',
-                prompt=eval_prompt,
-                pixel_values=eval_pixel_values,
-                max_position_embeddings=self.train_config.model_config.max_position_embeddings,
-                tokens_per_image=self.tokens_per_image
-            )
-        TrainerTools().parallel.wait()
+                submit_gen_task(
+                    generate_model,
+                    self.train_config.eval_config,
+                    tag=tag,
+                    prompt=eval_prompt,
+                    pixel_values=eval_pixel_values,
+                    max_position_embeddings=self.train_config.model_config.max_position_embeddings,
+                    tokens_per_image=self.tokens_per_image
+                )
 
-    def _on_epoch_end(
-            self,
-            tag: str
-    ):
-        copy_model_params(_from=self.train_model, _to=self.eval_model)
-
-        if TrainerTools().parallel.is_main_process:
-            eval_prompt, eval_image_tag = self._get_eval_data()
-            if isinstance(self.train_config, VLMConfig) and self.pixel_values_provider and eval_image_tag:
-                eval_pixel_values = self.pixel_values_provider([eval_image_tag])
-            else:
-                eval_pixel_values = None
-
-            submit_gen_task(
-                self.eval_model,
-                self.train_config.eval_config,
-                tag=f'sign:epoch/{tag}',
-                prompt=eval_prompt,
-                pixel_values=eval_pixel_values,
-                max_position_embeddings=self.train_config.model_config.max_position_embeddings,
-                tokens_per_image=self.tokens_per_image
-            )
 
         TrainerTools().parallel.wait()
+
+    def _on_batch_end(self, tag: str):
+        self._eval(f'sign:batch/{tag}')
+
+    def _on_epoch_end(self, tag: str):
+        self._eval(f'sign:epoch/{tag}')
 
     def _on_file_start(
             self,
@@ -574,7 +535,6 @@ class Trainer:
                         if need_update_grad:
                             loss_tensor = torch.tensor(loss_accumulation, device=TrainerTools().parallel.device)
 
-                            # todo check all_reduce??
                             if TrainerTools().parallel.parallel_train:
                                 dist.all_reduce(loss_tensor, dist.ReduceOp.AVG)
 

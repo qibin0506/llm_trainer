@@ -6,34 +6,10 @@ from torch.optim import Optimizer
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from .parallel_ds import DsParallel
-from .parallel_fsdp import FsdpParallel
-from .parallel_ddp import DdpParallel
 from .scheduler import LRScheduler
 from .tools import TrainerTools
 
-try:
-    from .dcp import save_dcp, load_dcp, convert_dcp_to_pth
-except:
-    os.environ['ENABLE_DCP'] = "0"
-
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-
-# https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html
-
 DEFAULT_CHECKPOINT_NAME = "checkpoint.pth"
-
-
-def _can_use_dcp(model: nn.Module) -> bool:
-    if os.environ.get('ENABLE_DCP', '1') != '1':
-        return False
-
-    # 如果是fsdp或者ddp，才能使用dcp保存
-    if (isinstance(TrainerTools().parallel, FsdpParallel)
-            or isinstance(TrainerTools().parallel, DdpParallel)):
-        return True
-
-    return False
-
 
 def save_checkpoint(
         model: nn.Module,
@@ -43,11 +19,6 @@ def save_checkpoint(
     if isinstance(TrainerTools().parallel, DsParallel):
         from .ds_checkpoint import save_ds_checkpoint
         save_ds_checkpoint(model, suffix)
-    elif _can_use_dcp(model):
-        save_dcp(model, optimizer, suffix)
-    elif isinstance(model, FSDP):
-        from .fsdp_checkpoint import save_fsdp_checkpoint
-        save_fsdp_checkpoint(model, optimizer, suffix)
     else:
         if TrainerTools().parallel.is_main_process:
             checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)
@@ -73,11 +44,6 @@ def load_checkpoint(
     if isinstance(TrainerTools().parallel, DsParallel):
         from .ds_checkpoint import load_ds_checkpoint
         load_ds_checkpoint(model, load_module_only=load_module_only, suffix=suffix)
-    elif _can_use_dcp(model):
-        load_dcp(model, optimizer, suffix)
-    elif isinstance(model, FSDP):
-        from .fsdp_checkpoint import load_fsdp_checkpoint
-        load_fsdp_checkpoint(model, optimizer, device, suffix)
     else:
         checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)
         if suffix:
@@ -99,22 +65,6 @@ def load_checkpoint_for_eval(
     if isinstance(TrainerTools().parallel, DsParallel):
         from .ds_checkpoint import load_ds_checkpoint_for_eval
         load_ds_checkpoint_for_eval(model)
-    elif _can_use_dcp(model):
-        checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)
-
-        # load_dcp方式在cpu上会报错，所以改为先将ckpt转换为pth，然后再加载pth
-        # load_dcp(model, optimizer)
-        pth_name = os.environ.get('EVAL_CHECKPOINT_NAME', checkpoint_name)
-        if suffix:
-            pth_name = f'{pth_name}_{suffix}'
-
-        convert_dcp_to_pth(pth_name)
-
-        if os.path.exists(pth_name):
-            ckpt = torch.load(pth_name, map_location=device, weights_only=True)
-            model.load_state_dict(ckpt['app']['model_state_dict'])
-            # 使用完删除
-            os.remove(pth_name)
     else:
         load_checkpoint(model, None, device, suffix=suffix)
 

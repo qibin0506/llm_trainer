@@ -1,7 +1,6 @@
 from typing import Union, Optional, List
 from contextlib import nullcontext
 import torch
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from llm_model import VlmModel, KVCache
 from .tools import TrainerTools
 from .utils import batch_repeat_image_tok
@@ -131,8 +130,7 @@ def _generate(
         device_type=device,
         dtype=TrainerTools().dtype,
         enabled=True,
-        # fsdp模式，需要将cache_enabled设置为false
-        cache_enabled=False if isinstance(model, FSDP) else None
+        cache_enabled=None
     ) if TrainerTools().use_amp else nullcontext()
 
     if isinstance(model, VlmModel):
@@ -165,7 +163,6 @@ def _generate(
             in_reasoning_block = True
             reasoning_step_count = len(prompt_tokens) - 1 - last_start_idx
 
-    model.eval()
     with torch.inference_mode():
         for _ in range(max_new_tokens):
             # 是否需要截取？？
@@ -386,7 +383,7 @@ def batch_generate(
         device_type=device,
         dtype=TrainerTools().dtype,
         enabled=True,
-        cache_enabled=False if isinstance(model, FSDP) else None
+        cache_enabled=None
     ) if TrainerTools().use_amp else nullcontext()
 
     if isinstance(model, VlmModel):
@@ -403,7 +400,6 @@ def batch_generate(
     end_token = TrainerTools().tokenizer.end
     done = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
-    model.eval()
     with torch.inference_mode():
         for _ in range(max_new_tokens):
             # 只处理未完成的样本

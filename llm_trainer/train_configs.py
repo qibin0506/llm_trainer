@@ -1,8 +1,7 @@
-from typing import Optional, Union, Set, Type, Callable, List, Mapping, Any
+from typing import Optional, Union, Callable, List, Mapping, Any
 from dataclasses import dataclass, field
 
 import torch
-from torch import nn
 from llm_model import ModelConfig, VLMConfig
 from .tools import FileDataset
 
@@ -33,6 +32,9 @@ class DsZeROConfig:
     reduce_bucket_size: Optional[Union[str, int]] = 5e8
     contiguous_gradients: Optional[bool] = True
 
+@dataclass(kw_only=True)
+class DsZero0Config(DsZeROConfig):
+    stage: int = field(default=0, init=False)
 
 @dataclass(kw_only=True)
 class DsZero1Config(DsZeROConfig):
@@ -82,26 +84,6 @@ class DsConfig:
     bf16_config: Optional[DsBf16Config] = field(default_factory=DsBf16Config)
     gradient_clipping: Optional[float] = 1.0
     activation_checkpointing: Optional[DsActivationCheckpointingConfig] = None
-
-
-@dataclass(kw_only=True)
-class FsdpConfig:
-    """
-        fsdp训练模式配置项
-        Args:
-            transformer_layer_cls (`Set[Type[nn.Module]]`, *optional*, default is None):
-                提供transformer层的类
-            wrap_policy_num_params (`int`, *optional*, default is -1):
-                size_based_auto_wrap_policy的min_num_params参数，-1不生效该策略
-            cpu_offload (`bool`, *optional*, default is False):
-                是否使用cpu卸载
-            offload_params (`bool`, default is False):
-                是否卸载参数，在cpu_offload为True时生效
-    """
-    transformer_layer_cls: Optional[Set[Type[nn.Module]]] = None
-    wrap_policy_num_params: int = -1
-    cpu_offload: bool = False
-    offload_params: bool = False
 
 
 @dataclass(kw_only=True)
@@ -157,6 +139,7 @@ class GRPOConfig:
     clip_eps: float = 0.2
     kl_weight: float = 0.01
     group_size: int = 12
+    mixup_alpha: float = 1.0
     gen_max_new_tokens: Optional[int] = None
     gen_temperature: Optional[float] = None
     gen_k: Optional[int] = None
@@ -210,8 +193,6 @@ class TrainConfig:
                 每隔多少个batch进行模型eval
             lr_config (`LrConfig`):
                 lr配置项
-            fsdp_config: (`FsdpConfig`):
-                fsdp训练模式配置项
             data_loader_config: (`DataLoaderConfig`):
                 data loader配置项
             kd_config: (`KDConfig`, *Optional*, default is None):
@@ -231,7 +212,6 @@ class TrainConfig:
     lr_config: LrConfig = field(default_factory=LrConfig)
 
     ds_config: DsConfig = field(default_factory=DsConfig)
-    fsdp_config: FsdpConfig = field(default_factory=FsdpConfig)
 
     kd_config: Optional[KDConfig] = None
     dpo_config: Optional[DPOConfig] = None

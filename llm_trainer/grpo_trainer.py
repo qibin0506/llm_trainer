@@ -1,5 +1,4 @@
 import time
-import copy
 from typing import Tuple, List, Union, Callable, Optional
 import torch
 from torch.utils.data import Dataset
@@ -15,7 +14,11 @@ from .loss import GRPOLoss
 from .tools import TrainerTools
 from .generate_utils import batch_generate
 from .log import log
-from .model_params import copy_model_params
+
+from .partition_utils import (
+    sync_model_params,
+    unwrap_model_for_generation
+)
 
 from .checkpoint import (
     save_checkpoint,
@@ -39,7 +42,6 @@ class GRPOTrainer(Trainer):
 
         self.reward_func = reward_func
         self.reference_model = self._init_reference_model()
-        self.generate_model = self._init_generate_model()
 
         # 默认使用torch提供的pad_sequence
         # 如果pad_sequence不支持padding_side参数，则将改参数置为False，使用反转的方式
@@ -47,16 +49,19 @@ class GRPOTrainer(Trainer):
 
     def _init_reference_model(self):
         reference_model = self._new_model(self.train_config)
-        reference_model.to('cpu')
-        reference_model.eval()
 
+        reference_model, _ = TrainerTools().parallel.process(
+            model=reference_model,
+            optimizer=None,
+            kwargs=self._init_reference_args(),
+            save_instance=False
+        )
+
+        reference_model.eval()
         for param in reference_model.parameters():
             param.requires_grad = False
 
         return reference_model
-
-    def _init_generate_model(self):
-        return copy.deepcopy(self.reference_model)
 
     def _init_loss(self):
         criterion = GRPOLoss(
@@ -163,7 +168,7 @@ class GRPOTrainer(Trainer):
         # [batch*group_size, 1]
         return advantages.unsqueeze(1)  # Add dimension for token-wise operations
 
-    def _generate_completions(self, prompts, group_size: int):
+    def _generate_completions(self, model, prompts, group_size: int):
         pad_token_id = TrainerTools().tokenizer.pad
         device = TrainerTools().parallel.device
 
@@ -181,7 +186,7 @@ class GRPOTrainer(Trainer):
 
         # [batch*group_size, max_prompt_len+max_gen_len]
         outputs: torch.Tensor = batch_generate(
-            model=self.generate_model,
+            model=model,
             tokens=prompt_ids,
             pad_token_id=pad_token_id,
             attention_mask=prompt_masks,
@@ -201,7 +206,7 @@ class GRPOTrainer(Trainer):
 
         return prompt_ids, prompt_masks, completion_ids, completion_masks
 
-    def _generate_rollout_data(self, batch_data: List[dict]):
+    def _generate_rollout_data(self, generate_model, batch_data: List[dict]):
         prompts = [item["prompt"] for item in batch_data]
         answers = [item["answer"] for item in batch_data]
         group_size = self.train_config.grpo_config.group_size
@@ -210,13 +215,13 @@ class GRPOTrainer(Trainer):
         # 修复问题：Inference tensors cannot be saved for backward. To work around you can make a clone to get a normal
         with torch.no_grad():
         # with torch.inference_mode():
-            prompt_ids, prompt_mask, completion_ids, completion_mask = self._generate_completions(prompts, group_size)
+            prompt_ids, prompt_mask, completion_ids, completion_mask = self._generate_completions(generate_model, prompts, group_size)
             input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
             attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
             logits_to_keep = completion_ids.shape[1]
 
             # Compute old_log_probs from the current model, with gradients disabled.
-            old_log_probs, _ = self._compute_log_probabilities(self.generate_model, input_ids, attention_mask, logits_to_keep)
+            old_log_probs, _ = self._compute_log_probabilities(generate_model, input_ids, attention_mask, logits_to_keep)
 
             # Compute ref_log_probs from the reference model, which remains static.
             ref_log_probs, _ = self._compute_log_probabilities(self.reference_model, input_ids, attention_mask, logits_to_keep)
@@ -275,12 +280,15 @@ class GRPOTrainer(Trainer):
     def train(self):
         global_steps = 0
         skipping_train = False
-        device = TrainerTools().parallel.device
         aux_loss_coef = self.train_config.loss_config.aux_loss_coef
 
         for epoch in range(self.train_config.n_epochs):
-            copy_model_params(_from=self.train_model, _to=self.reference_model)
-            self.train_model.train()
+            sync_model_params(
+                _from=self.train_model,
+                _to=self.reference_model,
+                mixup_alpha=self.train_config.grpo_config.mixup_alpha
+            )
+
             file_count = len(self.train_config.file_dataset)
 
             for file_idx in range(file_count):
@@ -307,22 +315,13 @@ class GRPOTrainer(Trainer):
                     skipping_train = False
 
                     # start generate
-                    # 使用单独的模型生成数据， 原因是在deepspeed并行训练时，使用train_model生成数据会卡死
-                    self.generate_model.to(device)
-                    self.reference_model.to(device)
-
                     if TrainerTools().parallel.is_main_process:
                         log(f'start generate for batch {batch}/{batch_count_per_file}')
 
                     # 生成数据
-                    with torch.no_grad():
-                        # 保存了train_model checkpoint后，这里保证生成模型使用的参数是最新
-                        copy_model_params(_from=self.train_model, _to=self.generate_model)
-                        rollout_data = self._generate_rollout_data(batch_data)
+                    with unwrap_model_for_generation(self.train_model) as generate_model:
+                        rollout_data = self._generate_rollout_data(generate_model, batch_data)
 
-                    # 卸载到cpu上，等待下次使用时再to gpu
-                    self.generate_model.to('cpu')
-                    self.reference_model.to('cpu')
                     torch.cuda.empty_cache()
                     # end generate
 

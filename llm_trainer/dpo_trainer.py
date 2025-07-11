@@ -12,7 +12,7 @@ from .dataset import DPODataset
 from .loss import DPOLoss
 from .tools import TrainerTools
 from .utils import get_dpo_collate_fn
-from .model_params import copy_model_params
+from .partition_utils import sync_model_params
 
 from .checkpoint import (
     save_checkpoint,
@@ -38,7 +38,6 @@ class DPOTrainer(Trainer):
 
     def _init_reference_model(self):
         reference_model = self._new_model(self.train_config)
-        copy_model_params(_from=self.train_model, _to=reference_model)
 
         reference_model, _ = TrainerTools().parallel.process(
             model=reference_model,
@@ -50,6 +49,11 @@ class DPOTrainer(Trainer):
         reference_model.eval()
         for param in reference_model.parameters():
             param.requires_grad = False
+
+        sync_model_params(
+            _from=self.train_model,
+            _to=reference_model
+        )
 
         return reference_model
 
@@ -210,7 +214,6 @@ class DPOTrainer(Trainer):
                         if need_update_grad:
                             loss_tensor = torch.tensor(loss_accumulation, device=TrainerTools().parallel.device)
 
-                            # todo check all_reduce??
                             if TrainerTools().parallel.parallel_train:
                                 dist.all_reduce(loss_tensor, dist.ReduceOp.AVG)
 

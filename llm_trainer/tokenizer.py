@@ -26,8 +26,8 @@ class Tokenizer:
         self.text_user = '<user>'
         self.text_assistant = '<assistant>'
 
-        self.text_reasoning_start = '<reasoning>'
-        self.text_reasoning_end = '</reasoning>'
+        self.text_think_start = '<think>'
+        self.text_think_end = '</think>'
 
         self.text_answer_start = '<answer>'
         self.text_answer_end = '</answer>'
@@ -47,8 +47,8 @@ class Tokenizer:
             additional_special_tokens = [
                 AddedToken(self.text_user, lstrip=False, rstrip=False),
                 AddedToken(self.text_assistant, lstrip=False, rstrip=False),
-                AddedToken(self.text_reasoning_start, lstrip=False, rstrip=False),
-                AddedToken(self.text_reasoning_end, lstrip=False, rstrip=False),
+                AddedToken(self.text_think_start, lstrip=False, rstrip=False),
+                AddedToken(self.text_think_end, lstrip=False, rstrip=False),
                 AddedToken(self.text_answer_start, lstrip=False, rstrip=False),
                 AddedToken(self.text_answer_end, lstrip=False, rstrip=False),
                 AddedToken(self.text_system, lstrip=False, rstrip=False),
@@ -69,8 +69,8 @@ class Tokenizer:
         self.user = self.tokenizer.convert_tokens_to_ids(self.text_user)
         self.assistant = self.tokenizer.convert_tokens_to_ids(self.text_assistant)
 
-        self.reasoning_start = self.tokenizer.convert_tokens_to_ids(self.text_reasoning_start)
-        self.reasoning_end = self.tokenizer.convert_tokens_to_ids(self.text_reasoning_end)
+        self.think_start = self.tokenizer.convert_tokens_to_ids(self.text_think_start)
+        self.think_end = self.tokenizer.convert_tokens_to_ids(self.text_think_end)
 
         self.answer_start = self.tokenizer.convert_tokens_to_ids(self.text_answer_start)
         self.answer_end = self.tokenizer.convert_tokens_to_ids(self.text_answer_end)
@@ -140,9 +140,9 @@ class Tokenizer:
                 {"role":"user", "content":"hello?"},
                 {"role":"assistant", "content":"hello"},
                 {"role":"user", "content":"hello hello?"},
-                {"role":"assistant", "reasoning":"thinking", "content":"hello hello"},
+                {"role":"assistant", "think":"thinking", "content":"hello hello"},
             ]
-            <system>{system_prompt}</s><user>hello?</s><assistant>hello</s><user>hello hello?</s><assistant><reasoning>thinking</reasoning><answer>hello hello</answer></s>
+            <system>{system_prompt}</s><user>hello?</s><assistant>hello</s><user>hello hello?</s><assistant><think>thinking</think><answer>hello hello</answer></s>
         """
 
         chat_template = ''
@@ -154,8 +154,8 @@ class Tokenizer:
                 if add_answer_tag_for_assistant and role == 'assistant':
                     content = f"{self.text_answer_start}{content}{self.text_answer_end}"
 
-                if 'reasoning' in conversation:
-                    content = f"{self.text_reasoning_start}{conversation['reasoning']}{self.text_reasoning_end}{content}"
+                if 'think' in conversation:
+                    content = f"{self.text_think_start}{conversation['think']}{self.text_think_end}{content}"
 
                 chat_template = f"{chat_template}{support_roles[role]}{content}{self.text_end}"
 

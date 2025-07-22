@@ -16,6 +16,7 @@ from .partition_utils import sync_model_params
 
 from .checkpoint import (
     save_checkpoint,
+    save_best_checkpoint,
     save_steps,
 )
 
@@ -139,6 +140,9 @@ class DPOTrainer(Trainer):
         loss_accumulation = 0.0
         skipping_train = False
 
+        current_loss: float = 0.0
+        last_best_checkpoint_loss: float = 0.0
+
         aux_loss_coef = self.train_config.loss_config.aux_loss_coef
 
         for epoch in range(self.train_config.n_epochs):
@@ -243,6 +247,9 @@ class DPOTrainer(Trainer):
 
                             if (batch - last_ckpt_batch) >= self.train_config.eval_batch_interval:
                                 save_checkpoint(model=self.train_model, optimizer=self.optimizer)
+                                if save_best_checkpoint(current_loss, last_best_checkpoint_loss):
+                                    last_best_checkpoint_loss = current_loss
+
                                 last_ckpt_batch = batch
                                 self._on_batch_end(tag=f'epoch:{epoch}/batch:{batch}')
 
@@ -252,8 +259,12 @@ class DPOTrainer(Trainer):
 
             # end epoch
             if not skipping_train:
-                save_checkpoint(model=self.train_model, optimizer=self.optimizer)
                 save_steps(global_steps=global_steps, lr_scheduler=self.lr_scheduler)
+
+                save_checkpoint(model=self.train_model, optimizer=self.optimizer)
+                if save_best_checkpoint(current_loss, last_best_checkpoint_loss):
+                    last_best_checkpoint_loss = current_loss
+
                 TrainerTools().parallel.on_epoch_end(epoch)
                 self._on_epoch_end(tag=f'epoch:{epoch}')
 

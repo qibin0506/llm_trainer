@@ -30,12 +30,12 @@ class WarmupCosineAnnealingLRScheduler(LRScheduler):
             self,
             *,
             optimizer: torch.optim.Optimizer,
+            warmup_iters: int,
             initial_lr: float,
             min_lr: float,
             max_lr: float,
-            warmup_iters: int,
-            period: int, # 每个周期的步数
-            period_mul: int = 1, # 周期长度的倍数
+            cosine_annealing_period: int, # 每个周期的步数
+            cosine_annealing_period_mul: int = 0, # 周期长度的倍数
             need_log: bool = False
     ):
         super().__init__()
@@ -46,8 +46,8 @@ class WarmupCosineAnnealingLRScheduler(LRScheduler):
         self._max_lr = max_lr
         self._warmup_iters = warmup_iters
 
-        self._period = period
-        self._period_mul = period_mul
+        self._cosine_annealing_period = cosine_annealing_period
+        self._cosine_annealing_period_mul = cosine_annealing_period_mul
 
         self.T_cur = 0  # 当前周期内已走过的步数
         self.cycle = 0  # 当前周期编号
@@ -85,7 +85,12 @@ class WarmupCosineAnnealingLRScheduler(LRScheduler):
         return self._steps > self._warmup_iters
 
     def _update_lr(self):
-        if self._steps <= self._warmup_iters:
+        # 如果period_mul是0，则认为没有周期，超过余弦退火总步数，则一直保持最小lr
+        if self._cosine_annealing_period_mul == 0 and self._steps >= self._cosine_annealing_period + self._warmup_iters:
+            lr = self._min_lr
+            for param_group in self._optimizer.param_groups:
+                param_group['lr'] = lr
+        elif self._steps <= self._warmup_iters:
             # Warmup: adjust learning rate linearly
             # (max_lr - initial_lr) / warmup_iters
             lr = self._initial_lr + self._steps * self._lr_increment
@@ -97,7 +102,7 @@ class WarmupCosineAnnealingLRScheduler(LRScheduler):
 
             """每步更新学习率"""
             # 计算当前周期的最大步数
-            T_max = self._period * (self._period_mul ** self.cycle)
+            T_max = self._cosine_annealing_period * (max(self._cosine_annealing_period_mul, 1) ** self.cycle)
 
             # 更新周期状态
             self.T_cur += 1

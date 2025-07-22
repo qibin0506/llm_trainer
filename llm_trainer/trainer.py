@@ -30,6 +30,7 @@ from .scheduler import (
 from .checkpoint import (
     load_checkpoint,
     save_checkpoint,
+    save_best_checkpoint,
     load_steps,
     save_steps,
 )
@@ -172,20 +173,20 @@ class Trainer:
 
     def _init_lr_scheduler(self, initial_lr: float) -> LRScheduler:
         if self.train_config.lr_config.enable_lr_scheduler:
+            warmup_iters = self.train_config.lr_config.warmup_iters
             min_lr = self.train_config.lr_config.min_lr
             max_lr = self.train_config.lr_config.max_lr
-            warmup_iters = self.train_config.lr_config.warmup_iters
-            period = self.train_config.lr_config.period
-            period_mul = self.train_config.lr_config.period_mul
+            cosine_annealing_period = self.train_config.lr_config.cosine_annealing_period
+            cosine_annealing_period_mul = self.train_config.lr_config.cosine_annealing_period_mul
 
             return WarmupCosineAnnealingLRScheduler(
                 optimizer=self.optimizer,
+                warmup_iters=warmup_iters,
                 initial_lr=initial_lr,
                 min_lr=min_lr,
                 max_lr=max_lr,
-                warmup_iters=warmup_iters,
-                period=period,
-                period_mul=period_mul,
+                cosine_annealing_period=cosine_annealing_period,
+                cosine_annealing_period_mul=cosine_annealing_period_mul,
                 need_log=TrainerTools().parallel.is_main_process
             )
 
@@ -467,6 +468,9 @@ class Trainer:
         loss_accumulation = 0.0
         skipping_train = False
 
+        current_loss: float = 0.0
+        last_best_checkpoint_loss: float = 0.0
+
         for epoch in range(self.train_config.n_epochs):
             self.train_model.train()
             file_count = len(self.train_config.file_dataset)
@@ -539,7 +543,7 @@ class Trainer:
                             if TrainerTools().parallel.parallel_train:
                                 dist.all_reduce(loss_tensor, dist.ReduceOp.AVG)
 
-                            final_log_loss = loss_tensor.item()
+                            current_loss = loss_tensor.item()
 
                             # ds模式已经集成gradient_clipping
                             if not isinstance(TrainerTools().parallel, DsParallel) and self.lr_scheduler.can_clip_grad():
@@ -553,7 +557,7 @@ class Trainer:
                                 epoch_tag=f'epoch: {epoch}',
                                 file_tag=f'file: {file_idx + 1}/{file_count}',
                                 batch_tag=f'batch: {batch}/{batch_count_per_file}',
-                                loss=final_log_loss
+                                loss=current_loss
                             )
                             # reset to default
                             loss_accumulation = 0.0
@@ -565,6 +569,9 @@ class Trainer:
 
                             if (batch - last_ckpt_batch) >= self.train_config.eval_batch_interval:
                                 save_checkpoint(model=self.train_model, optimizer=self.optimizer)
+                                if save_best_checkpoint(current_loss, last_best_checkpoint_loss):
+                                    last_best_checkpoint_loss = current_loss
+
                                 last_ckpt_batch = batch
                                 self._on_batch_end(tag=f'epoch:{epoch}/batch:{batch}')
 
@@ -574,8 +581,12 @@ class Trainer:
 
             # end epoch
             if not skipping_train:
-                save_checkpoint(model=self.train_model, optimizer=self.optimizer)
                 save_steps(global_steps=global_steps, lr_scheduler=self.lr_scheduler)
+
+                save_checkpoint(model=self.train_model, optimizer=self.optimizer)
+                if save_best_checkpoint(current_loss, last_best_checkpoint_loss):
+                    last_best_checkpoint_loss = current_loss
+
                 TrainerTools().parallel.on_epoch_end(epoch)
                 self._on_epoch_end(tag=f'epoch:{epoch}')
 

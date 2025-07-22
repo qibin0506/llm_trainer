@@ -1,5 +1,6 @@
 import os
 from typing import Optional, Union, Tuple
+import shutil
 import torch
 from torch import nn
 from torch.optim import Optimizer
@@ -32,6 +33,42 @@ def save_checkpoint(
                 ckpt.update({'optim_state_dict': optimizer.state_dict()})
 
             torch.save(ckpt, checkpoint_name)
+
+
+def save_best_checkpoint(
+        current_loss: float,
+        last_best_checkpoint_loss: float,
+        suffix: Optional[str] = None
+) -> bool:
+    need_replace = current_loss <= last_best_checkpoint_loss
+    if need_replace and TrainerTools().parallel.is_main_process:
+        if isinstance(TrainerTools().parallel, DsParallel):
+            checkpoint_name = os.environ.get('DIST_CHECKPOINT_DIR', 'checkpoint')
+            if suffix:
+                checkpoint_name = f"{checkpoint_name}_{suffix}"
+
+            best_checkpoint_name = f'best_{checkpoint_name}'
+            if not os.path.exists(best_checkpoint_name):
+                os.makedirs(best_checkpoint_name)
+
+            if os.path.exists(checkpoint_name):
+                shutil.rmtree(best_checkpoint_name)
+                shutil.copytree(checkpoint_name, best_checkpoint_name)
+        else:
+            checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)
+            if suffix:
+                checkpoint_name = f"{checkpoint_name}_{suffix}"
+
+            best_checkpoint_name = f'best_{checkpoint_name}'
+
+            if os.path.exists(checkpoint_name):
+                if os.path.exists(best_checkpoint_name):
+                    os.remove(best_checkpoint_name)
+
+                shutil.copy2(checkpoint_name, best_checkpoint_name)
+
+    TrainerTools().parallel.wait()
+    return need_replace
 
 
 def load_checkpoint(

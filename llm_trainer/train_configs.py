@@ -109,13 +109,13 @@ class DataLoaderConfig:
 @dataclass(kw_only=True)
 class LrConfig:
     enable_lr_scheduler: bool = False
-    initial_lr: Optional[float] = None
+    initial_lr: float
     weight_decay: float = 0.1
+    warmup_iters: Optional[int] = None
     max_lr: Optional[float] = None
     min_lr: Optional[float] = None
-    period: Optional[int] = None
-    period_mul: Optional[int] = None
-    warmup_iters: Optional[int] = None
+    cosine_annealing_period: Optional[int] = None
+    cosine_annealing_period_mul: int = 0
 
 
 @dataclass(kw_only=True)

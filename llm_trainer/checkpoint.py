@@ -14,17 +14,14 @@ DEFAULT_CHECKPOINT_NAME = "checkpoint.pth"
 
 def save_checkpoint(
         model: nn.Module,
-        optimizer: Optional[Optimizer] = None,
-        suffix: Optional[str] = None
+        optimizer: Optional[Optimizer] = None
 ):
     if isinstance(TrainerTools().parallel, DsParallel):
         from .ds_checkpoint import save_ds_checkpoint
-        save_ds_checkpoint(model, suffix)
+        save_ds_checkpoint(model)
     else:
         if TrainerTools().parallel.is_main_process:
             checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)
-            if suffix:
-                checkpoint_name = f"{checkpoint_name}_{suffix}"
 
             raw_model = model if not isinstance(model, DDP) else model.module
             ckpt = {'model_state_dict': raw_model.state_dict()}
@@ -37,28 +34,26 @@ def save_checkpoint(
 
 def save_best_checkpoint(
         current_loss: float,
-        last_best_checkpoint_loss: float,
-        suffix: Optional[str] = None
+        last_best_checkpoint_loss: Optional[float] = None
 ) -> bool:
-    need_replace = current_loss <= last_best_checkpoint_loss
+    need_replace = not last_best_checkpoint_loss or current_loss <= last_best_checkpoint_loss
     if need_replace and TrainerTools().parallel.is_main_process:
         if isinstance(TrainerTools().parallel, DsParallel):
-            checkpoint_name = os.environ.get('DIST_CHECKPOINT_DIR', 'checkpoint')
-            if suffix:
-                checkpoint_name = f"{checkpoint_name}_{suffix}"
+            checkpoint_dir = os.environ.get('DIST_CHECKPOINT_DIR', 'checkpoint')
 
-            best_checkpoint_name = f'{checkpoint_name}_best'
-            if not os.path.exists(best_checkpoint_name):
-                os.makedirs(best_checkpoint_name)
+            if checkpoint_dir.endswith('/'):
+                best_checkpoint_dir = f'{checkpoint_dir[:-1]}_best'
+            else:
+                best_checkpoint_dir = f'{checkpoint_dir}_best'
 
-            if os.path.exists(checkpoint_name):
-                shutil.rmtree(best_checkpoint_name)
-                shutil.copytree(checkpoint_name, best_checkpoint_name)
+            if not os.path.exists(best_checkpoint_dir):
+                os.makedirs(best_checkpoint_dir)
+
+            if os.path.exists(checkpoint_dir):
+                shutil.rmtree(best_checkpoint_dir)
+                shutil.copytree(checkpoint_dir, best_checkpoint_dir)
         else:
             checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)
-            if suffix:
-                checkpoint_name = f"{checkpoint_name}_{suffix}"
-
             best_checkpoint_name = f'{checkpoint_name}_best'
 
             if os.path.exists(checkpoint_name):
@@ -75,16 +70,13 @@ def load_checkpoint(
         model: nn.Module,
         optimizer: Optional[Optimizer] = None,
         device: Optional[Union[torch.device, str]] = None,
-        load_module_only: bool = False,
-        suffix: Optional[str] = None
+        load_module_only: bool = False
 ):
     if isinstance(TrainerTools().parallel, DsParallel):
         from .ds_checkpoint import load_ds_checkpoint
-        load_ds_checkpoint(model, load_module_only=load_module_only, suffix=suffix)
+        load_ds_checkpoint(model, load_module_only=load_module_only)
     else:
         checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)
-        if suffix:
-            checkpoint_name = f"{checkpoint_name}_{suffix}"
 
         state_dict = torch.load(checkpoint_name, weights_only=True, map_location=device)
         raw_model = model.module if isinstance(model, DDP) else model
@@ -96,14 +88,13 @@ def load_checkpoint(
 
 def load_checkpoint_for_eval(
         model: nn.Module,
-        device: Optional[Union[torch.device, str]] = None,
-        suffix: Optional[str] = None
+        device: Optional[Union[torch.device, str]] = None
 ):
     if isinstance(TrainerTools().parallel, DsParallel):
         from .ds_checkpoint import load_ds_checkpoint_for_eval
         load_ds_checkpoint_for_eval(model)
     else:
-        load_checkpoint(model, None, device, suffix=suffix)
+        load_checkpoint(model, None, device)
 
 
 def save_steps(global_steps: int, lr_scheduler: Optional[LRScheduler] = None):

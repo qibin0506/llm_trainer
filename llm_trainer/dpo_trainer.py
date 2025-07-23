@@ -141,7 +141,7 @@ class DPOTrainer(Trainer):
         skipping_train = False
 
         current_loss: float = 0.0
-        last_best_checkpoint_loss: float = 0.0
+        last_best_checkpoint_loss: Optional[float] = None
 
         aux_loss_coef = self.train_config.loss_config.aux_loss_coef
 

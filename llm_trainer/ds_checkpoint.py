@@ -1,5 +1,4 @@
 import os
-from typing import Optional
 from glob import glob
 import shutil
 from torch import nn
@@ -17,14 +16,9 @@ load_state_dict_from_zero_checkpoint	从 ZeRO 检查点加载模型和优化器�
 convert_zero_checkpoint_to_fp32_state_dict	将 ZeRO 检查点转换为独立的 FP32 状态字典文件	否	是	创建可移植的 FP32 权重文件，用于部署、分享等
 """
 
-def save_ds_checkpoint(
-        model: nn.Module,
-        suffix: Optional[str] = None
-):
+def save_ds_checkpoint(model: nn.Module):
     assert isinstance(model, DeepSpeedEngine)
     ckpt_dir = os.environ.get('DIST_CHECKPOINT_DIR', 'checkpoint')
-    if suffix:
-        ckpt_dir = f"{ckpt_dir}_{suffix}"
 
     try:
         # 包括model、optimizer等状态
@@ -44,13 +38,10 @@ def save_ds_checkpoint(
 
 def load_ds_checkpoint(
         model: nn.Module,
-        load_module_only: bool = False,
-        suffix: Optional[str] = None
+        load_module_only: bool = False
 ):
     assert isinstance(model, DeepSpeedEngine)
     ckpt_dir = os.environ.get('DIST_CHECKPOINT_DIR', 'checkpoint')
-    if suffix:
-        ckpt_dir = f"{ckpt_dir}_{suffix}"
 
     # 包括model、optimizer等状态
     if os.path.exists(ckpt_dir):

@@ -469,7 +469,7 @@ class Trainer:
         skipping_train = False
 
         current_loss: float = 0.0
-        last_best_checkpoint_loss: float = 0.0
+        last_best_checkpoint_loss: Optional[float] = None
 
         for epoch in range(self.train_config.n_epochs):
             self.train_model.train()

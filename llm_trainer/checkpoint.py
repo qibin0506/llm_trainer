@@ -47,7 +47,7 @@ def save_best_checkpoint(
             if suffix:
                 checkpoint_name = f"{checkpoint_name}_{suffix}"
 
-            best_checkpoint_name = f'best_{checkpoint_name}'
+            best_checkpoint_name = f'{checkpoint_name}_best'
             if not os.path.exists(best_checkpoint_name):
                 os.makedirs(best_checkpoint_name)
 
@@ -59,7 +59,7 @@ def save_best_checkpoint(
             if suffix:
                 checkpoint_name = f"{checkpoint_name}_{suffix}"
 
-            best_checkpoint_name = f'best_{checkpoint_name}'
+            best_checkpoint_name = f'{checkpoint_name}_best'
 
             if os.path.exists(checkpoint_name):
                 if os.path.exists(best_checkpoint_name):

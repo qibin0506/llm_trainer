@@ -38,29 +38,32 @@ def save_best_checkpoint(
 ) -> bool:
     need_replace = not last_best_checkpoint_loss or current_loss <= last_best_checkpoint_loss
     if need_replace and TrainerTools().parallel.is_main_process:
-        if isinstance(TrainerTools().parallel, DsParallel):
-            checkpoint_dir = os.environ.get('DIST_CHECKPOINT_DIR', 'checkpoint')
+        try:
+            if isinstance(TrainerTools().parallel, DsParallel):
+                checkpoint_dir = os.environ.get('DIST_CHECKPOINT_DIR', 'checkpoint')
 
-            if checkpoint_dir.endswith('/'):
-                best_checkpoint_dir = f'{checkpoint_dir[:-1]}_best'
+                if checkpoint_dir.endswith('/'):
+                    best_checkpoint_dir = f'{checkpoint_dir[:-1]}_best'
+                else:
+                    best_checkpoint_dir = f'{checkpoint_dir}_best'
+
+                if not os.path.exists(best_checkpoint_dir):
+                    os.makedirs(best_checkpoint_dir)
+
+                if os.path.exists(checkpoint_dir):
+                    shutil.rmtree(best_checkpoint_dir)
+                    shutil.copytree(checkpoint_dir, best_checkpoint_dir)
             else:
-                best_checkpoint_dir = f'{checkpoint_dir}_best'
+                checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)
+                best_checkpoint_name = f'{checkpoint_name}_best'
 
-            if not os.path.exists(best_checkpoint_dir):
-                os.makedirs(best_checkpoint_dir)
+                if os.path.exists(checkpoint_name):
+                    if os.path.exists(best_checkpoint_name):
+                        os.remove(best_checkpoint_name)
 
-            if os.path.exists(checkpoint_dir):
-                shutil.rmtree(best_checkpoint_dir)
-                shutil.copytree(checkpoint_dir, best_checkpoint_dir)
-        else:
-            checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)
-            best_checkpoint_name = f'{checkpoint_name}_best'
-
-            if os.path.exists(checkpoint_name):
-                if os.path.exists(best_checkpoint_name):
-                    os.remove(best_checkpoint_name)
-
-                shutil.copy2(checkpoint_name, best_checkpoint_name)
+                    shutil.copy2(checkpoint_name, best_checkpoint_name)
+        except:
+            pass
 
     TrainerTools().parallel.wait()
     return need_replace

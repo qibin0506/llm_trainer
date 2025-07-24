@@ -137,9 +137,10 @@ class DPOTrainer(Trainer):
         # 梯度累积步数
         gradient_accumulation_steps = self.train_config.gradient_accumulation_steps
         global_steps = 0
-        loss_accumulation = 0.0
         skipping_train = False
 
+        loss_accumulation = 0.0
+        batches_accumulated = 0
         current_loss: float = 0.0
         last_best_checkpoint_loss: Optional[float] = None
 
@@ -214,14 +215,15 @@ class DPOTrainer(Trainer):
 
                         loss_accumulation += loss.detach().item()
                         self._backward_loss(loss)
+                        batches_accumulated += 1
 
                         if need_update_grad:
-                            loss_tensor = torch.tensor(loss_accumulation, device=TrainerTools().parallel.device)
+                            loss_tensor = torch.tensor(loss_accumulation * gradient_accumulation_steps / batches_accumulated, device=TrainerTools().parallel.device)
 
                             if TrainerTools().parallel.parallel_train:
                                 dist.all_reduce(loss_tensor, dist.ReduceOp.AVG)
 
-                            final_log_loss = loss_tensor.item()
+                            current_loss = loss_tensor.item()
 
                             # ds模式已经集成gradient_clipping
                             if not isinstance(TrainerTools().parallel, DsParallel) and self.lr_scheduler.can_clip_grad():
@@ -235,10 +237,11 @@ class DPOTrainer(Trainer):
                                 epoch_tag=f'epoch: {epoch}',
                                 file_tag=f'file: {file_idx + 1}/{file_count}',
                                 batch_tag=f'batch: {batch}/{batch_count_per_file}',
-                                loss=final_log_loss
+                                loss=current_loss
                             )
                             # reset to default
                             loss_accumulation = 0.0
+                            batches_accumulated = 0
                     except Exception as e:
                         self._on_exception(e, epoch, batch)
                     finally:

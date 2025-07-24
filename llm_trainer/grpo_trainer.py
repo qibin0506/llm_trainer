@@ -345,6 +345,8 @@ class GRPOTrainer(Trainer):
                             if TrainerTools().parallel.parallel_train:
                                 dist.all_reduce(loss, dist.ReduceOp.AVG)
 
+                            current_loss = loss.detach().item()
+
                             # ds模式已经集成gradient_clipping
                             if not isinstance(TrainerTools().parallel, DsParallel) and self.lr_scheduler.can_clip_grad():
                                 # clip grad
@@ -357,7 +359,7 @@ class GRPOTrainer(Trainer):
                                 epoch_tag=f'epoch: {epoch}',
                                 file_tag=f'file: {file_idx + 1}/{file_count}',
                                 batch_tag=f'batch: {batch}/{batch_count_per_file}',
-                                loss=loss.detach().item()
+                                loss=current_loss
                             )
                     except Exception as e:
                         self._on_exception(e, epoch, batch)

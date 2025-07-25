@@ -92,12 +92,15 @@ class Trainer:
             device=TrainerTools().parallel.device
         )
 
-        last_global_steps, last_lr_steps = load_steps(0, -1)
-        self.last_global_steps = last_global_steps
-        log(f'last_global_steps={last_global_steps}, last_lr_steps={last_lr_steps}')
+        steps_dict = load_steps()
+        if steps_dict:
+            self.last_global_steps = steps_dict['global_steps']
+            if not self.last_global_steps:
+                self.last_global_steps = 0
 
-        if last_lr_steps != -1:
-            self.lr_scheduler.update_steps(last_lr_steps)
+            self.lr_scheduler.restore_ckpt_dict(steps_dict)
+
+            log(f'restore steps_dict = {steps_dict}')
 
         if isinstance(train_config.model_config, VLMConfig):
             self.pixel_values_provider = train_config.pixel_values_provider

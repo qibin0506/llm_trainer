@@ -16,13 +16,16 @@ class LRScheduler(ABC):
     def cur_lr(self): ...
 
     @abstractmethod
-    def update_steps(self, steps): ...
-
-    @abstractmethod
     def step(self): ...
 
     @abstractmethod
     def can_clip_grad(self): ...
+
+    @abstractmethod
+    def get_ckpt_dict(self) -> dict: ...
+
+    @abstractmethod
+    def restore_ckpt_dict(self, ckpt: dict): ...
 
 
 class WarmupCosineAnnealingLRScheduler(LRScheduler):
@@ -72,11 +75,6 @@ class WarmupCosineAnnealingLRScheduler(LRScheduler):
     def cur_lr(self):
         return self._current_lr
 
-    def update_steps(self, steps):
-        log(f'update step to {steps}')
-        self._steps = steps
-        self._update_lr()
-
     def step(self):
         self._steps += 1
         self._update_lr()
@@ -122,6 +120,33 @@ class WarmupCosineAnnealingLRScheduler(LRScheduler):
         if self.need_log:
             log(f"step={self.cur_steps},lr={lr}\n", f'{get_log_dir()}lr.txt')
 
+    def get_ckpt_dict(self) -> dict:
+        return {
+            'cur_lr': self._current_lr,
+            'lr_steps': self.cur_steps,
+            'cosine_annealing_base_lr': self._cosine_annealing_base_lr,
+            't_cur': self.T_cur,
+            'cycle': self.cycle,
+        }
+
+    def restore_ckpt_dict(self, ckpt: dict):
+        if ckpt['cur_lr']:
+            self._current_lr = ckpt['cur_lr']
+
+        if ckpt['lr_steps']:
+            self._steps = ckpt['lr_steps']
+
+        if ckpt['cosine_annealing_base_lr']:
+            self._cosine_annealing_base_lr = ckpt['cosine_annealing_base_lr']
+
+        if ckpt['t_cur']:
+            self.T_cur = ckpt['t_cur']
+
+        if ckpt['cycle']:
+            self.cycle = ckpt['cycle']
+
+        self._update_lr()
+
 
 class NoneLRScheduler(LRScheduler):
     def __init__(self, initial_lr):
@@ -135,9 +160,14 @@ class NoneLRScheduler(LRScheduler):
     def cur_lr(self):
         return self._current_lr
 
-    def update_steps(self, steps): ...
-
     def step(self): ...
 
     def can_clip_grad(self):
         return True
+
+    def get_ckpt_dict(self) -> dict:
+        return {'cur_lr': self._current_lr}
+
+    def restore_ckpt_dict(self, ckpt: dict):
+        if ckpt['cur_lr']:
+            self._current_lr = ckpt['cur_lr']

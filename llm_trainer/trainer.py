@@ -59,6 +59,7 @@ class Trainer:
         self.eval_prompts = eval_prompts
         self.eval_image_tags = eval_image_tags
         self.eval_idx = -1
+        self.last_global_steps = 0
 
         if self.eval_image_tags:
             assert len(self.eval_prompts) == len(self.eval_image_tags)

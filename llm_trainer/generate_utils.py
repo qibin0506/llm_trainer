@@ -143,8 +143,7 @@ def _generate(
 
     with torch.inference_mode():
         for _ in range(max_new_tokens):
-            # 是否需要截取？？
-            t = tokens[:, -max_position_embeddings:]
+            t = tokens # tokens[:, -max_position_embeddings:]
             with ctx:
                 result = model(
                     t,
@@ -202,7 +201,7 @@ def _generate(
 def _streaming_generate(
         model: torch.nn.Module,
         *,
-        prompt: str,
+        prompt: Union[str, torch.Tensor],
         max_position_embeddings: int,
         max_new_tokens: int,
         temperature: Optional[float] = 1.0,
@@ -214,7 +213,11 @@ def _streaming_generate(
         device: Union[str, torch.device, int] = None
 ):
     device = TrainerTools().parallel.device if not device else device
-    encoded_tokens = TrainerTools().tokenizer.encode(prompt, unsqueeze=True, covert_tensor=True).to(device)
+
+    if isinstance(prompt, torch.Tensor):
+        encoded_tokens = prompt.to(device)
+    else:
+        encoded_tokens = TrainerTools().tokenizer.encode(prompt, unsqueeze=True, covert_tensor=True).to(device)
 
     generate_text_iterator = _generate(
         model=model,
@@ -237,7 +240,7 @@ def _streaming_generate(
 def streaming_generate(
         model: torch.nn.Module,
         *,
-        prompt: str,
+        prompt: Union[str, torch.Tensor],
         max_position_embeddings: int,
         max_new_tokens: int,
         temperature: Optional[float] = 1.0,
@@ -246,7 +249,8 @@ def streaming_generate(
         pixel_values: Optional[torch.Tensor] = None,
         tokens_per_image: int = -1,
         suppress_tokens: Optional[List[int]] = None,
-        device: Union[str, torch.device, int] = None
+        device: Union[str, torch.device, int] = None,
+        return_token: bool = False
 ):
     text_iterator = _streaming_generate(
         model=model,
@@ -264,13 +268,16 @@ def streaming_generate(
 
     for (token, is_full_result) in text_iterator:
         if not is_full_result:
-            yield TrainerTools().tokenizer.decode(token.squeeze(0))
+            if return_token:
+                yield token.squeeze(0)
+            else:
+                yield TrainerTools().tokenizer.decode(token.squeeze(0))
 
 
 def generate(
         model: torch.nn.Module,
         *,
-        prompt: str,
+        prompt: Union[str, torch.Tensor],
         max_position_embeddings: int,
         max_new_tokens: int,
         temperature: Optional[float] = 1.0,
@@ -279,7 +286,8 @@ def generate(
         pixel_values: Optional[torch.Tensor] = None,
         tokens_per_image: int = -1,
         suppress_tokens: Optional[List[int]] = None,
-        device: Union[str, torch.device, int] = None
+        device: Union[str, torch.device, int] = None,
+        return_token: bool = False
 ):
     text_iterator = _streaming_generate(
         model=model,
@@ -297,7 +305,12 @@ def generate(
 
     for (token, is_full_result) in text_iterator:
         if is_full_result:
-            return TrainerTools().tokenizer.decode(token.squeeze(0))
+            if return_token:
+                return token.squeeze(0)
+            else:
+                return TrainerTools().tokenizer.decode(token.squeeze(0))
+
+    return None
 
 
 def batch_generate(

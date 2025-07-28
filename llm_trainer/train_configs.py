@@ -164,7 +164,7 @@ class KDConfig:
 
 @dataclass(kw_only=True)
 class EvalConfig:
-    max_new_tokens: int = 512
+    max_new_tokens: Optional[int] = None
     temperature: float = 1.0
     top_p: float = 0.95
     top_k: Optional[float] = None

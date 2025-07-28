@@ -81,12 +81,13 @@ def load_checkpoint(
     else:
         checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)
 
-        state_dict = torch.load(checkpoint_name, weights_only=True, map_location=device)
-        raw_model = model.module if isinstance(model, DDP) else model
-        raw_model.load_state_dict(state_dict['model_state_dict'])
+        if os.path.exists(checkpoint_name):
+            state_dict = torch.load(checkpoint_name, weights_only=True, map_location=device)
+            raw_model = model.module if isinstance(model, DDP) else model
+            raw_model.load_state_dict(state_dict['model_state_dict'])
 
-        if optimizer:
-            optimizer.load_state_dict(state_dict['optim_state_dict'])
+            if optimizer:
+                optimizer.load_state_dict(state_dict['optim_state_dict'])
 
 
 def load_checkpoint_for_eval(

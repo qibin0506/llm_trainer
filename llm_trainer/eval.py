@@ -15,12 +15,17 @@ def submit_gen_task(
         tokens_per_image
 ):
     log_dir = get_log_dir()
+    tokens = TrainerTools().tokenizer.encode(prompt, unsqueeze=True, covert_tensor=True)
+
+    max_new_tokens = eval_config.max_new_tokens
+    if not max_new_tokens:
+        max_new_tokens = max_position_embeddings - tokens.shape[-1]
 
     gen_result = generate(
         eval_model,
-        prompt=prompt,
+        prompt=tokens,
         max_position_embeddings=max_position_embeddings,
-        max_new_tokens=eval_config.max_new_tokens,
+        max_new_tokens=max_new_tokens,
         temperature=eval_config.temperature,
         k=eval_config.top_k,
         p=eval_config.top_p,

@@ -136,8 +136,8 @@ class DPOConfig:
 @dataclass(kw_only=True)
 class GRPOConfig:
     grpo_steps: int = 1
-    clip_eps: float = 0.2
-    kl_weight: float = 0.01
+    clip_eps: float = 0.1
+    kl_weight: float = 0.04
     group_size: int = 12
     mixup_alpha: float = 1.0
     gen_max_new_tokens: Optional[int] = None

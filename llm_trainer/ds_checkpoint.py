@@ -2,6 +2,7 @@ import os
 from glob import glob
 import shutil
 from torch import nn
+from .tools import TrainerTools
 
 try:
     import deepspeed
@@ -23,17 +24,20 @@ def save_ds_checkpoint(model: nn.Module):
     try:
         # 包括model、optimizer等状态
         model.save_checkpoint(save_dir=ckpt_dir)
-    except:
-        return
+    except: ...
 
-    # 删除历史checkpoint
-    ckpt_paths = glob(os.path.join(ckpt_dir, "global_*"))
-    if len(ckpt_paths) > 2:
-        # 按修改时间排序，找到最旧的目录
-        oldest_ckpt = sorted(ckpt_paths, key=os.path.getmtime)[0]
-        try:
-            shutil.rmtree(oldest_ckpt)
-        except: ...
+    TrainerTools().parallel.wait()
+
+    # 只在main rank上执行
+    if TrainerTools().parallel.is_main_process:
+        # 删除历史checkpoint
+        ckpt_paths = glob(os.path.join(ckpt_dir, "global_*"))
+        if len(ckpt_paths) > 2:
+            # 按修改时间排序，找到最旧的目录
+            oldest_ckpt = sorted(ckpt_paths, key=os.path.getmtime)[0]
+            try:
+                shutil.rmtree(oldest_ckpt)
+            except: ...
 
 
 def load_ds_checkpoint(

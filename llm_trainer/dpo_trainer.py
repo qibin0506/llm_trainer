@@ -271,7 +271,5 @@ class DPOTrainer(Trainer):
                 TrainerTools().parallel.on_epoch_end(epoch)
                 self._on_epoch_end(tag=f'epoch:{epoch}')
 
-        # 等待checkpoint保存完成
-        time.sleep(10)
         TrainerTools().parallel.destroy()
 

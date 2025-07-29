@@ -26,8 +26,6 @@ def save_ds_checkpoint(model: nn.Module):
         model.save_checkpoint(save_dir=ckpt_dir)
     except: ...
 
-    TrainerTools().parallel.wait()
-
     # 只在main rank上执行
     if TrainerTools().parallel.is_main_process:
         # 删除历史checkpoint
@@ -38,6 +36,8 @@ def save_ds_checkpoint(model: nn.Module):
             try:
                 shutil.rmtree(oldest_ckpt)
             except: ...
+
+    TrainerTools().parallel.wait()
 
 
 def load_ds_checkpoint(

@@ -65,7 +65,7 @@ def save_best_checkpoint(
         except:
             pass
 
-    TrainerTools().parallel.wait()
+    TrainerTools().parallel.wait('save best checkpoint')
     return need_replace
 
 

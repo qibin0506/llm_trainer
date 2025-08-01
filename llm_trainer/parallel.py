@@ -139,9 +139,8 @@ class Parallel(ABC):
             return dist.get_world_size()
         return 1
 
-    def wait(self):
-        try:
-            log(f'wait at {self.device}')
-            dist.barrier()
-        except: ...
-        log(f'continue at {self.device}')
+    def wait(self, msg=None):
+        msg = f' for {msg}' if msg else None
+        log(f'wait at {self.device}{msg}')
+        dist.barrier()
+        log(f'continue at {self.device}{msg}')

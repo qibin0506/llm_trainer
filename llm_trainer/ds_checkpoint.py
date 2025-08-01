@@ -37,7 +37,7 @@ def save_ds_checkpoint(model: nn.Module):
                 shutil.rmtree(oldest_ckpt)
             except: ...
 
-    TrainerTools().parallel.wait()
+    TrainerTools().parallel.wait('remove old ds checkpoint')
 
 
 def load_ds_checkpoint(

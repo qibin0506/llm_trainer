@@ -170,13 +170,18 @@ class DPOTrainer(Trainer):
                         skipping_train = True
                         continue
 
-                    skipping_train = False
-
                     # 是否需要更新梯度
-                    if gradient_accumulation_steps > 1:
+                    if skipping_train:
+                        need_update_grad = False
+                    elif gradient_accumulation_steps > 1:
                         need_update_grad = (batch + 1) % gradient_accumulation_steps == 0 or batch == batch_count_per_file - 1
                     else:
                         need_update_grad = True
+
+                    # 要放在need_update_grad赋值下面，解决在继续训练时未知原因的卡死现象
+                    if skipping_train:
+                        TrainerTools().parallel.wait('skip train')
+                        skipping_train = False
 
                     try:
                         chosen_inputs: torch.Tensor = batch_data['chosen_inputs'].to(TrainerTools().parallel.device)

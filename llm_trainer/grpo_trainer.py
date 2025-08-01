@@ -317,7 +317,9 @@ class GRPOTrainer(Trainer):
                         skipping_train = True
                         continue
 
-                    skipping_train = False
+                    if skipping_train:
+                        TrainerTools().parallel.wait('skip train')
+                        skipping_train = False
 
                     # start generate
                     if TrainerTools().parallel.is_main_process:

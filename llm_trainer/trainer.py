@@ -1,6 +1,6 @@
-import time
 from contextlib import nullcontext
 from typing import Optional, Tuple, List, Dict, Any
+import copy
 
 import torch
 import torch.distributed as dist
@@ -65,6 +65,7 @@ class Trainer:
             assert len(self.eval_prompts) == len(self.eval_image_tags)
 
         parallel_kwargs, data_loader_kwargs, sampler_kwargs, use_ds_optim = self._convert_train_args()
+        self.parallel_kwargs = parallel_kwargs
         self.data_loader_kwargs: dict[str, Any] = data_loader_kwargs
         self.sampler_kwargs: dict[str, Any] = sampler_kwargs
 
@@ -323,8 +324,8 @@ class Trainer:
 
         return parallel_kwargs, data_loader_kwargs, sampler_kwargs, use_ds_optim
 
-    def _init_reference_args(self) -> dict:
-        parallel_kwargs, _, _, _ = self._convert_train_args()
+    def _init_ref_model_args(self) -> dict:
+        parallel_kwargs = copy.deepcopy(self.parallel_kwargs)
 
         if parallel_kwargs and isinstance(TrainerTools().parallel, DsParallel):
             # reference to https://github.com/huggingface/trl/blob/main/trl/models/utils.py:prepare_deepspeed
@@ -346,8 +347,13 @@ class Trainer:
             #             }
             #         )
 
-            if parallel_kwargs['zero_optimization']['stage'] != 3:
-                parallel_kwargs['zero_optimization']['stage'] = 0
+            parallel_kwargs.pop('activation_checkpointing', None)
+            parallel_kwargs.pop('gradient_clipping', None)
+
+            # ref_model暂时先使用stage 0, 解决训练卡住问题
+            parallel_kwargs["zero_optimization"] = {"stage": 0}
+            # if parallel_kwargs.get("zero_optimization", {}).get("stage", 0) != 3:
+            #     parallel_kwargs["zero_optimization"] = {"stage": 0}
 
         return parallel_kwargs
 

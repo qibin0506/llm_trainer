@@ -12,7 +12,10 @@ from .dataset import DPODataset
 from .loss import DPOLoss
 from .tools import TrainerTools
 from .utils import get_dpo_collate_fn
-from .partition_utils import sync_model_params
+from .partition_utils import (
+    sync_model_params,
+    unwrap_model_for_generation
+)
 
 from .checkpoint import (
     save_checkpoint,
@@ -35,28 +38,28 @@ class DPOTrainer(Trainer):
             eval_image_tags=eval_image_tags
         )
 
-        self.reference_model = self._init_reference_model()
+        self.ref_model = self._init_ref_model()
 
-    def _init_reference_model(self):
-        reference_model = self._new_model(self.train_config)
+    def _init_ref_model(self):
+        ref_model = self._new_model(self.train_config)
 
-        reference_model, _ = TrainerTools().parallel.process(
-            model=reference_model,
+        ref_model, _ = TrainerTools().parallel.process(
+            model=ref_model,
             optimizer=None,
-            kwargs=self._init_reference_args(),
+            kwargs=self._init_ref_model_args(),
             save_instance=False
         )
 
-        reference_model.eval()
-        for param in reference_model.parameters():
+        ref_model.eval()
+        for param in ref_model.parameters():
             param.requires_grad = False
 
         sync_model_params(
             _from=self.train_model,
-            _to=reference_model
+            _to=ref_model
         )
 
-        return reference_model
+        return ref_model
 
     def _init_loss(self):
         criterion = DPOLoss(
@@ -203,17 +206,18 @@ class DPOTrainer(Trainer):
 
                         with self.ctx:
                             policy_outputs = self.train_model(concat_inputs, attention_mask=concat_mask)
-                            with torch.inference_mode():
-                                ref_outputs = self.reference_model(concat_inputs, attention_mask=concat_mask)
-
                             policy_probs = self._logprobs(policy_outputs['logits'], concat_labels, concat_mask)
-                            ref_probs = self._logprobs(ref_outputs['logits'], concat_labels, concat_mask)
+                            aux_loss = policy_outputs.get('aux_loss')
+
+                            with torch.no_grad():
+                                ref_outputs = self.ref_model(concat_inputs, attention_mask=concat_mask)
+                                ref_probs = self._logprobs(ref_outputs['logits'], concat_labels, concat_mask)
 
                             # calc loss
                             loss = self.criterion(policy_probs, ref_probs)
 
-                            if aux_loss_coef and policy_outputs['aux_loss']:
-                                loss += aux_loss_coef * policy_outputs['aux_loss']
+                            if aux_loss_coef and aux_loss:
+                                loss += aux_loss_coef *aux_loss
 
                         if gradient_accumulation_steps > 1:
                             loss = loss / gradient_accumulation_steps

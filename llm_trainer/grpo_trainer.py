@@ -42,27 +42,27 @@ class GRPOTrainer(Trainer):
         )
 
         self.reward_func = reward_func
-        self.reference_model = self._init_reference_model()
+        self.ref_model = self._init_ref_model()
 
         # 默认使用torch提供的pad_sequence
         # 如果pad_sequence不支持padding_side参数，则将改参数置为False，使用反转的方式
         self._use_origin_pad_sequence = True
 
-    def _init_reference_model(self):
-        reference_model = self._new_model(self.train_config)
+    def _init_ref_model(self):
+        ref_model = self._new_model(self.train_config)
 
-        reference_model, _ = TrainerTools().parallel.process(
-            model=reference_model,
+        ref_model, _ = TrainerTools().parallel.process(
+            model=ref_model,
             optimizer=None,
-            kwargs=self._init_reference_args(),
+            kwargs=self._init_ref_model_args(),
             save_instance=False
         )
 
-        reference_model.eval()
-        for param in reference_model.parameters():
+        ref_model.eval()
+        for param in ref_model.parameters():
             param.requires_grad = False
 
-        return reference_model
+        return ref_model
 
     def _init_loss(self):
         criterion = GRPOLoss(
@@ -225,7 +225,7 @@ class GRPOTrainer(Trainer):
             old_log_probs, _ = self._compute_log_probabilities(generate_model, input_ids, attention_mask, logits_to_keep)
 
             # Compute ref_log_probs from the reference model, which remains static.
-            ref_log_probs, _ = self._compute_log_probabilities(self.reference_model, input_ids, attention_mask, logits_to_keep)
+            ref_log_probs, _ = self._compute_log_probabilities(self.ref_model, input_ids, attention_mask, logits_to_keep)
 
         repeated_prompts = [p for p in prompts for _ in range(group_size)]
         repeated_answers = [a for a in answers for _ in range(group_size)]
@@ -290,7 +290,7 @@ class GRPOTrainer(Trainer):
         for epoch in range(self.train_config.n_epochs):
             sync_model_params(
                 _from=self.train_model,
-                _to=self.reference_model,
+                _to=self.ref_model,
                 mixup_alpha=self.train_config.grpo_config.mixup_alpha
             )
 

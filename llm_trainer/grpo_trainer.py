@@ -66,8 +66,12 @@ class GRPOTrainer(Trainer):
 
     def _init_loss(self):
         criterion = GRPOLoss(
-            clip_eps=self.train_config.grpo_config.clip_eps,
-            kl_weight=self.train_config.grpo_config.kl_weight
+            beta=self.train_config.grpo_config.loss_beta,
+            clip_eps=self.train_config.grpo_config.loss_clip_eps,
+            delta=self.train_config.grpo_config.loss_delta,
+            importance_sampling_level=self.train_config.grpo_config.loss_importance_sampling_level,
+            loss_type=self.train_config.grpo_config.loss_type,
+            gen_max_new_tokens=self.train_config.grpo_config.gen_max_new_tokens
         )
 
         return criterion, None

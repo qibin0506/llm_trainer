@@ -2,6 +2,7 @@ from typing import List, Optional
 import torch
 from torch import nn
 import torch.nn.functional as F
+from .tools import TrainerTools
 
 
 class LMLoss(nn.Module):
@@ -115,6 +116,7 @@ class DPOLoss(nn.Module):
             )
 
         loss = losses.mean()
+
         # chosen_rewards = self.beta * (policy_chosen_probs - ref_chosen_probs).detach()
         # rejected_rewards = self.beta * (policy_reject_probs - ref_reject_probs).detach()
 
@@ -124,12 +126,21 @@ class DPOLoss(nn.Module):
 class GRPOLoss(nn.Module):
     def __init__(
             self,
+            beta: float,
             clip_eps: float,
-            kl_weight: float
+            delta: Optional[float] = None,
+            importance_sampling_level: str = 'token',
+            loss_type: str = 'grpo',
+            gen_max_new_tokens: Optional[float] = None
     ):
         super().__init__()
+
+        self.beta = beta
         self.clip_eps = clip_eps
-        self.kl_weight = kl_weight
+        self.delta = delta
+        self.importance_sampling_level = importance_sampling_level
+        self.loss_type = loss_type
+        self.gen_max_new_tokens = gen_max_new_tokens
 
     def forward(
             self,
@@ -139,33 +150,41 @@ class GRPOLoss(nn.Module):
             completion_mask: torch.Tensor,
             advantages: torch.Tensor
     ) -> torch.Tensor:
-        # Compute policy ratio
-        ratio = torch.exp(log_probs - old_log_probs)
 
-        # Compute surrogate loss with clipping
-        surrogate1 = ratio * advantages
-        surrogate2 = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * advantages
-        surrogate_loss = torch.min(surrogate1, surrogate2)
+        if self.beta != 0.0:
+            per_token_kl = torch.exp(ref_log_probs - log_probs) - (ref_log_probs - log_probs) - 1
+        else:
+            per_token_kl = None
 
-        # Compute KL divergence penalty
-        kl_div = torch.exp(ref_log_probs - log_probs) - (ref_log_probs - log_probs) - 1
+        log_ratio = log_probs - old_log_probs
+        if self.importance_sampling_level == "seq":
+            # GSPO
+            log_importance_weights = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
+            log_importance_weights = log_importance_weights.unsqueeze(-1)
+        else:
+            # GRPO
+            log_importance_weights = log_ratio
 
-        # Combine losses
-        per_token_loss = surrogate_loss - self.kl_weight * kl_div
-        loss = -((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+        coef_1 = torch.exp(log_importance_weights)
+        coef_2 = torch.clamp(coef_1, 1 - self.clip_eps, 1 + self.clip_eps)
+
+        # Two-sided clipping
+        if self.delta is not None:
+            coef_1 = torch.clamp(coef_1, max=self.delta)
+
+        per_token_loss1 = coef_1 * advantages
+        per_token_loss2 = coef_2 * advantages
+        per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+
+        if self.beta != 0.0:
+            per_token_loss = per_token_loss + self.beta * per_token_kl
+
+        if self.loss_type == "bnpo":
+            loss = (per_token_loss * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
+        elif self.loss_type == "dr_grpo":
+            assert self.gen_max_new_tokens is not None
+            loss = (per_token_loss * completion_mask).sum() / (per_token_loss.size(0) * self.gen_max_new_tokens)
+        else:
+            loss = ((per_token_loss * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)).mean()
 
         return loss
-
-        # kl = self._approx_kl_divergence(
-        #     log_probs=log_probs,
-        #     ref_log_probs=ref_log_probs,
-        #     mask=mask,
-        # )
-        #
-        # ratio = (log_probs - old_log_probs).exp()
-        # surr1 = ratio * advantages
-        # surr2 = ratio.clamp(1 - self.clip_eps, 1 + self.clip_eps) * advantages
-        # loss = -torch.min(surr1, surr2) + self.kl_weight * kl
-        #
-        # loss = self._masked_mean(loss, mask, dim=-1).mean()
-        # return loss, kl.mean()

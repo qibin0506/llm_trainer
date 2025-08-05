@@ -12,10 +12,7 @@ from .dataset import DPODataset
 from .loss import DPOLoss
 from .tools import TrainerTools
 from .utils import get_dpo_collate_fn
-from .partition_utils import (
-    sync_model_params,
-    unwrap_model_for_generation
-)
+from .partition_utils import sync_model_params
 
 from .checkpoint import (
     save_checkpoint,
@@ -217,7 +214,7 @@ class DPOTrainer(Trainer):
                             loss = self.criterion(policy_probs, ref_probs)
 
                             if aux_loss_coef and aux_loss:
-                                loss += aux_loss_coef *aux_loss
+                                loss += aux_loss_coef * aux_loss
 
                         if gradient_accumulation_steps > 1:
                             loss = loss / gradient_accumulation_steps

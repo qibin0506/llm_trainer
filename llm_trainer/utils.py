@@ -1,4 +1,5 @@
 import random
+from contextlib import nullcontext
 import torch
 from torch.nn.utils.rnn import pad_sequence
 import torch.nn.functional as F
@@ -12,6 +13,115 @@ def set_seed(seed=42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def autocastcontext(device_type):
+    if TrainerTools().use_amp:
+        dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+        return torch.autocast(
+            device_type=device_type,
+            dtype=dtype,
+            enabled=True,
+            cache_enabled=None
+        )
+    else:
+        return nullcontext()
+
+
+def create_doc_boundary_mask(
+        input_ids: torch.Tensor,
+        dtype: torch.dtype
+) -> torch.Tensor:
+    """
+    根据文档结束符 (eot) 的位置，创建一个 attention mask 来阻止跨文档的注意力。
+
+    这个函数生成的 mask 会阻止一个 token 关注 (attend to) 属于前面文档的 tokens。
+    例如，对于输入 `[[1, 2, eot, 3, 4, eot]]`，
+    tokens `3` 和 `4` 将无法关注 `1`, `2`, 和第一个 `eot`。
+
+    Args:
+        input_ids (torch.Tensor): 输入的 token ID 张量，形状为 (bsz, seq_len)。
+        dtype (torch.dtype): 数据类型。
+
+    Returns:
+        torch.Tensor: 符合 attention 机制要求的 mask 张量，
+                      形状为 (bsz, 1, seq_len, seq_len)。
+                      值为 -inf 的位置表示被屏蔽，值为 0 的位置表示允许注意力。
+    """
+    # 获取 batch size 和 sequence length
+    bsz, seq_len = input_ids.shape
+
+    # 1. 确定每个 eot_token 的位置
+    # is_eot 是一个布尔张量，形状为 (bsz, seq_len)
+    is_eot = (input_ids == TrainerTools().tokenizer.end)
+
+    # 2. 为每个 token 分配一个文档 ID
+    # 我们使用 cumsum (累加和) 来创建递增的文档 ID。一个 token 所属的文档 ID，
+    # 取决于它前面有多少个 eot。
+    # 示例:
+    # input_ids:        [[1, 2, 3, eot, 4, 5, eot]]
+    # is_eot:           [F, F, F, T, F, F, T] -> [0, 0, 0, 1, 0, 0, 1]
+    # doc_ids_ending:   [0, 0, 0, 1, 1, 1, 2] (cumsum 的结果)
+    # doc_ids:          [0, 0, 0, 0, 1, 1, 1] (向右移位后的结果)
+    # 这个结果正确地将文档 0 分配给了前四个 token，将文档 1 分配给了后三个 token。
+    doc_ids_ending = torch.cumsum(is_eot, dim=-1)
+    doc_ids = F.pad(doc_ids_ending[:, :-1], (1, 0), value=0)
+
+    # 3. 通过比较 query 和 key 的文档 ID 来创建 mask
+    # 我们的目标是：当 query token 所在的文档 ID 大于 key token 所在的文档 ID 时，进行屏蔽。
+    # query_doc_ids 形状: (bsz, seq_len, 1)
+    # key_doc_ids 形状:   (bsz, 1, seq_len)
+    query_doc_ids = doc_ids.unsqueeze(2)
+    key_doc_ids = doc_ids.unsqueeze(1)
+
+    # 利用 PyTorch 的广播机制，`query_doc_ids > key_doc_ids` 会创建一个
+    # 形状为 (bsz, seq_len, seq_len) 的布尔张量。
+    # 当 query 的文档 ID 大于 key 的文档 ID 时，值为 True，这正是我们需要屏蔽的位置。
+    boundary_mask = query_doc_ids > key_doc_ids
+
+    # 4. 将布尔 mask 转换为 attention 机制所需的浮点数 mask (-inf 和 0)
+    final_mask = torch.zeros(
+        (bsz, seq_len, seq_len), device=input_ids.device, dtype=dtype
+    )
+    final_mask.masked_fill_(boundary_mask, torch.finfo(dtype).min)
+
+    # 5. 增加一个维度以匹配 attention head 的输入要求 (bsz, num_heads, seq_len, seq_len)
+    #    这里我们只生成一个 mask，它可以被广播到所有的 head。
+    return final_mask.unsqueeze(1)
+
+
+def generate_position_ids(input_ids: torch.Tensor):
+    """
+    为打包序列生成 position_ids 张量。
+
+    参数:
+      input_ids (torch.Tensor): 输入的 token ID 张量 (batch_size, sequence_length)。
+      end_of_text_id (int): 代表文本结束的特殊 token ID。
+
+    返回:
+      torch.Tensor: 生成的 position_ids 张量。
+    """
+    # 获取输入张量的形状
+    batch_size, seq_length = input_ids.shape
+
+    # 创建一个与输入形状相同，全为0的张量来存储position_ids
+    # 第一个token的位置永远是0，所以这个初始化是正确的
+    position_ids = torch.zeros_like(input_ids, dtype=torch.long)
+
+    # 从第二个时间步 (t=1) 开始遍历整个序列
+    for t in range(1, seq_length):
+        # 检查前一个时间步 (t-1) 的token是否为 EOT token
+        # 这会为批次中的每个序列生成一个布尔值
+        is_reset_token = (input_ids[:, t - 1] == TrainerTools().tokenizer.end)
+
+        # 获取前一个时间步的位置ID
+        prev_position_ids = position_ids[:, t - 1]
+
+        # 如果前一个token是EOT，当前位置重置为0；否则，在前一个位置上加1
+        # torch.where 会根据 is_reset_token 的布尔值进行选择
+        position_ids[:, t] = torch.where(is_reset_token, 0, prev_position_ids + 1)
+
+    return position_ids
 
 
 def repeat_image_tok(
@@ -41,43 +151,6 @@ def batch_repeat_image_tok(
         new_tokens.append(repeat_image_tok(token, tokens_per_image))
 
     return torch.stack(new_tokens, dim=0)
-
-
-def _pad_sequence(batch_data):
-    # [[x,x,x], [y,y,y]]
-    inputs = pad_sequence(batch_data, batch_first=True, padding_value=TrainerTools().tokenizer.pad)
-    # crossEntropy默认的ignore_index是-100
-    labels = pad_sequence(batch_data, batch_first=True, padding_value=-100)
-
-    return inputs, labels
-
-
-def _mask_prompt(labels):
-    tokenizer = TrainerTools().tokenizer
-    # 支持多轮会话的mask
-    for batch, label in enumerate(labels):
-        start_index = -1
-        for index, token in enumerate(label):
-            if token == tokenizer.system or token == tokenizer.user:
-                start_index = index
-            elif token == tokenizer.end and start_index != -1:
-                labels[batch, start_index:index + 1] = -100
-                start_index = -1
-
-    return labels
-
-
-def _zero_pad_sequences(
-    sequences: list[torch.Tensor], side: str = "left"
-) -> torch.Tensor:
-    assert side in ("left", "right")
-    max_len = max(seq.size(0) for seq in sequences)
-    padded_sequences = []
-    for seq in sequences:
-        pad_len = max_len - seq.size(0)
-        padding = (pad_len, 0) if side == "left" else (0, pad_len)
-        padded_sequences.append(F.pad(seq, padding))
-    return torch.stack(padded_sequences, dim=0)
 
 
 def pretrain_collate_fn(batch_data):
@@ -220,3 +293,40 @@ def join_batch(batch_data: list[dict]) -> dict:
         result[key] = data
 
     return result
+
+
+def _pad_sequence(batch_data):
+    # [[x,x,x], [y,y,y]]
+    inputs = pad_sequence(batch_data, batch_first=True, padding_value=TrainerTools().tokenizer.pad)
+    # crossEntropy默认的ignore_index是-100
+    labels = pad_sequence(batch_data, batch_first=True, padding_value=-100)
+
+    return inputs, labels
+
+
+def _mask_prompt(labels):
+    tokenizer = TrainerTools().tokenizer
+    # 支持多轮会话的mask
+    for batch, label in enumerate(labels):
+        start_index = -1
+        for index, token in enumerate(label):
+            if token == tokenizer.system or token == tokenizer.user:
+                start_index = index
+            elif token == tokenizer.end and start_index != -1:
+                labels[batch, start_index:index + 1] = -100
+                start_index = -1
+
+    return labels
+
+
+def _zero_pad_sequences(
+    sequences: list[torch.Tensor], side: str = "left"
+) -> torch.Tensor:
+    assert side in ("left", "right")
+    max_len = max(seq.size(0) for seq in sequences)
+    padded_sequences = []
+    for seq in sequences:
+        pad_len = max_len - seq.size(0)
+        padding = (pad_len, 0) if side == "left" else (0, pad_len)
+        padded_sequences.append(F.pad(seq, padding))
+    return torch.stack(padded_sequences, dim=0)

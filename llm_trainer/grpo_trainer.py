@@ -1,4 +1,3 @@
-import time
 from typing import Tuple, List, Union, Callable, Optional
 import torch
 from torch.utils.data import Dataset
@@ -14,6 +13,7 @@ from .loss import GRPOLoss
 from .tools import TrainerTools
 from .generate_utils import batch_generate
 from .log import log
+from .utils import autocastcontext
 
 from .partition_utils import (
     sync_model_params,
@@ -41,6 +41,7 @@ class GRPOTrainer(Trainer):
             eval_image_tags=eval_image_tags
         )
 
+        self.packed_sequences = False
         self.reward_func = reward_func
         self.ref_model = self._init_ref_model()
 
@@ -341,7 +342,7 @@ class GRPOTrainer(Trainer):
                             log(f'start train for batch {batch}/{batch_count_per_file}')
 
                         for grpo_step in range(self.train_config.grpo_config.grpo_steps):
-                            with self.ctx:
+                            with autocastcontext(TrainerTools().parallel.device_type):
                                 loss, aux_loss = self._maximize_grpo_objective(rollout_data)
                                 if aux_loss_coef and aux_loss:
                                     loss += aux_loss_coef * aux_loss

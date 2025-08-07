@@ -7,6 +7,7 @@ def get_log_dir() -> str:
 
     return f'{log_dir}/' if not log_dir.endswith('/') else log_dir
 
+
 def log(msg: str, log_file=None):
     cur_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     if not log_file:

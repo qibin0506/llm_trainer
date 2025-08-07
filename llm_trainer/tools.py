@@ -31,15 +31,7 @@ class TrainerTools:
             self.tokenizer = Tokenizer(os.environ.get('TOKENIZERS_TYPE', 'zh_llama'))
             self.use_amp = 'cuda' in self.parallel.device and not isinstance(self.parallel, DsParallel)
 
-            dtype = os.environ.get('DTYPE', None)
-            self.dtype = dtypes[dtype] if dtype in dtypes else None
-
-            if not self.dtype:
-                self.dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
-
-            log(f'word_size={self.parallel.world_size},'
-                f' use_amp={self.use_amp},'
-                f' dtype={self.dtype}')
+            log(f'word_size={self.parallel.world_size}, use_amp={self.use_amp}')
 
     def _new_parallel(self):
         parallel_type = os.environ.get('PARALLEL_TYPE', 'none')

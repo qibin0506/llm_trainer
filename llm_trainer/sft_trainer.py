@@ -21,6 +21,7 @@ class SFTTrainer(Trainer):
             eval_prompts=eval_prompts,
             eval_image_tags=eval_image_tags
         )
+        self.packed_sequences = False
 
     def _convert_train_args(self) -> Tuple[dict, dict, dict, bool]:
         sft_collate_fn = get_sft_collate_fn(self.train_config.mask_prompt)

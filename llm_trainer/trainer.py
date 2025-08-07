@@ -1,4 +1,3 @@
-from contextlib import nullcontext
 from typing import Optional, Tuple, List, Dict, Any
 import copy
 
@@ -37,6 +36,9 @@ from .checkpoint import (
 
 from .utils import (
     set_seed,
+    autocastcontext,
+    create_doc_boundary_mask,
+    generate_position_ids,
     pretrain_collate_fn,
 )
 
@@ -54,6 +56,17 @@ class Trainer:
             eval_image_tags: Optional[List[str]] = None
     ):
         set_seed()
+
+        # 是否打包序列，仅pretrain阶段需要打包序列，
+        # [[1, 1, eos, 2, 2, eos]]
+        #   doc_boundary_mask=[[[[0., 0., 0., 0., 0., 0.],
+        #           [0., 0., 0., 0., 0., 0.],
+        #           [0., 0., 0., 0., 0., 0.],
+        #           [-inf, -inf, -inf, 0., 0., 0.],
+        #           [-inf, -inf, -inf, 0., 0., 0.],
+        #           [-inf, -inf, -inf, 0., 0., 0.]]]]
+        #   position_ids=[[0, 1, 2, 0, 1, 2]]
+        self.packed_sequences = True
 
         self.train_config: TrainConfig = train_config
         self.eval_prompts = eval_prompts
@@ -80,13 +93,6 @@ class Trainer:
         self.lr_scheduler = self._init_lr_scheduler(initial_lr)
 
         self.criterion, self.kd_loss = self._init_loss()
-
-        self.ctx = torch.autocast(
-            device_type=TrainerTools().parallel.device_type,
-            dtype=TrainerTools().dtype,
-            enabled=True,
-            cache_enabled=None
-        ) if TrainerTools().use_amp else nullcontext()
 
         load_checkpoint(
             self.train_model,
@@ -433,6 +439,14 @@ class Trainer:
 
         raise e
 
+    def _get_model_dtype(self):
+        if isinstance(TrainerTools().parallel, DsParallel):
+            import deepspeed
+            assert isinstance(self.train_model, deepspeed.DeepSpeedEngine)
+            return self.train_model.get_data_types()[0]
+        else:
+            return torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+
     def _eval(self, tag: str):
         with unwrap_model_for_generation(self.train_model) as generate_model:
             if TrainerTools().parallel.is_main_process:
@@ -526,8 +540,12 @@ class Trainer:
                         inputs, labels = inputs.to(TrainerTools().parallel.device), labels.to(TrainerTools().parallel.device)
                         attention_mask = inputs != TrainerTools().tokenizer.pad
 
-                        if TrainerTools().parallel.parallel_train:
-                            self.train_model.require_backward_grad_sync = need_update_grad
+                        if self.packed_sequences:
+                            doc_boundary_mask = create_doc_boundary_mask(inputs, self._get_model_dtype())
+                            position_ids = generate_position_ids(inputs)
+                        else:
+                            doc_boundary_mask = None
+                            position_ids = None
 
                         if self.pixel_values_provider and 'image_tags' in batch_data:
                             image_tags = batch_data['image_tags']
@@ -535,10 +553,15 @@ class Trainer:
                         else:
                             pixel_values = None
 
-                        with self.ctx:
+                        if TrainerTools().parallel.parallel_train:
+                            self.train_model.require_backward_grad_sync = need_update_grad
+
+                        with autocastcontext(TrainerTools().parallel.device_type):
                             result = self.train_model(
                                 inputs,
                                 attention_mask=attention_mask,
+                                doc_boundary_mask=doc_boundary_mask,
+                                position_ids=position_ids,
                                 pixel_values=pixel_values
                             )
 

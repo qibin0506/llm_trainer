@@ -140,6 +140,9 @@ class Parallel(ABC):
         return 1
 
     def wait(self, msg=None):
+        if self.world_size == 1:
+            return
+
         msg = f' for {msg}' if msg else ''
         log(f'wait at {self.device}{msg}')
         dist.barrier()

@@ -3,7 +3,10 @@ from contextlib import nullcontext
 import torch
 from llm_model import VlmModel, KVCache
 from .tools import TrainerTools
-from .utils import batch_repeat_image_tok
+from .utils import (
+    autocastcontext,
+    batch_repeat_image_tok
+)
 
 
 def _suppress_warper(logits: torch.Tensor, suppress_tokens: List[int]) -> torch.Tensor:
@@ -124,13 +127,7 @@ def _generate(
     如果temperature很大但内容单一，需要增大k、p
     """
     use_kv_cache = True
-
-    ctx = torch.autocast(
-        device_type=device,
-        dtype=TrainerTools().dtype,
-        enabled=True,
-        cache_enabled=None
-    ) if TrainerTools().use_amp else nullcontext()
+    ctx = autocastcontext(device)
 
     if isinstance(model, VlmModel):
         tokens = batch_repeat_image_tok(tokens, tokens_per_image)
@@ -330,13 +327,7 @@ def batch_generate(
         device: Union[str, torch.device, int]
 ):
     use_kv_cache = True
-
-    ctx = torch.autocast(
-        device_type=device,
-        dtype=TrainerTools().dtype,
-        enabled=True,
-        cache_enabled=None
-    ) if TrainerTools().use_amp else nullcontext()
+    ctx = autocastcontext(device)
 
     if isinstance(model, VlmModel):
         tokens = batch_repeat_image_tok(tokens, tokens_per_image)

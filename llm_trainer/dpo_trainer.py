@@ -1,4 +1,3 @@
-import time
 from typing import Tuple, List, Optional
 import torch
 from torch.utils.data import Dataset
@@ -11,7 +10,10 @@ from .train_configs import TrainConfig
 from .dataset import DPODataset
 from .loss import DPOLoss
 from .tools import TrainerTools
-from .utils import get_dpo_collate_fn
+from .utils import (
+    autocastcontext,
+    get_dpo_collate_fn
+)
 from .partition_utils import sync_model_params
 
 from .checkpoint import (
@@ -34,7 +36,7 @@ class DPOTrainer(Trainer):
             eval_prompts=eval_prompts,
             eval_image_tags=eval_image_tags
         )
-
+        self.packed_sequences = False
         self.ref_model = self._init_ref_model()
 
     def _init_ref_model(self):
@@ -201,7 +203,7 @@ class DPOTrainer(Trainer):
                         if TrainerTools().parallel.parallel_train:
                             self.train_model.require_backward_grad_sync = need_update_grad
 
-                        with self.ctx:
+                        with autocastcontext(TrainerTools().parallel.device_type):
                             policy_outputs = self.train_model(concat_inputs, attention_mask=concat_mask)
                             policy_probs = self._logprobs(policy_outputs['logits'], concat_labels, concat_mask)
                             aux_loss = policy_outputs.get('aux_loss')

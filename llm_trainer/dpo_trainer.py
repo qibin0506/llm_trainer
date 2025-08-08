@@ -11,7 +11,7 @@ from .dataset import DPODataset
 from .loss import DPOLoss
 from .tools import TrainerTools
 from .utils import (
-    autocastcontext,
+    autocast,
     get_dpo_collate_fn
 )
 from .partition_utils import sync_model_params
@@ -203,7 +203,7 @@ class DPOTrainer(Trainer):
                         if TrainerTools().parallel.parallel_train:
                             self.train_model.require_backward_grad_sync = need_update_grad
 
-                        with autocastcontext(TrainerTools().parallel.device_type):
+                        with autocast(TrainerTools().parallel.device_type):
                             policy_outputs = self.train_model(concat_inputs, attention_mask=concat_mask)
                             policy_probs = self._logprobs(policy_outputs['logits'], concat_labels, concat_mask)
                             aux_loss = policy_outputs.get('aux_loss')

@@ -4,7 +4,7 @@ import torch
 from llm_model import VlmModel, KVCache
 from .tools import TrainerTools
 from .utils import (
-    autocastcontext,
+    autocast,
     batch_repeat_image_tok
 )
 
@@ -127,7 +127,6 @@ def _generate(
     如果temperature很大但内容单一，需要增大k、p
     """
     use_kv_cache = True
-    ctx = autocastcontext(device)
 
     if isinstance(model, VlmModel):
         tokens = batch_repeat_image_tok(tokens, tokens_per_image)
@@ -141,7 +140,7 @@ def _generate(
     with torch.inference_mode():
         for _ in range(max_new_tokens):
             t = tokens # tokens[:, -max_position_embeddings:]
-            with ctx:
+            with autocast(device):
                 result = model(
                     t,
                     past_key_values=kv_cache,
@@ -327,7 +326,6 @@ def batch_generate(
         device: Union[str, torch.device, int]
 ):
     use_kv_cache = True
-    ctx = autocastcontext(device)
 
     if isinstance(model, VlmModel):
         tokens = batch_repeat_image_tok(tokens, tokens_per_image)
@@ -350,7 +348,7 @@ def batch_generate(
                 break
 
             t = tokens #tokens[:, -max_position_embeddings:]
-            with ctx:
+            with autocast(device):
                 result = model(
                     t,
                     attention_mask=attention_mask,

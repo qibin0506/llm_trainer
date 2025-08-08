@@ -36,7 +36,7 @@ from .checkpoint import (
 
 from .utils import (
     set_seed,
-    autocastcontext,
+    autocast,
     create_doc_boundary_mask,
     generate_position_ids,
     pretrain_collate_fn,
@@ -556,7 +556,7 @@ class Trainer:
                         if TrainerTools().parallel.parallel_train:
                             self.train_model.require_backward_grad_sync = need_update_grad
 
-                        with autocastcontext(TrainerTools().parallel.device_type):
+                        with autocast(TrainerTools().parallel.device_type):
                             result = self.train_model(
                                 inputs,
                                 attention_mask=attention_mask,

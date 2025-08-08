@@ -15,7 +15,7 @@ def set_seed(seed=42):
     torch.cuda.manual_seed_all(seed)
 
 
-def autocastcontext(device_type):
+def autocast(device_type):
     if TrainerTools().use_amp:
         dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
         return torch.autocast(

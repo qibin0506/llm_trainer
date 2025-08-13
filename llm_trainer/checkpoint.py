@@ -2,6 +2,7 @@ import os
 from typing import Optional, Union, Tuple
 import shutil
 import torch
+from sympy import false
 from torch import nn
 from torch.optim import Optimizer
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -36,6 +37,10 @@ def save_best_checkpoint(
         current_loss: float,
         last_best_checkpoint_loss: Optional[float] = None
 ) -> bool:
+    # 指定不保存最佳checkpoint
+    if os.environ.get('SAVE_BEST_CHECKPOINT', '1') != '1':
+        return False
+
     need_replace = not last_best_checkpoint_loss or current_loss <= last_best_checkpoint_loss
     if need_replace and TrainerTools().parallel.is_main_process:
         try:
@@ -62,8 +67,7 @@ def save_best_checkpoint(
                         os.remove(best_checkpoint_name)
 
                     shutil.copy2(checkpoint_name, best_checkpoint_name)
-        except:
-            pass
+        except: pass
 
     TrainerTools().parallel.wait('save best checkpoint')
     return need_replace

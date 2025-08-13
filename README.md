@@ -43,7 +43,8 @@ def init_env():
     os.environ['CHECKPOINT_NAME'] = 'ckpt.pth'
     os.environ['EVAL_CHECKPOINT_NAME'] = 'eval_ckpt.pth'
 
-    # os.environ['DTYPE'] = 'float32'
+    os.environ['CKPT_MAX_TO_KEEP'] = '2'
+    os.environ['SAVE_BEST_CHECKPOINT'] = '1' # or '0'
 
 
 def get_model_config(long_context = False):

@@ -28,9 +28,11 @@ def save_ds_checkpoint(model: nn.Module):
 
     # 只在main rank上执行
     if TrainerTools().parallel.is_main_process:
+        # 最多保存多少checkpoint，默认为2
+        max_to_keep = int(os.environ.get('CKPT_MAX_TO_KEEP', '2'))
         # 删除历史checkpoint
         ckpt_paths = glob(os.path.join(ckpt_dir, "global_*"))
-        if len(ckpt_paths) > 2:
+        if len(ckpt_paths) > max_to_keep:
             # 按修改时间排序，找到最旧的目录
             oldest_ckpt = sorted(ckpt_paths, key=os.path.getmtime)[0]
             try:

@@ -1,8 +1,7 @@
 import os
-from typing import Optional, Union, Tuple
+from typing import Optional, Union
 import shutil
 import torch
-from sympy import false
 from torch import nn
 from torch.optim import Optimizer
 from torch.nn.parallel import DistributedDataParallel as DDP

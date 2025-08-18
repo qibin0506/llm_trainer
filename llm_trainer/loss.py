@@ -2,7 +2,6 @@ from typing import List, Optional
 import torch
 from torch import nn
 import torch.nn.functional as F
-from .tools import TrainerTools
 
 
 class LMLoss(nn.Module):
@@ -127,7 +126,8 @@ class GRPOLoss(nn.Module):
     def __init__(
             self,
             beta: float,
-            clip_eps: float,
+            clip_eps_low: float,
+            clip_eps_high: Optional[float] = None,
             delta: Optional[float] = None,
             importance_sampling_level: str = 'token',
             loss_type: str = 'grpo',
@@ -136,7 +136,8 @@ class GRPOLoss(nn.Module):
         super().__init__()
 
         self.beta = beta
-        self.clip_eps = clip_eps
+        self.clip_eps_low = clip_eps_low
+        self.clip_eps_high = clip_eps_high if clip_eps_high else clip_eps_low
         self.delta = delta
         self.importance_sampling_level = importance_sampling_level
         self.loss_type = loss_type
@@ -166,7 +167,7 @@ class GRPOLoss(nn.Module):
             log_importance_weights = log_ratio
 
         coef_1 = torch.exp(log_importance_weights)
-        coef_2 = torch.clamp(coef_1, 1 - self.clip_eps, 1 + self.clip_eps)
+        coef_2 = torch.clamp(coef_1, 1 - self.clip_eps_low, 1 + self.clip_eps_high)
 
         # Two-sided clipping
         if self.delta is not None:

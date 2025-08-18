@@ -138,10 +138,11 @@ class GRPOConfig:
     grpo_steps: int = 1
     group_size: int = 12
     mixup_alpha: float = 1.0
-    loss_beta: float = 0.04
-    loss_clip_eps: float = 0.1
+    loss_beta: float = 0.0 # or 0.04 for grpo
+    loss_clip_eps: float = 3e-4
+    loss_clip_eps_high: Optional[float] = 4e-4
     loss_delta: Optional[float] = None
-    loss_importance_sampling_level: str = 'token' # token or seq
+    loss_importance_sampling_level: str = 'seq' # token or seq
     loss_type: str = 'grpo' # grpo or bnpo or dr_grpo
     gen_max_new_tokens: Optional[int] = None
     gen_temperature: Optional[float] = None

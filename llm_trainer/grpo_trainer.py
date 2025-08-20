@@ -50,6 +50,10 @@ class GRPOTrainer(Trainer):
         self._use_origin_pad_sequence = True
 
     def _init_ref_model(self):
+        # beta == 0，不需要ref_model
+        if self.train_config.grpo_config.loss_beta == 0.0:
+            return None
+
         ref_model = self._new_model(self.train_config)
 
         ref_model, _ = TrainerTools().parallel.process(
@@ -230,8 +234,11 @@ class GRPOTrainer(Trainer):
             # Compute old_log_probs from the current model, with gradients disabled.
             old_log_probs, _ = self._compute_log_probabilities(generate_model, input_ids, attention_mask, logits_to_keep)
 
-            # Compute ref_log_probs from the reference model, which remains static.
-            ref_log_probs, _ = self._compute_log_probabilities(self.ref_model, input_ids, attention_mask, logits_to_keep)
+            if self.ref_model:
+                # Compute ref_log_probs from the reference model, which remains static.
+                ref_log_probs, _ = self._compute_log_probabilities(self.ref_model, input_ids, attention_mask, logits_to_keep)
+            else:
+                ref_log_probs = None
 
         repeated_prompts = [p for p in prompts for _ in range(group_size)]
         repeated_answers = [a for a in answers for _ in range(group_size)]
@@ -294,11 +301,12 @@ class GRPOTrainer(Trainer):
         aux_loss_coef = self.train_config.loss_config.aux_loss_coef
 
         for epoch in range(self.train_config.n_epochs):
-            sync_model_params(
-                _from=self.train_model,
-                _to=self.ref_model,
-                mixup_alpha=self.train_config.grpo_config.mixup_alpha
-            )
+            if self.ref_model:
+                sync_model_params(
+                    _from=self.train_model,
+                    _to=self.ref_model,
+                    mixup_alpha=self.train_config.grpo_config.mixup_alpha
+                )
 
             file_count = len(self.train_config.file_dataset)
 
@@ -366,7 +374,7 @@ class GRPOTrainer(Trainer):
                             self._log_loss(
                                 epoch_tag=f'epoch: {epoch}',
                                 file_tag=f'file: {file_idx + 1}/{file_count}',
-                                batch_tag=f'batch: {batch}/{batch_count_per_file}',
+                                batch_tag=f'batch: {batch}/{batch_count_per_file}, grpo_step={grpo_step}',
                                 loss=current_loss
                             )
                     except Exception as e:

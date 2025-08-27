@@ -2,8 +2,23 @@
 
 if __name__ == '__main__':
     import os, sys, torch
+
     arguments = sys.argv[1:]
+    # file name
     run_file_name = arguments[0]
+
+    # cuda_visible_devive
+    if len(arguments) > 1:
+        # 0,1,2,3
+        cuda_visible_devive = arguments[1]
+    else:
+        cuda_visible_devive = None
+
+    # cuda location
+    if len(arguments) > 2:
+        cuda_loc = arguments[2]
+    else:
+        cuda_loc = 'localhost'
 
     try:
         import deepspeed
@@ -18,11 +33,14 @@ if __name__ == '__main__':
     os.environ['PARALLEL_TYPE'] = parallel_type
 
     if parallel_type == 'ds':
-        command = f'deepspeed {run_file_name}'
+        cuda_ctrl = f' --include {cuda_loc}:{cuda_visible_devive}' if cuda_visible_devive else ''
+        command = f'deepspeed{cuda_ctrl} {run_file_name}'
     elif parallel_type == 'ddp':
+        if cuda_visible_devive:
+            os.environ['CUDA_VISIBLE_DEVICES'] = cuda_visible_devive
         command = f'torchrun --standalone --nproc_per_node=gpu {run_file_name}'
     else:
         command = f'python3 {run_file_name}'
 
-    print(f'real command is {command}')
+    print(f'run command {command}')
     os.system(command)

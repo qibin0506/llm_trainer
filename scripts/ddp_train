@@ -3,10 +3,22 @@
 if __name__ == '__main__':
     import os, sys
     arguments = sys.argv[1:]
+    # file_name
     run_file_name = arguments[0]
 
+    # cuda_visible_devive
+    if len(arguments) > 1:
+        # 0,1,2,3
+        cuda_visible_devive = arguments[1]
+    else:
+        cuda_visible_devive = None
+
     os.environ['PARALLEL_TYPE'] = 'ddp'
+
+    if cuda_visible_devive:
+        os.environ['CUDA_VISIBLE_DEVICES'] = cuda_visible_devive
+
     command = f'torchrun --standalone --nproc_per_node=gpu {run_file_name}'
 
-    print(f'real command is {command}')
+    print(f'run command {command}')
     os.system(command)

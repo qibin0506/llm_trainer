@@ -12,7 +12,8 @@ from .loss import DPOLoss
 from .tools import TrainerTools
 from .utils import (
     autocast,
-    get_dpo_collate_fn
+    get_dpo_collate_fn,
+    fill_loss_mask
 )
 from .partition_utils import sync_model_params
 
@@ -84,7 +85,6 @@ class DPOTrainer(Trainer):
     def _calc_loss(self, inputs, attention_mask, logits, labels): ...
 
     def _log_probs_from_logits(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        # https://github.com/OpenRLHF/OpenRLHF/pull/718#issuecomment-2641081881
         if logits.dtype in [torch.float32, torch.float64]:
             logits_labels = torch.gather(logits, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
             logsumexp_values = torch.stack(
@@ -102,25 +102,26 @@ class DPOTrainer(Trainer):
         return log_probs_labels
 
 
-    def _logprobs(self, logits, labels, mask):
+    def _logprobs(self, logits, labels, attention_mask):
         """
         Calculate the average log probabilities for a batch of sequences.
 
         Args:
             logits (torch.Tensor): Logits from the model with shape (B, T, V)
             labels (torch.Tensor): Ground truth labels with shape (B, T).
-            mask (torch.Tensor): Mask tensor with shape (B, T) indicating
+            attention_mask (torch.Tensor): Mask tensor with shape (B, T) indicating
                 which tokens are not padding (1 for valid tokens, 0 for padding).
 
         Returns:
             torch.Tensor: Average log probabilities for each sequence in the batch.
                           Shape is (B,) representing the mean log probability for each sequence.
         """
-        labels = labels[:, 1:].clone()
-        logits = logits[:, :-1, :]
+        loss_masks = attention_mask.clone().bool()
+        loss_masks = fill_loss_mask(loss_masks, labels)
 
-        # # Shift mask right by one to align with labels
-        mask = mask[:, 1:].clone()
+        logits = logits[:, :-1, :]
+        labels = labels[:, 1:].clone()
+        loss_masks = loss_masks[:, 1:]
 
         # dummy token; we'll ignore the losses on these tokens later
         labels[labels == -100] = 0
@@ -129,11 +130,10 @@ class DPOTrainer(Trainer):
         per_token_logps = self._log_probs_from_logits(logits, labels)
 
         # Apply the mask to set log-probs of padding tokens to 0
-        logprobs_sums = (per_token_logps * mask).sum(-1)
+        logprobs_sums = (per_token_logps * loss_masks).sum(-1)
+        logprobs_means = (per_token_logps * loss_masks).sum(-1) / loss_masks.sum(-1)
 
-        # logprobs_means = (per_token_logps * mask).sum(-1) / mask.sum(-1)
-
-        return logprobs_sums #, -logprobs_means.mean()
+        return logprobs_sums, logprobs_means
 
     def train(self):
         # 梯度累积步数
@@ -147,6 +147,7 @@ class DPOTrainer(Trainer):
         last_best_checkpoint_loss: Optional[float] = None
 
         aux_loss_coef = self.train_config.loss_config.aux_loss_coef
+        nll_loss_coef = self.train_config.dpo_config.nll_loss_coef
 
         for epoch in range(self.train_config.n_epochs):
             self.train_model.train()
@@ -188,35 +189,52 @@ class DPOTrainer(Trainer):
                     try:
                         chosen_inputs: torch.Tensor = batch_data['chosen_inputs'].to(TrainerTools().parallel.device)
                         chosen_labels: torch.Tensor = batch_data['chosen_labels'].to(TrainerTools().parallel.device)
+
                         rejected_inputs: torch.Tensor = batch_data['rejected_inputs'].to(TrainerTools().parallel.device)
                         rejected_labels: torch.Tensor = batch_data['rejected_labels'].to(TrainerTools().parallel.device)
 
-                        chosen_attention_mask: torch.Tensor = chosen_inputs != TrainerTools().tokenizer.pad
-                        rejected_attention_mask: torch.Tensor = rejected_inputs != TrainerTools().tokenizer.pad
+                        chosen_attention_masks: torch.Tensor = chosen_inputs != TrainerTools().tokenizer.pad
+                        rejected_attention_masks: torch.Tensor = rejected_inputs != TrainerTools().tokenizer.pad
 
                         # 在batch维度concat
                         # [chosen, chosen, reject, reject]
                         concat_inputs = torch.concat([chosen_inputs, rejected_inputs], dim=0)
                         concat_labels = torch.concat([chosen_labels, rejected_labels], dim=0)
-                        concat_mask = torch.concat([chosen_attention_mask, rejected_attention_mask], dim=0)
+                        concat_attention_masks = torch.concat([chosen_attention_masks, rejected_attention_masks], dim=0)
 
                         if TrainerTools().parallel.parallel_train:
                             self.train_model.require_backward_grad_sync = need_update_grad
 
                         with autocast(TrainerTools().parallel.device_type):
-                            policy_outputs = self.train_model(concat_inputs, attention_mask=concat_mask)
-                            policy_probs = self._logprobs(policy_outputs['logits'], concat_labels, concat_mask)
+                            policy_outputs = self.train_model(concat_inputs, attention_mask=concat_attention_masks)
+                            policy_logprobs_sums, policy_logprobs_means = self._logprobs(policy_outputs['logits'], concat_labels, concat_attention_masks)
                             aux_loss = policy_outputs.get('aux_loss')
 
                             with torch.no_grad():
-                                ref_outputs = self.ref_model(concat_inputs, attention_mask=concat_mask)
-                                ref_probs = self._logprobs(ref_outputs['logits'], concat_labels, concat_mask)
+                                ref_outputs = self.ref_model(concat_inputs, attention_mask=concat_attention_masks)
+                                ref_logprobs_sums, _ = self._logprobs(ref_outputs['logits'], concat_labels, concat_attention_masks)
+
+                            policy_chosen_logps = policy_logprobs_sums[:chosen_inputs.shape[0]]
+                            policy_rejected_logps = policy_logprobs_sums[chosen_inputs.shape[0]:]
+
+                            ref_chosen_logps = ref_logprobs_sums[:chosen_inputs.shape[0]]
+                            ref_rejected_logps = ref_logprobs_sums[chosen_inputs.shape[0]:]
+
+                            nll_loss = -policy_logprobs_means[:chosen_inputs.shape[0]].mean()
 
                             # calc loss
-                            loss = self.criterion(policy_probs, ref_probs)
+                            loss = self.criterion(
+                                policy_chosen_logps,
+                                policy_rejected_logps,
+                                ref_chosen_logps,
+                                ref_rejected_logps
+                            )
 
                             if aux_loss_coef and aux_loss:
                                 loss += aux_loss_coef * aux_loss
+
+                            if nll_loss_coef and nll_loss:
+                                loss += nll_loss_coef * nll_loss
 
                         if gradient_accumulation_steps > 1:
                             loss = loss / gradient_accumulation_steps

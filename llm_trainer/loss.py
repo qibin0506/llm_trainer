@@ -92,17 +92,13 @@ class DPOLoss(nn.Module):
 
     def forward(
             self,
-            policy_logps: torch.Tensor,
-            reference_logps: torch.Tensor,
+            policy_chosen_logps: torch.Tensor,
+            policy_reject_logps: torch.Tensor,
+            ref_chosen_logps: torch.Tensor,
+            ref_reject_logps: torch.Tensor
     ) -> torch.Tensor:
-        batch_size = reference_logps.shape[0]
-        ref_chosen_probs = reference_logps[:batch_size//2]
-        ref_reject_probs = reference_logps[batch_size//2:]
-        policy_chosen_probs = policy_logps[:batch_size//2]
-        policy_reject_probs = policy_logps[batch_size//2:]
-
-        pi_logratios = policy_chosen_probs - policy_reject_probs
-        ref_logratios = ref_chosen_probs - ref_reject_probs
+        pi_logratios = policy_chosen_logps - policy_reject_logps
+        ref_logratios = ref_chosen_logps - ref_reject_logps
         logits = pi_logratios - ref_logratios
 
         if self.ipo:

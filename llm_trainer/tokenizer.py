@@ -3,7 +3,7 @@ import warnings
 from typing import List, Dict, Union
 from transformers import Qwen2TokenizerFast
 from transformers import AddedToken
-from transformers import LlamaTokenizer, LlamaTokenizerFast
+from transformers import LlamaTokenizerFast
 import torch
 
 TOKEN_TYPE_QWEN = 'qwen'
@@ -163,4 +163,19 @@ class Tokenizer:
             return self.encode(chat_template, unsqueeze, covert_tensor)
 
         return chat_template
+
+    def get_special_tokens_dict(self):
+        return {
+            self.text_end: self.end,
+            self.text_pad: self.pad,
+            self.text_unk: self.unk,
+            self.text_user: self.user,
+            self.text_assistant: self.assistant,
+            self.text_think_start: self.think_start,
+            self.text_think_end: self.think_end,
+            self.text_answer_start: self.answer_start,
+            self.text_answer_end: self.answer_end,
+            self.text_system: self.system,
+            self.text_image: self.image,
+        }
 

@@ -10,14 +10,15 @@ if __name__ == '__main__':
     if len(arguments) > 1:
         # 0,1,2,3
         cuda_visible_devive = arguments[1]
+
+        # cuda location
+        if len(arguments) > 2:
+            cuda_loc = arguments[2]
+        else:
+            cuda_loc = 'localhost'
     else:
         cuda_visible_devive = None
-
-    # cuda location
-    if len(arguments) > 2:
-        cuda_loc = arguments[2]
-    else:
-        cuda_loc = 'localhost'
+        cuda_loc = None
 
     os.environ['PARALLEL_TYPE'] = 'ds'
 

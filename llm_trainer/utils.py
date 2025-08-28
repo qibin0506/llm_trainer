@@ -154,16 +154,22 @@ def batch_repeat_image_tok(
 
 
 def pretrain_collate_fn(batch_data):
-    inputs, labels = _pad_sequence(batch_data)
+    # [[x,x,x], [y,y,y]]
+    inputs = pad_sequence(batch_data, batch_first=True, padding_value=TrainerTools().tokenizer.pad)
+    # crossEntropy默认的ignore_index是-100
+    labels = pad_sequence(batch_data, batch_first=True, padding_value=-100)
 
     # inputs, labels
-    return {'inputs': inputs, 'labels': labels}
+    return {
+        'inputs': inputs,
+        'labels': labels
+    }
 
 
 def get_sft_collate_fn(mask_prompt: bool):
     def sft_collate_fn(batch_data):
         """
-         如果是sft，则不计算prompt部分的loss, 例如：
+        如果是sft，则不计算prompt部分的loss, 例如：
         logits: [USER]你好[BOT]我好[SEP]
         labels: [USER]你好[BOT]我好[SEP]
 
@@ -184,11 +190,19 @@ def get_sft_collate_fn(mask_prompt: bool):
             batch_train_data.append(item['inputs'])
             image_tags.append(item['image_tag'])
 
-        inputs, labels = _pad_sequence(batch_train_data)
+        # [[x,x,x], [y,y,y]]
+        inputs = pad_sequence(batch_train_data, batch_first=True, padding_value=TrainerTools().tokenizer.pad)
+        # crossEntropy默认的ignore_index是-100
+        labels = pad_sequence(batch_train_data, batch_first=True, padding_value=-100)
+
         if mask_prompt:
             labels = _mask_prompt(labels)
 
-        return {'inputs': inputs, 'labels': labels, 'image_tags': image_tags}
+        return {
+            'inputs': inputs,
+            'labels': labels,
+            'image_tags': image_tags
+        }
 
     return sft_collate_fn
 
@@ -295,13 +309,24 @@ def join_batch(batch_data: list[dict]) -> dict:
     return result
 
 
-def _pad_sequence(batch_data):
-    # [[x,x,x], [y,y,y]]
-    inputs = pad_sequence(batch_data, batch_first=True, padding_value=TrainerTools().tokenizer.pad)
-    # crossEntropy默认的ignore_index是-100
-    labels = pad_sequence(batch_data, batch_first=True, padding_value=-100)
+def fill_loss_mask(loss_masks, labels):
+    """
+    将loss_mask中prompt部分强制设置为False
+    loss_masks: shape  (B, T)
+    labels: shape (B, T)
+    """
+    tokenizer = TrainerTools().tokenizer
+    # 支持多轮会话的mask
+    for batch, label in enumerate(labels):
+        start_index = -1
+        for index, token in enumerate(label):
+            if token == tokenizer.system or token == tokenizer.user:
+                start_index = index
+            elif token == tokenizer.end and start_index != -1:
+                loss_masks[batch, start_index:index + 1] = False
+                start_index = -1
 
-    return inputs, labels
+    return loss_masks
 
 
 def _mask_prompt(labels):

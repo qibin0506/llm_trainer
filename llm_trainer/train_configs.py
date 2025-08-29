@@ -107,7 +107,8 @@ class DataLoaderConfig:
 
 
 @dataclass(kw_only=True)
-class LrConfig:
+class OptimConfig:
+    optim_type: str = 'adam' # or 'lion'
     enable_lr_scheduler: bool = False
     initial_lr: float
     weight_decay: float = 0.1
@@ -195,8 +196,8 @@ class TrainConfig:
                 grpo训练时不生效该配置！
             eval_batch_interval (`int`, default is 100):
                 每隔多少个batch进行模型eval
-            lr_config (`LrConfig`):
-                lr配置项
+            optim_config (`OptimConfig`):
+                optim配置项
             data_loader_config: (`DataLoaderConfig`):
                 data loader配置项
             kd_config: (`KDConfig`, *Optional*, default is None):
@@ -213,7 +214,7 @@ class TrainConfig:
     image_tags_file_dataset: Optional[FileDataset] = None
 
     loss_config: LossConfig = field(default_factory=LossConfig)
-    lr_config: LrConfig = field(default_factory=LrConfig)
+    optim_config: OptimConfig = field(default_factory=OptimConfig)
 
     ds_config: DsConfig = field(default_factory=DsConfig)
 

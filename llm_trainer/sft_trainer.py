@@ -23,12 +23,12 @@ class SFTTrainer(Trainer):
         )
         self.packed_sequences = False
 
-    def _convert_train_args(self) -> Tuple[dict, dict, dict, bool]:
+    def _convert_train_args(self) -> Tuple[dict, dict, dict]:
         sft_collate_fn = get_sft_collate_fn(self.train_config.mask_prompt)
-        parallel_kwargs, data_loader_kwargs, sampler_kwargs, use_ds_optim = super()._convert_train_args()
+        parallel_kwargs, data_loader_kwargs, sampler_kwargs = super()._convert_train_args()
         data_loader_kwargs.update({"collate_fn": sft_collate_fn})
 
-        return parallel_kwargs, data_loader_kwargs, sampler_kwargs, use_ds_optim
+        return parallel_kwargs, data_loader_kwargs, sampler_kwargs
 
     def _create_dataset(self, file_idx) -> Tuple[Dataset, str]:
         file_path = self.train_config.file_dataset[file_idx]

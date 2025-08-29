@@ -77,19 +77,15 @@ class Trainer:
         if self.eval_image_tags:
             assert len(self.eval_prompts) == len(self.eval_image_tags)
 
-        parallel_kwargs, data_loader_kwargs, sampler_kwargs, use_ds_optim = self._convert_train_args()
-        self.parallel_kwargs = parallel_kwargs
-        self.data_loader_kwargs: dict[str, Any] = data_loader_kwargs
-        self.sampler_kwargs: dict[str, Any] = sampler_kwargs
-
+        self.parallel_kwargs, self.data_loader_kwargs, self.sampler_kwargs = self._convert_train_args()
         # initialize a GradScaler. If enabled=False scaler is a no-op
         self.scalar = torch.GradScaler(enabled=TrainerTools().use_amp)
 
         # 注意：学习率要根据GPU的数量进行倍增：
         # 在训练的过程中，损失梯度决定下降的方向，学习率决定下降的步长。如果有两块gpu，前进的综合步长为：平均学习率*2
-        initial_lr = train_config.lr_config.initial_lr
+        initial_lr = train_config.optim_config.initial_lr
 
-        self.train_model, self.optimizer = self._init_train_model_and_optim(initial_lr, parallel_kwargs, use_ds_optim)
+        self.train_model, self.optimizer = self._init_train_model_and_optim(initial_lr)
         self.lr_scheduler = self._init_lr_scheduler(initial_lr)
 
         self.criterion, self.kd_loss = self._init_loss()
@@ -127,12 +123,7 @@ class Trainer:
         freeze_llm_model = self.train_config.freeze_llm_model
         return model.parameters() if not freeze_llm_model else filter(lambda p: p.requires_grad, model.parameters())
 
-    def _init_train_model_and_optim(
-            self,
-            initial_lr: float,
-            parallel_kwargs: dict,
-            use_ds_optim: bool
-    ):
+    def _init_train_model_and_optim(self, initial_lr: float):
         model = self._new_model(self.train_config)
 
         if self.train_config.init_state_dict:
@@ -161,34 +152,58 @@ class Trainer:
             total_size_mb = total_size_bytes / (1024 * 1024)
             log(f"Total size of the model: {total_size_mb:.2f} MB")
 
-        if use_ds_optim:
-            import deepspeed
-            origin_optim = deepspeed.ops.adam.DeepSpeedCPUAdam(
-                self._get_trainable_params(model),
-                lr=initial_lr,
-                weight_decay=self.train_config.lr_config.weight_decay
-            )
-        else:
-            origin_optim = torch.optim.AdamW(
-                self._get_trainable_params(model),
-                lr=initial_lr,
-                weight_decay=self.train_config.lr_config.weight_decay
-            )
         model, optim = TrainerTools().parallel.process(
             model=model,
-            optimizer=origin_optim,
-            kwargs=parallel_kwargs
+            optimizer=self._get_optim(model, initial_lr),
+            kwargs=self.parallel_kwargs
         )
 
         return model, optim
 
+    def _get_optim(self, model, initial_lr):
+        optimizer = None
+
+        if isinstance(TrainerTools().parallel, DsParallel) and self.parallel_kwargs:
+            import deepspeed
+            if ('zero_optimization' in self.parallel_kwargs
+                    and 'offload_optimizer' in self.parallel_kwargs['zero_optimization']
+                    and self.parallel_kwargs['zero_optimization']['offload_optimizer']['device'] == 'cpu'):
+                # offline optimizer to cpu
+                # 不能使用 deepspeed.ops.lion.cpu_lion.DeepSpeedCPULion???
+                # 所以，这里忽略lion判断
+                optimizer = deepspeed.ops.adam.DeepSpeedCPUAdam
+                if self.train_config.optim_config.optim_type == 'lion':
+                    log('When set offload_optimizer, lion optim is unsupported, so set optim to adam!!!!!')
+            else:
+                if self.train_config.optim_config.optim_type == 'lion':
+                    optimizer = deepspeed.ops.lion.FusedLion
+                else:
+                    optimizer = deepspeed.ops.adam.FusedAdam
+
+        if not optimizer:
+            if self.train_config.optim_config.optim_type == 'lion':
+                try:
+                    import lion_pytorch
+                except:
+                    raise Exception('lion is not detected, please use `pip3 install lion_pytorch` to install or set optim_type to adam')
+
+                optimizer = lion_pytorch.Lion
+            else:
+                optimizer = torch.optim.AdamW
+
+        return optimizer(
+            self._get_trainable_params(model),
+            lr=initial_lr,
+            weight_decay=self.train_config.optim_config.weight_decay
+        )
+
     def _init_lr_scheduler(self, initial_lr: float) -> LRScheduler:
-        if self.train_config.lr_config.enable_lr_scheduler:
-            warmup_iters = self.train_config.lr_config.warmup_iters
-            min_lr = self.train_config.lr_config.min_lr
-            max_lr = self.train_config.lr_config.max_lr
-            cosine_annealing_period = self.train_config.lr_config.cosine_annealing_period
-            cosine_annealing_period_mul = self.train_config.lr_config.cosine_annealing_period_mul
+        if self.train_config.optim_config.enable_lr_scheduler:
+            warmup_iters = self.train_config.optim_config.warmup_iters
+            min_lr = self.train_config.optim_config.min_lr
+            max_lr = self.train_config.optim_config.max_lr
+            cosine_annealing_period = self.train_config.optim_config.cosine_annealing_period
+            cosine_annealing_period_mul = self.train_config.optim_config.cosine_annealing_period_mul
 
             return WarmupCosineAnnealingLRScheduler(
                 optimizer=self.optimizer,
@@ -220,9 +235,8 @@ class Trainer:
 
         return criterion, kd_loss
 
-    def _convert_train_args(self) -> Tuple[dict, dict, dict, bool]:
+    def _convert_train_args(self) -> Tuple[dict, dict, dict]:
         parallel_kwargs: Optional[Dict[str, Any]] = None
-        use_ds_optim: bool = False
         if isinstance(TrainerTools().parallel, DsParallel) and self.train_config.ds_config:
             parallel_kwargs = {
                 'gradient_accumulation_steps': 1,
@@ -253,7 +267,6 @@ class Trainer:
                             "device": zero_config.offload_optimizer.device,
                             "pin_memory": zero_config.offload_optimizer.pin_memory
                         }
-                        use_ds_optim = True
                     if zero_config.offload_param is not None:
                         zero_optimization['offload_param'] = {
                             "device": zero_config.offload_param.device,
@@ -328,10 +341,10 @@ class Trainer:
             "drop_last": dataloader_args.data_loader_drop_last,
         }
 
-        return parallel_kwargs, data_loader_kwargs, sampler_kwargs, use_ds_optim
+        return parallel_kwargs, data_loader_kwargs, sampler_kwargs
 
     def _init_ref_model_args(self) -> dict:
-        parallel_kwargs = copy.deepcopy(self.parallel_kwargs)
+        parallel_kwargs = copy.deepcopy(self.parallel_kwargs) if self.parallel_kwargs else None
 
         if parallel_kwargs and isinstance(TrainerTools().parallel, DsParallel):
             # reference to https://github.com/huggingface/trl/blob/main/trl/models/utils.py:prepare_deepspeed

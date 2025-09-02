@@ -448,7 +448,7 @@ class Trainer:
         exception_file = e.__traceback__.tb_frame.f_globals["__file__"]
         exception_line = e.__traceback__.tb_lineno
         log_msg = f"epoch: {epoch}, batch: {batch}, {e} at {exception_file} line {exception_line}\n"
-        log(log_msg, f'{log_dir}log.txt')
+        log(log_msg, f'{log_dir}exception.txt')
 
         raise e
 

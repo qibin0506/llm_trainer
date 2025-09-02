@@ -305,3 +305,21 @@ if __name__ == '__main__':
 
     trainer.train()
 ```
+
+## 推理
+``` python
+from llm_trainer import TrainerTools, streaming_generate
+generator = streaming_generate(
+                model=model,
+                prompt=prompt_token,
+                max_position_embeddings=2048,
+                max_new_tokens=2048,
+                temperature=temperature,
+                k=None,
+                p=top_p,
+                device=device
+            )
+
+for chunk in generator:
+    print(chunk)
+```

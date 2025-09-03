@@ -226,7 +226,7 @@ def get_dpo_config():
     )
 ```
 
-### 开始训练
+### 训练入口
 
 预训练
 ``` python
@@ -306,6 +306,16 @@ if __name__ == '__main__':
     trainer.train()
 ```
 
+### 开启训练
+|  训练命令 | 解释 | 实例 |
+| --- | --- | --- |
+| smart_train | 会优先使用`deepspeed`，未安装`deepspeed`时会自动降级到`ddp`训练 | smart_train train_pretrain.py |
+| ds_train | 使用`deepspeed`训练 | ds_train train_pretrain.py |
+| ddp_train | 使用`ddp`训练 | ddp_train train_pretrain.py |
+
+* 建议使用`smart_train train_pretrain.py`开启训练
+
+
 ## 推理
 ``` python
 from llm_trainer import TrainerTools, streaming_generate
@@ -323,3 +333,59 @@ generator = streaming_generate(
 for chunk in generator:
     print(chunk)
 ```
+
+## 其他功能
+
+### TrainerTools使用
+TrainerTools是一个单例类，可以在外部环境使用训练中的一些实例。
+
+`TrainerTools().parallel`可以获取当前训练中正在使用的并行方式，例如在多卡训练时判断是否为主进程：`if TrainerTools().parallel.is_main_process: print(log)`。
+
+`TrainerTools().tokenizer`可以获取当前训练中正在使用的tokenizer，可以参考下面Tokenizer使用方法。
+
+### Tokenizer
+``` python
+# encode to token id
+TrainerTools().tokenizer.encode('hello world') # return [0, 1, 2...]
+TrainerTools().tokenizer.encode('hello world', unsqueeze=True) # return torch.tensor([[0, 1, 2...]])
+TrainerTools().tokenizer.encode('hello world', covert_tensor=True) # return torch.tensor([0, 1, 2...])
+
+# decode from token id
+TrainerTools().tokenizer.decode(torch.tensor([1, 2, 3])) # return hello world
+
+# apply chat template
+template = [
+        {'role': 'system', 'content': 'system'},
+        {'role': 'user', 'content': 'user'},
+        {'role': 'assistant', 'content': '<think>think</think><answer>answer</answer>'},
+        {'role': 'assistant', 'think': 'think2', 'content': 'answer2'}
+    ]
+
+encoded_template = TrainerTools().tokenizer.apply_chat_template(template) # return [0, 1, 2, 3]
+encoded_template = TrainerTools().tokenizer.apply_chat_template(template, add_answer_tag_for_assistant=True) # 会在content中添加<answer></answer>标签，如果原始数据中已经包含，可以不指定encoded_template = TrainerTools().tokenizer.apply_chat_template(template, unsqueeze=True) # return torch.tensor([[0, 1, 2, 3]])
+TrainerTools().tokenizer.apply_chat_template(template, covert_tensor=True) # return torch.tensor([0, 1, 2, 3])
+```
+
+### 内置脚本
+项目内置多个方便用户使用的脚本，除上面提到的`smart_train`、`ds_train`、`ddp_train`外，还有以下脚本可以使用
+|  脚本 | 解释 | 实例 |
+| --- | --- | --- |
+| plot_loss | 绘制训练loss曲线，将loss可视化 | plot_loss ./log/log.txt |
+| plot_lr | 绘制训练lr曲线，将学习率可视化 | plot_lr ./log/lr.txt |
+| calc_intermediate_size | 根据hidden_size计算intermediate_size | calc_intermediate_size 1024 # 结果为2752 |
+
+### 调整断点续训
+本项目自动支持断点续训，大部分情况下无需手动干预，但是有时候也有干预的需求，例如：我训练到最后的时候崩溃了，这个时候我其实不想等待断点续训的，而是把前面训练的文件全部注释掉，使用固定的lr把最后这部分文件训练完成，这个时候可以通过修改steps.pt完成。
+
+``` python
+ckpt = torch.load('./log/steps.pt', weights_only=True)
+ckpt['global_steps'] = 0 # 重置训练步数
+ckpt['cur_lr'] = 0.0018589864724561254 # 指定当前lr
+ckpt['lr_steps'] = 0 # 重置lr部分
+ckpt['cosine_annealing_base_lr'] = 0.002 # 重置余弦退火基础lr
+ckpt['t_cur'] = 0.002 # 重置余弦退火当前周期内已走过的步数
+ckpt['cycle'] = 0.002 # 重置余弦退火周期编号
+
+torch.save(ckpt, './log/steps.pt')
+```
+

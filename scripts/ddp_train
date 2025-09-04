@@ -6,19 +6,16 @@ if __name__ == '__main__':
     # file_name
     run_file_name = arguments[0]
 
-    # cuda_visible_devive
+    extra_args = ''
     if len(arguments) > 1:
-        # 0,1,2,3
-        cuda_visible_devive = arguments[1]
-    else:
-        cuda_visible_devive = None
+        extra_args = f"{' '.join(arguments[1:])} "
 
     os.environ['PARALLEL_TYPE'] = 'ddp'
 
-    if cuda_visible_devive:
-        os.environ['CUDA_VISIBLE_DEVICES'] = cuda_visible_devive
+    if len(extra_args) == 0:
+        extra_args = '--standalone --nproc_per_node=gpu '
 
-    command = f'torchrun --standalone --nproc_per_node=gpu {run_file_name}'
+    command = f'torchrun {extra_args}{run_file_name}'
 
     print(f'run command {command}')
     os.system(command)

@@ -6,25 +6,12 @@ if __name__ == '__main__':
     # file_name
     run_file_name = arguments[0]
 
-    # cuda_visible_devive
+    extra_args = ''
     if len(arguments) > 1:
-        # 0,1,2,3
-        cuda_visible_devive = arguments[1]
-
-        # cuda location
-        if len(arguments) > 2:
-            cuda_loc = arguments[2]
-        else:
-            cuda_loc = 'localhost'
-    else:
-        cuda_visible_devive = None
-        cuda_loc = None
+        extra_args = f"{' '.join(arguments[1:])} "
 
     os.environ['PARALLEL_TYPE'] = 'ds'
-
-    cuda_ctrl = f' --include {cuda_loc}:{cuda_visible_devive}' if cuda_visible_devive else ''
-
-    command = f'deepspeed{cuda_ctrl} {run_file_name}'
+    command = f'deepspeed {extra_args}{run_file_name}'
 
     print(f'run command {command}')
     os.system(command)

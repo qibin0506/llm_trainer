@@ -309,9 +309,9 @@ if __name__ == '__main__':
 ### 开启训练
 |  训练命令 | 解释 | 实例 |
 | --- | --- | --- |
-| smart_train | 会优先使用`deepspeed`，未安装`deepspeed`时会自动降级到`ddp`训练 | smart_train train_pretrain.py |
-| ds_train | 使用`deepspeed`训练 | ds_train train_pretrain.py |
-| ddp_train | 使用`ddp`训练 | ddp_train train_pretrain.py |
+| smart_train | 会优先使用`deepspeed`，未安装`deepspeed`时会自动降级到`ddp`训练，支持deepspeed、ddp原生参数，需要在指定训练文件后设置 | smart_train train_pretrain.py [raw arguments] |
+| ds_train | 使用`deepspeed`训练 | ds_train train_pretrain.py [raw arguments] |
+| ddp_train | 使用`ddp`训练 | ddp_train train_pretrain.py [raw arguments] |
 
 * 建议使用`smart_train train_pretrain.py`开启训练
 

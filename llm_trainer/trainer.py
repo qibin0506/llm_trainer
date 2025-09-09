@@ -383,15 +383,19 @@ class Trainer:
 
     def _calc_loss(self, inputs, attention_mask, logits, labels):
         # calc loss
-        loss = self.criterion(logits, labels)
+        if not self.kd_loss or self.train_config.kd_config.kd_coef == 0.0:
+            # 不用计算kd_loss
+            return self.criterion(logits, labels)
 
-        # 知识蒸馏loss
-        if self.kd_loss:
-            teacher_logits = self.train_config.kd_config.teacher_logits_provider(inputs, attention_mask)
-            distil_loss = self.kd_loss(logits, teacher_logits, labels)
-            loss = (1 - self.train_config.kd_config.kd_coef) * loss + self.train_config.kd_config.kd_coef * distil_loss
+        teacher_logits = self.train_config.kd_config.teacher_logits_provider(inputs, attention_mask)
+        loss = self.kd_loss(logits, teacher_logits, labels)
 
-        return loss
+        if self.train_config.kd_config.kd_coef == 1.0:
+            # 不用计算ce loss
+            return loss
+
+        ce_loss = self.criterion(logits, labels)
+        return (1 - self.train_config.kd_config.kd_coef) * ce_loss + self.train_config.kd_config.kd_coef * loss
 
     def _backward_loss(self, loss):
         if isinstance(TrainerTools().parallel, DsParallel):

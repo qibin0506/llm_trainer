@@ -123,7 +123,7 @@ class OptimConfig:
 class LossConfig:
     critical_tokens: Optional[List[int]] = None
     critical_alpha: float = 1.0
-    aux_loss_coef: Optional[float] = 1.0
+    aux_loss_coef: Optional[float] = 0.001
 
 
 @dataclass(kw_only=True)

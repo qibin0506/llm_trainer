@@ -1,5 +1,7 @@
 from typing import Optional, Tuple, List, Dict, Any
 import copy
+import importlib.metadata
+from packaging import version
 
 import torch
 import torch.distributed as dist
@@ -168,12 +170,14 @@ class Trainer:
             if ('zero_optimization' in self.parallel_kwargs
                     and 'offload_optimizer' in self.parallel_kwargs['zero_optimization']
                     and self.parallel_kwargs['zero_optimization']['offload_optimizer']['device'] == 'cpu'):
-                # offline optimizer to cpu
-                # 不能使用 deepspeed.ops.lion.cpu_lion.DeepSpeedCPULion???
-                # 所以，这里忽略lion判断
-                optimizer = deepspeed.ops.adam.DeepSpeedCPUAdam
                 if self.train_config.optim_config.optim_type == 'lion':
-                    log('When set offload_optimizer, lion optim is unsupported, so set optim to adam!!!!!')
+                    if version.parse(importlib.metadata.version("deepspeed")) >= version.parse('0.17.6'):
+                        optimizer = deepspeed.ops.lion.DeepSpeedCPULion
+                    else:
+                        optimizer = deepspeed.ops.adam.DeepSpeedCPUAdam
+                        log('When set offload_optimizer, lion optim is unsupported, so set optim to adam!!!!!')
+                else:
+                    optimizer = deepspeed.ops.adam.DeepSpeedCPUAdam
             else:
                 if self.train_config.optim_config.optim_type == 'lion':
                     optimizer = deepspeed.ops.lion.FusedLion

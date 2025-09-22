@@ -156,14 +156,15 @@ class Trainer:
 
         model, optim = TrainerTools().parallel.process(
             model=model,
-            optimizer=self._get_optim(model, initial_lr),
+            optimizer=self._config_optim(model, initial_lr),
             kwargs=self.parallel_kwargs
         )
 
         return model, optim
 
-    def _get_optim(self, model, initial_lr):
+    def _config_optim(self, model, initial_lr):
         optimizer = None
+        use_lion_optim = self.train_config.optim_config.optim_type == 'lion'
 
         if isinstance(TrainerTools().parallel, DsParallel) and self.parallel_kwargs:
             import deepspeed
@@ -175,6 +176,7 @@ class Trainer:
                         optimizer = deepspeed.ops.lion.DeepSpeedCPULion
                     else:
                         optimizer = deepspeed.ops.adam.DeepSpeedCPUAdam
+                        use_lion_optim = False
                         log('When set offload_optimizer, lion optim is unsupported, so set optim to adam!!!!!')
                 else:
                     optimizer = deepspeed.ops.adam.DeepSpeedCPUAdam
@@ -195,10 +197,26 @@ class Trainer:
             else:
                 optimizer = torch.optim.AdamW
 
+        betas = self.train_config.optim_config.betas
+        weight_decay = self.train_config.optim_config.weight_decay
+
+        if betas is None:
+            if use_lion_optim:
+                betas = (0.95, 0.98)
+            else:
+                betas = (0.9, 0.999)
+
+        if weight_decay is None:
+            if use_lion_optim:
+                weight_decay = 0.015
+            else:
+                weight_decay = 0.01
+
         return optimizer(
             self._get_trainable_params(model),
             lr=initial_lr,
-            weight_decay=self.train_config.optim_config.weight_decay
+            betas=betas,
+            weight_decay=weight_decay
         )
 
     def _init_lr_scheduler(self, initial_lr: float) -> LRScheduler:

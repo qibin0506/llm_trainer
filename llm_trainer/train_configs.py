@@ -1,4 +1,4 @@
-from typing import Optional, Union, Callable, List, Mapping, Any
+from typing import Optional, Union, Callable, List, Mapping, Any, Tuple
 from dataclasses import dataclass, field
 
 import torch
@@ -111,7 +111,8 @@ class OptimConfig:
     optim_type: str = 'adam' # or 'lion'
     enable_lr_scheduler: bool = False
     initial_lr: float
-    weight_decay: float = 0.1
+    weight_decay: Optional[float] = None
+    betas: Optional[Tuple[float, float]] = None
     warmup_iters: Optional[int] = None
     max_lr: Optional[float] = None
     min_lr: Optional[float] = None

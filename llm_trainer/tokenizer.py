@@ -1,22 +1,15 @@
 import os
 import warnings
 from typing import List, Dict, Union
-from transformers import Qwen2TokenizerFast
-from transformers import AddedToken
-from transformers import LlamaTokenizerFast
+from transformers import AutoTokenizer
 import torch
-
-TOKEN_TYPE_QWEN = 'qwen'
-TOKEN_TYPE_ZH_LLAMA = "zh_llama"
-
-AVAILABLE_TOKEN_TYPES = [TOKEN_TYPE_QWEN, TOKEN_TYPE_ZH_LLAMA]
+from .log import log
 
 
 class Tokenizer:
-    def __init__(self, token_type: str = TOKEN_TYPE_ZH_LLAMA):
-        super().__init__()
-        assert token_type in AVAILABLE_TOKEN_TYPES, 'token type is unavailable'
-        self.token_type = token_type
+    def __init__(self):
+        self.tokenizer = AutoTokenizer.from_pretrained(os.environ['TOKEN_DIR'])
+        log(f'is fast tokenizer={self.tokenizer.is_fast}')
 
         self.text_end = '</s>'
 
@@ -35,31 +28,6 @@ class Tokenizer:
         self.text_system = '<system>'
 
         self.text_image = '<image>'
-
-        if token_type == TOKEN_TYPE_QWEN:
-            self.tokenizer = Qwen2TokenizerFast(
-                vocab_file=f"{os.environ['TOKEN_DIR']}qwen_vocab.json",
-                merges_file=f"{os.environ['TOKEN_DIR']}qwen_merges.txt",
-                unk_token=self.text_unk,
-                eos_token=self.text_end,
-                pad_token=self.text_pad
-            )
-            additional_special_tokens = [
-                AddedToken(self.text_user, lstrip=False, rstrip=False),
-                AddedToken(self.text_assistant, lstrip=False, rstrip=False),
-                AddedToken(self.text_think_start, lstrip=False, rstrip=False),
-                AddedToken(self.text_think_end, lstrip=False, rstrip=False),
-                AddedToken(self.text_answer_start, lstrip=False, rstrip=False),
-                AddedToken(self.text_answer_end, lstrip=False, rstrip=False),
-                AddedToken(self.text_system, lstrip=False, rstrip=False),
-                AddedToken(self.text_image, lstrip=False, rstrip=False),
-            ]
-
-            self.tokenizer.add_special_tokens({"additional_special_tokens": additional_special_tokens})
-        else:
-            self.tokenizer = LlamaTokenizerFast.from_pretrained(os.environ['TOKEN_DIR'])
-            # self.tokenizer = AutoTokenizer.from_pretrained(os.environ['TOKEN_DIR'])
-            # self.tokenizer = PreTrainedTokenizerFast.from_pretrained(os.environ['TOKEN_DIR'], trust_remote_code=True)
 
         self.end = self.tokenizer.convert_tokens_to_ids(self.text_end)
 
@@ -105,8 +73,15 @@ class Tokenizer:
             padding = False,
             truncation = False,
             covert_tensor: bool = False,
+            return_attention_mask: bool = False
     ) -> Union[torch.Tensor, List[List[int]]]:
-        encoded = self.tokenizer(text, padding=padding, truncation=truncation)['input_ids']
+        encoded = self.tokenizer(
+            text,
+            padding=padding,
+            truncation=truncation,
+            return_attention_mask=return_attention_mask
+        )['input_ids']
+
         if covert_tensor:
             encoded = torch.tensor(encoded, dtype=torch.long)
 

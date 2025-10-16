@@ -28,7 +28,7 @@ class TrainerTools:
 
             self.parallel = self._new_parallel()
 
-            self.tokenizer = Tokenizer(os.environ.get('TOKENIZERS_TYPE', 'zh_llama'))
+            self.tokenizer = Tokenizer()
             self.use_amp = 'cuda' in self.parallel.device and not isinstance(self.parallel, DsParallel)
 
             log(f'word_size={self.parallel.world_size}, use_amp={self.use_amp}')

@@ -89,20 +89,28 @@ class Tokenizer:
         # [x,x,x]
         encoded = self.tokenizer.encode(text, add_special_tokens=False)
 
-        # if self.token_type == TOKEN_TYPE_MISTRAL:
-        #     # 处理MISTRAL每句话前面都会增加一个29473的问题
-        #     if encoded[0] == 29473:
-        #         encoded = encoded[1:]
-
         if unsqueeze:
             # tensor: [[x,x,x]]
-            return torch.tensor(encoded).long().unsqueeze(0)
+            return torch.tensor(encoded, dtype=torch.long).unsqueeze(0)
         else:
             # tensor: # [x,x,x]
             if covert_tensor:
-                return torch.tensor(encoded).long()
+                return torch.tensor(encoded, dtype=torch.long)
 
             return encoded
+
+    def batch_encode(
+            self,
+            text: List[str],
+            padding = False,
+            truncation = False,
+            covert_tensor: bool = False,
+    ) -> Union[torch.Tensor, List[List[int]]]:
+        encoded = self.tokenizer(text, padding=padding, truncation=truncation)['input_ids']
+        if covert_tensor:
+            encoded = torch.tensor(encoded, dtype=torch.long)
+
+        return encoded
 
     def decode(
             self,

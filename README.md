@@ -384,7 +384,7 @@ TrainerTools().tokenizer.apply_chat_template(template, covert_tensor=True) # ret
 项目内置多个方便用户使用的脚本，除上面提到的`smart_train`、`ds_train`、`ddp_train`外，还有以下脚本可以使用
 |  脚本 | 解释 | 实例 |
 | --- | --- | --- |
-| plot_loss | 绘制训练loss曲线，将loss可视化 | plot_loss ./log/log.txt |
+| plot_log | 绘制训练日志曲线，包括loss、reward等 | plot_log ./log/log.txt |
 | plot_lr | 绘制训练lr曲线，将学习率可视化 | plot_lr ./log/lr.txt |
 | calc_intermediate_size | 根据hidden_size计算intermediate_size | calc_intermediate_size 1024 # 结果为2752 |
 

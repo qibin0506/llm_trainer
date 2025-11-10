@@ -1,4 +1,5 @@
 import os
+from typing import Optional
 from glob import glob
 import shutil
 from torch import nn
@@ -51,7 +52,10 @@ def load_ds_checkpoint(
 
     # 包括model、optimizer等状态
     if os.path.exists(ckpt_dir):
-        model.load_checkpoint(load_dir=ckpt_dir, load_module_only=load_module_only)
+        model.load_checkpoint(
+            load_dir=ckpt_dir,
+            load_module_only=load_module_only
+        )
 
 
 def load_ds_checkpoint_for_eval(model: nn.Module):

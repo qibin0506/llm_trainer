@@ -36,6 +36,7 @@ class DsZeROConfig:
 class DsZero0Config(DsZeROConfig):
     stage: int = field(default=0, init=False)
 
+
 @dataclass(kw_only=True)
 class DsZero1Config(DsZeROConfig):
     stage: int = field(default=1, init=False)
@@ -129,10 +130,29 @@ class LossConfig:
 
 @dataclass(kw_only=True)
 class DPOConfig:
+    ref_model_checkpoint: Mapping[str, Any]
     loss_beta: float
     loss_label_smoothing: float = 0.0
     loss_ipo: bool = False
     nll_loss_coef: Optional[float] = None
+
+
+@dataclass(kw_only=True)
+class PPOConfig:
+    ref_model_checkpoint: Mapping[str, Any]
+    value_model_checkpoint: Optional[Mapping[str, Any]] = None
+    ppo_epochs: int = 4
+    gamma: float = 1.0
+    lam: float = 0.95
+    clip_eps: float = 0.1
+    vf_coef: float = 0.5
+    kl_beta: float = 0.02
+    use_sparse_rewards: bool = True
+    gen_max_new_tokens: int
+    gen_temperature: Optional[float] = None
+    gen_k: Optional[int] = None
+    gen_p: Optional[float] = None
+    gen_suppress_tokens: Optional[list[int]] = None
 
 
 @dataclass(kw_only=True)
@@ -146,7 +166,7 @@ class GRPOConfig:
     loss_delta: Optional[float] = None
     loss_importance_sampling_level: str = 'seq' # token or seq
     loss_type: str = 'grpo' # grpo or bnpo or dr_grpo
-    gen_max_new_tokens: Optional[int] = None
+    gen_max_new_tokens: int
     gen_temperature: Optional[float] = None
     gen_k: Optional[int] = None
     gen_p: Optional[float] = None
@@ -170,7 +190,7 @@ class KDConfig:
 
 @dataclass(kw_only=True)
 class EvalConfig:
-    max_new_tokens: Optional[int] = None
+    max_new_tokens: int
     temperature: float = 1.0
     top_p: float = 0.95
     top_k: Optional[float] = None
@@ -190,6 +210,8 @@ class TrainConfig:
                 模型的配置
             file_dataset (`FileDataset`):
                 训练文件dataset
+            max_seq_len (`int`, default is None)
+                训练序列最大长度，为None时取model的max_position_embedding
             mask_prompt (`bool`)
                 指定是否mask prompt部分的token
             gradient_accumulation_steps (`int`, *Optional*, default is 0):
@@ -211,6 +233,7 @@ class TrainConfig:
     model_config: Union[ModelConfig, VLMConfig]
 
     file_dataset: FileDataset
+    max_seq_len: int
     data_loader_config: DataLoaderConfig = field(default_factory=DataLoaderConfig)
     image_tags_file_dataset: Optional[FileDataset] = None
 
@@ -221,6 +244,7 @@ class TrainConfig:
 
     kd_config: Optional[KDConfig] = None
     dpo_config: Optional[DPOConfig] = None
+    ppo_config: Optional[PPOConfig] = None
     grpo_config: Optional[GRPOConfig] = None
 
     mask_prompt: bool = True

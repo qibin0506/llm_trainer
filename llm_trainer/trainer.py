@@ -11,7 +11,7 @@ from llm_model import LlmModel, VlmModel
 from .parallel_ds import DsParallel
 from .tools import TrainerTools
 from .loss import LMLoss, KDLoss
-from .dataset import TextDataset
+from .dataset import PretrainDataset
 from .eval import submit_gen_task
 from .partition_utils import unwrap_model_for_generation
 
@@ -31,7 +31,6 @@ from .scheduler import (
 from .checkpoint import (
     load_checkpoint,
     save_checkpoint,
-    save_best_checkpoint,
     load_steps,
     save_steps,
 )
@@ -44,10 +43,7 @@ from .utils import (
     pretrain_collate_fn,
 )
 
-from .log import(
-    log,
-    get_log_dir
-)
+from .log import log
 
 class Trainer:
     def __init__(
@@ -88,7 +84,7 @@ class Trainer:
         initial_lr = train_config.optim_config.initial_lr
 
         self.train_model, self.optimizer = self._init_train_model_and_optim(initial_lr)
-        self.lr_scheduler = self._init_lr_scheduler(initial_lr)
+        self.lr_scheduler = self._init_lr_scheduler(initial_lr, self.optimizer)
 
         self.criterion, self.kd_loss = self._init_loss()
 
@@ -99,14 +95,7 @@ class Trainer:
         )
 
         steps_dict = load_steps()
-        if steps_dict:
-            self.last_global_steps = steps_dict['global_steps']
-            if not self.last_global_steps:
-                self.last_global_steps = 0
-
-            self.lr_scheduler.restore_ckpt_dict(steps_dict)
-
-            log(f'restore steps_dict = {steps_dict}')
+        self._apply_restore_ckpt(steps_dict)
 
         if isinstance(train_config.model_config, VLMConfig):
             self.pixel_values_provider = train_config.pixel_values_provider
@@ -219,7 +208,7 @@ class Trainer:
             weight_decay=weight_decay
         )
 
-    def _init_lr_scheduler(self, initial_lr: float) -> LRScheduler:
+    def _init_lr_scheduler(self, initial_lr: float, optimizer) -> LRScheduler:
         if self.train_config.optim_config.enable_lr_scheduler:
             warmup_iters = self.train_config.optim_config.warmup_iters
             min_lr = self.train_config.optim_config.min_lr
@@ -228,7 +217,7 @@ class Trainer:
             cosine_annealing_period_mul = self.train_config.optim_config.cosine_annealing_period_mul
 
             return WarmupCosineAnnealingLRScheduler(
-                optimizer=self.optimizer,
+                optimizer=optimizer,
                 warmup_iters=warmup_iters,
                 initial_lr=initial_lr,
                 min_lr=min_lr,
@@ -256,6 +245,16 @@ class Trainer:
         kd_loss = KDLoss() if self.train_config.kd_config else None
 
         return criterion, kd_loss
+
+    def _apply_restore_ckpt(self, steps_dict):
+        if steps_dict:
+            self.last_global_steps = steps_dict['global_steps']
+            if not self.last_global_steps:
+                self.last_global_steps = 0
+
+            self.lr_scheduler.restore_ckpt_dict(steps_dict)
+
+            log(f'restore steps_dict={steps_dict}')
 
     def _convert_train_args(self) -> Tuple[dict, dict, dict]:
         parallel_kwargs: Optional[Dict[str, Any]] = None
@@ -400,8 +399,8 @@ class Trainer:
 
     def _create_dataset(self, file_idx) -> Tuple[Dataset, str]:
         file_path = self.train_config.file_dataset[file_idx]
-        max_position_embeddings = self.train_config.model_config.max_position_embeddings
-        return TextDataset(file_path, max_position_embeddings, max_position_embeddings), file_path
+        max_seq_len = self.train_config.max_seq_len
+        return PretrainDataset(file_path, max_seq_len, max_seq_len), file_path
 
     def _calc_loss(self, inputs, attention_mask, logits, labels):
         # calc loss
@@ -425,15 +424,20 @@ class Trainer:
         else:
             self.scalar.scale(loss).backward()
 
-    def _step(self):
+    def _apply_grad_clipping(self):
+        # ds模式已经集成gradient_clipping
+        if not isinstance(TrainerTools().parallel, DsParallel) and self.lr_scheduler.can_clip_grad():
+            # clip grad
+            self.scalar.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self._get_trainable_params(self.train_model), 1.0)
+
+    def _apply_step(self):
         self.lr_scheduler.step()
         if isinstance(TrainerTools().parallel, DsParallel):
             self.train_model.step()
         else:
             self.scalar.step(self.optimizer)
-            # optimizer.step()
             self.scalar.update()
-            # flush the gradients as soon as we can, no need for this memory anymore
             self.optimizer.zero_grad(set_to_none=True)
 
         TrainerTools().parallel.synchronize()
@@ -451,18 +455,17 @@ class Trainer:
 
         return self.eval_prompts[self.eval_idx], self.eval_image_tags[self.eval_idx]
 
-    def _log_loss(
-            self,
-            epoch_tag: str,
-            file_tag: str,
-            batch_tag: str,
-            loss
-    ):
+    def _log(self, keys: Dict[str, any], values: Dict[str, any]):
+        """
+        格式：keys_key1: keys_value1, keys_key2: keys_value2 -> values_key1: values_value1, values_key2: values_value2
+        """
         if TrainerTools().parallel.is_main_process:
-            log_dir = get_log_dir()
-            log_msg = f"{epoch_tag}, {file_tag}, {batch_tag}, loss: {loss}"
+            log_tags = ', '.join([f'{k}: {v}' for k, v in keys.items()])
+            log_values = ', '.join([f'{k}: {v}' for k, v in values.items()])
+            log_msg = f'{log_tags} -> {log_values}'
+
             log(log_msg)
-            log(f"{log_msg}\n", f'{log_dir}log.txt')
+            log(f"{log_msg}\n", 'log.txt')
 
     def _on_exception(
             self,
@@ -470,11 +473,10 @@ class Trainer:
             epoch: int,
             batch: int
     ):
-        log_dir = get_log_dir()
         exception_file = e.__traceback__.tb_frame.f_globals["__file__"]
         exception_line = e.__traceback__.tb_lineno
-        log_msg = f"epoch: {epoch}, batch: {batch}, {e} at {exception_file} line {exception_line}\n"
-        log(log_msg, f'{log_dir}exception.txt')
+        log_msg = f"epoch: {epoch}, batch: {batch} -> {e} at {exception_file} line {exception_line}\n"
+        log(log_msg, 'exception.txt')
 
         raise e
 
@@ -487,9 +489,11 @@ class Trainer:
             return torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
 
     def _eval(self, tag: str):
-        with unwrap_model_for_generation(self.train_model) as generate_model:
+        with unwrap_model_for_generation(self.train_model) as eval_model:
             if TrainerTools().parallel.is_main_process:
-                generate_model.eval()
+                eval_model = self._check_eval_model(eval_model)
+                eval_model.eval()
+
                 eval_prompt, eval_image_tag = self._get_eval_data()
 
                 if isinstance(self.train_config, VLMConfig) and self.pixel_values_provider and eval_image_tag:
@@ -498,17 +502,19 @@ class Trainer:
                     eval_pixel_values = None
 
                 submit_gen_task(
-                    generate_model,
-                    self.train_config.eval_config,
+                    eval_model,
+                    self.train_config,
                     tag=tag,
                     prompt=eval_prompt,
                     pixel_values=eval_pixel_values,
-                    max_position_embeddings=self.train_config.model_config.max_position_embeddings,
                     tokens_per_image=self.tokens_per_image
                 )
-                generate_model.train()
+                eval_model.train()
 
         TrainerTools().parallel.wait('eval')
+
+    def _check_eval_model(self, eval_model):
+        return eval_model
 
     def _on_batch_end(self, tag: str):
         self._eval(f'sign:batch/{tag}')
@@ -522,7 +528,21 @@ class Trainer:
             file_name: str
     ):
         if TrainerTools().parallel.is_main_process:
-            log(f"epoch: {epoch}, start train {file_name}\n", f'{get_log_dir()}log.txt')
+            log(f"====epoch: {epoch}, start train {file_name}====\n", 'log.txt')
+
+    def _avg_loss(self, losses: List[float], gradient_accumulation_steps, batches_accumulated) -> List[float]:
+        avg_losses = []
+        for loss in losses:
+            avg_loss = torch.tensor(
+                loss * gradient_accumulation_steps / batches_accumulated,
+                device=TrainerTools().parallel.device)
+
+            if TrainerTools().parallel.parallel_train:
+                dist.all_reduce(avg_loss, dist.ReduceOp.AVG)
+
+            avg_losses.append(avg_loss.detach().item())
+
+        return avg_losses
 
     def train(self):
         # 梯度累积步数
@@ -530,10 +550,10 @@ class Trainer:
         global_steps = 0
         skipping_train = False
 
-        loss_accumulation = 0.0
+        loss_with_aux_accumulation = 0.0
+        loss_without_aux_accumulation = 0.0
+        aux_loss_accumulation = 0.0
         batches_accumulated = 0
-        current_loss: float = 0.0
-        last_best_checkpoint_loss: Optional[float] = None
 
         for epoch in range(self.train_config.n_epochs):
             self.train_model.train()
@@ -607,39 +627,54 @@ class Trainer:
                             # calc loss
                             loss = self._calc_loss(inputs, attention_mask, result['logits'], labels)
                             if result['aux_loss'] and self.train_config.loss_config.aux_loss_coef:
-                                loss += self.train_config.loss_config.aux_loss_coef * result['aux_loss']
+                                aux_loss = self.train_config.loss_config.aux_loss_coef * result['aux_loss']
+                            else:
+                                aux_loss = torch.tensor(0.0)
 
                         if gradient_accumulation_steps > 1:
                             loss = loss / gradient_accumulation_steps
+                            aux_loss = aux_loss / gradient_accumulation_steps
 
-                        loss_accumulation += loss.detach().item()
-                        self._backward_loss(loss)
+                        total_loss = loss + aux_loss
+                        self._backward_loss(total_loss)
+
+                        loss_with_aux_accumulation += total_loss.detach().item()
+                        loss_without_aux_accumulation += loss.detach().item()
+                        aux_loss_accumulation += aux_loss.detach().item()
+
                         batches_accumulated += 1
 
                         if need_update_grad:
-                            loss_tensor = torch.tensor(loss_accumulation * gradient_accumulation_steps / batches_accumulated, device=TrainerTools().parallel.device)
+                            self._apply_grad_clipping()
+                            self._apply_step()
 
-                            if TrainerTools().parallel.parallel_train:
-                                dist.all_reduce(loss_tensor, dist.ReduceOp.AVG)
-
-                            current_loss = loss_tensor.item()
-
-                            # ds模式已经集成gradient_clipping
-                            if not isinstance(TrainerTools().parallel, DsParallel) and self.lr_scheduler.can_clip_grad():
-                                # clip grad
-                                self.scalar.unscale_(self.optimizer)
-                                torch.nn.utils.clip_grad_norm_(self._get_trainable_params(self.train_model), 1.0)
-
-                            self._step()
-
-                            self._log_loss(
-                                epoch_tag=f'epoch: {epoch}',
-                                file_tag=f'file: {file_idx + 1}/{file_count}',
-                                batch_tag=f'batch: {batch}/{batch_count_per_file}',
-                                loss=current_loss
+                            avg_loss, avg_loss_without_aux, avg_aux_loss = self._avg_loss(
+                                losses=[
+                                    loss_with_aux_accumulation,
+                                    loss_without_aux_accumulation,
+                                    aux_loss_accumulation
+                                ],
+                                gradient_accumulation_steps=gradient_accumulation_steps,
+                                batches_accumulated=batches_accumulated
                             )
+
+                            self._log(
+                                keys={
+                                    'epoch': epoch,
+                                    'file': f'{file_idx + 1}/{file_count}',
+                                    'batch': f'{batch}/{batch_count_per_file}'
+                                },
+                                values={
+                                    'loss(with aux)': avg_loss,
+                                    'loss(without aux)': avg_loss_without_aux,
+                                    'aux_loss': avg_aux_loss
+                                }
+                            )
+
                             # reset to default
-                            loss_accumulation = 0.0
+                            loss_with_aux_accumulation = 0.0
+                            loss_without_aux_accumulation = 0.0
+                            aux_loss_accumulation = 0.0
                             batches_accumulated = 0
                     except Exception as e:
                         self._on_exception(e, epoch, batch)
@@ -649,9 +684,6 @@ class Trainer:
 
                             if (batch - last_ckpt_batch) >= self.train_config.eval_batch_interval:
                                 save_checkpoint(model=self.train_model, optimizer=self.optimizer)
-                                if save_best_checkpoint(current_loss, last_best_checkpoint_loss):
-                                    last_best_checkpoint_loss = current_loss
-
                                 last_ckpt_batch = batch
                                 self._on_batch_end(tag=f'epoch:{epoch}/batch:{batch}')
 
@@ -662,10 +694,7 @@ class Trainer:
             # end epoch
             if not skipping_train:
                 save_steps(global_steps=global_steps, lr_scheduler=self.lr_scheduler)
-
                 save_checkpoint(model=self.train_model, optimizer=self.optimizer)
-                if save_best_checkpoint(current_loss, last_best_checkpoint_loss):
-                    last_best_checkpoint_loss = current_loss
 
                 TrainerTools().parallel.on_epoch_end(epoch)
                 self._on_epoch_end(tag=f'epoch:{epoch}')

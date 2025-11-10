@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -116,6 +116,78 @@ class DPOLoss(nn.Module):
         # rejected_rewards = self.beta * (policy_reject_probs - ref_reject_probs).detach()
 
         return loss
+
+
+class PPOLoss(nn.Module):
+    """
+    PPO (Proximal Policy Optimization) 损失函数。
+    这个类统一计算 Actor 和 Value 的损失。
+    """
+
+    def __init__(
+            self,
+            clip_eps: float,
+            vf_coef: float,
+    ):
+        """
+        初始化PPO损失函数。
+        :param clip_eps: PPO裁剪范围的epsilon值。
+        :param vf_coef: 价值函数损失的系数。
+        """
+        super().__init__()
+        self.clip_eps = clip_eps
+        self.vf_coef = vf_coef
+
+    def forward(
+            self,
+            log_probs: torch.Tensor,
+            old_log_probs: torch.Tensor,
+            values: torch.Tensor,
+            old_values: torch.Tensor,
+            returns: torch.Tensor,
+            advantages: torch.Tensor,
+            mask: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        计算PPO的总损失、Actor损失和Value损失。
+
+        :param log_probs: 当前策略的log probabilities, 形状: [batch_size, seq_len]
+        :param old_log_probs: 生成rollout时的旧策略的log probabilities, 形状: [batch_size, seq_len]
+        :param values: 当前评论家模型输出的价值, 形状: [batch_size, seq_len]
+        :param old_values: 生成rollout时的旧价值, 形状: [batch_size, seq_len]
+        :param returns: GAE计算出的回报, 形状: [batch_size, seq_len]
+        :param advantages: GAE计算出的优势, 形状: [batch_size, seq_len]
+        :param mask: 掩码，只计算生成部分的损失, 形状: [batch_size, seq_len]
+        :return: (总损失, Actor损失, Value损失)
+        """
+        # Value Loss (价值损失) with clipping
+        values_clipped = old_values + torch.clamp(values - old_values, -self.clip_eps, self.clip_eps)
+        vf_loss_unclipped = F.mse_loss(values, returns, reduction='none')
+        vf_loss_clipped = F.mse_loss(values_clipped, returns, reduction='none')
+        value_loss = torch.max(vf_loss_unclipped, vf_loss_clipped)
+        # Apply mask and average
+        value_loss = (value_loss * mask).sum() / mask.sum().clamp(min=1.0)
+        value_loss = value_loss * self.vf_coef
+
+        # Actor Loss (策略损失)
+        # 计算新旧策略的概率比 r_t = exp(log_prob_new - log_prob_old)
+        # ratio 形状: [batch_size, seq_len]
+        ratio = torch.exp(log_probs - old_log_probs)
+
+        # PPO裁剪替代目标（Clipped Surrogate Objective）
+        # surr1 形状: [batch_size, seq_len]
+        surr1 = ratio * advantages
+        # surr2 形状: [batch_size, seq_len]
+        surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * advantages
+
+        # 取两者中较小的一个，并加负号（因为我们要最大化这个目标，所以最小化它的负值）
+        # 我们只关心生成部分（由mask标记）的损失
+        actor_loss = -torch.sum(torch.min(surr1, surr2) * mask) / torch.sum(mask).clamp(min=1.0)
+
+        # 总损失
+        total_loss = actor_loss + value_loss
+
+        return total_loss, actor_loss, value_loss
 
 
 class GRPOLoss(nn.Module):

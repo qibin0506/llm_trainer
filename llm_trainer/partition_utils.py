@@ -63,7 +63,7 @@ def sync_model_params(_from: nn.Module, _to: Optional[nn.Module], mixup_alpha: f
     unwrap_to_model = unwrap_model(_to)
     if mixup_alpha == 1.0:
         # 直接覆盖
-        unwrap_to_model.load_state_dict(state_dict)
+        unwrap_to_model.load_state_dict(state_dict, strict=False)
     else:
         # 混合参数
         for param_name, target_param in unwrap_to_model.named_parameters():

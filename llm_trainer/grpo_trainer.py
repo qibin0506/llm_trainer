@@ -1,19 +1,19 @@
-from typing import Tuple, List, Union, Callable, Optional
+from typing import Tuple, List, Callable, Optional
 import torch
 from torch.utils.data import Dataset
-from torch.nn.utils.rnn import pad_sequence
-import torch.distributed as dist
-import torch.nn.functional as F
 
-from .parallel_ds import DsParallel
 from .trainer import Trainer
 from .train_configs import TrainConfig
-from .dataset import GRPORolloutDataset
+from .dataset import RLDataset
 from .loss import GRPOLoss
 from .tools import TrainerTools
 from .generate_utils import batch_generate
 from .log import log
-from .utils import autocast
+from .utils import (
+    autocast,
+    left_pad_sequence,
+    log_softmax
+)
 
 from .partition_utils import (
     sync_model_params,
@@ -22,16 +22,18 @@ from .partition_utils import (
 
 from .checkpoint import (
     save_checkpoint,
-    save_best_checkpoint,
     save_steps,
 )
 
 class GRPOTrainer(Trainer):
+    """
+        reward_func(prompt_ids, complete_ids, answer_ids) -> scores
+    """
     def __init__(
             self,
             *,
             train_config: TrainConfig,
-            reward_func: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], List[float]],
+            reward_func: Callable[[List[torch.Tensor], torch.Tensor, List[Optional[torch.Tensor]]], List[float]],
             eval_prompts: List[str],
             eval_image_tags: Optional[List[str]] = None
     ):
@@ -44,10 +46,6 @@ class GRPOTrainer(Trainer):
         self.packed_sequences = False
         self.reward_func = reward_func
         self.ref_model = self._init_ref_model()
-
-        # 默认使用torch提供的pad_sequence
-        # 如果pad_sequence不支持padding_side参数，则将改参数置为False，使用反转的方式
-        self._use_origin_pad_sequence = True
 
     def _init_ref_model(self):
         # beta == 0，不需要ref_model
@@ -90,70 +88,28 @@ class GRPOTrainer(Trainer):
 
     def _create_dataset(self, file_idx) -> Tuple[Dataset, str]:
         file_path = self.train_config.file_dataset[file_idx]
-        return GRPORolloutDataset(file_path), file_path
+        return RLDataset(file_path), file_path
 
     def _calc_loss(self, inputs, attention_mask, logits, labels): ...
 
-    def _left_pad_sequence(
-            self,
-            sequences: Union[torch.Tensor, List[torch.Tensor]],
-            padding_value: float,
-    ) -> torch.Tensor:
-        if self._use_origin_pad_sequence:
-            try:
-                return pad_sequence(sequences, batch_first=True, padding_value=padding_value, padding_side='left')
-            except:
-                self._use_origin_pad_sequence = False
-                return self._left_pad_sequence(sequences, padding_value)
-        else:
-            # 反转每个序列的顺序（如 [1,2,3] → [3,2,1]）
-            reversed_sequences = [seq.flip(dims=(0,)) for seq in sequences]
-            # 使用默认的右侧填充
-            padded_reversed = pad_sequence(reversed_sequences, batch_first=True, padding_value=padding_value)
-            # 再次反转序列顺序，恢复原始方向（填充在左侧）
-            return padded_reversed.flip(dims=(1,))
-
-    def _selective_log_softmax(self, logits, input_ids):
-        # Convert raw logits into log probabilities along the vocabulary axis.
-        # [batch_size, seq_len, vocab_size]
-        log_probs = F.log_softmax(logits, dim=-1)
-
-        # Reshape input_ids from (batch_size, seq_len) to (batch_size, seq_len, 1) for gathering.
-        # Then, gather the log probability for each token in input_ids.
-        selected_log_probs = log_probs.gather(dim=-1, index=input_ids.unsqueeze(-1))
-
-        # Remove the extra last dimension to get back to shape (batch_size, seq_len).
-        return selected_log_probs.squeeze(-1)
-
-    def _compute_log_probabilities(
+    def _compute_log_probs(
             self,
             model,
             input_ids,
-            attention_mask,
-            logits_to_keep
+            attention_mask
     ):
-        # prompt部分[1, 2, 3]
-        # 生成模型生成的内容是[4, 5]，logits_to_keep=2
-        # 则下面的输入 [1, 2, 3, 4, 5], 正常情况下输出是[2, 3, 4, 5, 6]
-        # logits_to_keep=2，时输出[5, 6]
-        # 但是我们想要的[4, 5]部分
-        # 所以需要logits_to_keep=2+1，输出[4, 5, 6]
-
         # [batch_size, total_seq_len, vocab_size]
         outputs = model(
             input_ids=input_ids,
-            attention_mask=attention_mask,
-            logits_to_keep=logits_to_keep + 1
+            attention_mask=attention_mask
         )
 
         # [batch_size, total_seq_len - 1, vocab_size]
         logits = outputs['logits'][:, :-1, :]
-
-        input_ids = input_ids[:, -logits_to_keep:]
-        logits = logits[:, -logits_to_keep:, :]
+        input_ids = input_ids[:, 1:]
 
         # Compute and return the log probabilities for the selected tokens.
-        return self._selective_log_softmax(logits, input_ids), outputs['aux_loss']
+        return log_softmax(logits, input_ids), outputs['aux_loss']
 
     def _compute_group_relative_advantages(self, rewards):
         group_size = self.train_config.grpo_config.group_size
@@ -185,7 +141,7 @@ class GRPOTrainer(Trainer):
 
         # 左边添加pad，对齐prompt长度
         # [batch, max_prompt_len]
-        prompt_ids = self._left_pad_sequence(prompts, padding_value=pad_token_id)
+        prompt_ids = left_pad_sequence(prompts, padding_value=pad_token_id)
         prompt_ids = prompt_ids.to(device)
 
         prompt_len = prompt_ids.shape[1]
@@ -201,7 +157,6 @@ class GRPOTrainer(Trainer):
             tokens=prompt_ids,
             pad_token_id=pad_token_id,
             attention_mask=prompt_masks,
-            max_position_embeddings=self.train_config.model_config.max_position_embeddings,
             max_new_tokens=self.train_config.grpo_config.gen_max_new_tokens,
             temperature=self.train_config.grpo_config.gen_temperature,
             k=self.train_config.grpo_config.gen_k,
@@ -229,14 +184,13 @@ class GRPOTrainer(Trainer):
             prompt_ids, prompt_mask, completion_ids, completion_mask = self._generate_completions(generate_model, prompts, group_size)
             input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
             attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
-            logits_to_keep = completion_ids.shape[1]
 
             # Compute old_log_probs from the current model, with gradients disabled.
-            old_log_probs, _ = self._compute_log_probabilities(generate_model, input_ids, attention_mask, logits_to_keep)
+            old_log_probs, _ = self._compute_log_probs(generate_model, input_ids, attention_mask)
 
             if self.ref_model:
                 # Compute ref_log_probs from the reference model, which remains static.
-                ref_log_probs, _ = self._compute_log_probabilities(self.ref_model, input_ids, attention_mask, logits_to_keep)
+                ref_log_probs, _ = self._compute_log_probs(self.ref_model, input_ids, attention_mask)
             else:
                 ref_log_probs = None
 
@@ -252,7 +206,6 @@ class GRPOTrainer(Trainer):
             'completion_ids': completion_ids,
             'repeated_prompts': repeated_prompts,
             'repeated_answers': repeated_answers,
-            'logits_to_keep': logits_to_keep
         }
 
     def _maximize_grpo_objective(self, rollout_data):
@@ -263,7 +216,6 @@ class GRPOTrainer(Trainer):
         completion_mask = rollout_data['completion_mask']
         old_log_probs = rollout_data['old_log_probs']
         ref_log_probs = rollout_data['ref_log_probs']
-        logits_to_keep = rollout_data['logits_to_keep']
         completion_ids = rollout_data['completion_ids']
         repeated_prompts = rollout_data['repeated_prompts']
         repeated_answers = rollout_data['repeated_answers']
@@ -279,7 +231,7 @@ class GRPOTrainer(Trainer):
         advantages = self._compute_group_relative_advantages(rewards)
 
         # Compute current log probabilities
-        log_probs, aux_loss = self._compute_log_probabilities(self.train_model, input_ids, attention_mask, logits_to_keep)
+        log_probs, aux_loss = self._compute_log_probs(self.train_model, input_ids, attention_mask)
 
         loss = self.criterion(
             log_probs=log_probs,
@@ -289,15 +241,11 @@ class GRPOTrainer(Trainer):
             advantages=advantages
         )
 
-        return loss, aux_loss
+        return loss, aux_loss, rewards
 
     def train(self):
         global_steps = 0
         skipping_train = False
-
-        current_loss: float = 0.0
-        last_best_checkpoint_loss: Optional[float] = None
-
         aux_loss_coef = self.train_config.loss_config.aux_loss_coef
 
         for epoch in range(self.train_config.n_epochs):
@@ -342,8 +290,6 @@ class GRPOTrainer(Trainer):
                     # 生成数据
                     with unwrap_model_for_generation(self.train_model) as generate_model:
                         rollout_data = self._generate_rollout_data(generate_model, batch_data)
-
-                    torch.cuda.empty_cache()
                     # end generate
 
                     try:
@@ -352,30 +298,44 @@ class GRPOTrainer(Trainer):
 
                         for grpo_step in range(self.train_config.grpo_config.grpo_steps):
                             with autocast(TrainerTools().parallel.device_type):
-                                loss, aux_loss = self._maximize_grpo_objective(rollout_data)
+                                loss, aux_loss, rewards = self._maximize_grpo_objective(rollout_data)
                                 if aux_loss_coef and aux_loss:
-                                    loss += aux_loss_coef * aux_loss
+                                    aux_loss = aux_loss_coef * aux_loss
+                                else:
+                                    aux_loss = torch.tensor(0.0)
 
-                            self._backward_loss(loss)
+                            total_loss = loss + aux_loss
+                            self._backward_loss(total_loss)
+                            self._apply_grad_clipping()
+                            self._apply_step()
 
-                            if TrainerTools().parallel.parallel_train:
-                                dist.all_reduce(loss, dist.ReduceOp.AVG)
+                            loss_with_aux_accumulation = total_loss.detach().item()
+                            loss_without_aux_accumulation = loss.detach().item()
+                            aux_loss_accumulation = aux_loss.detach().item()
 
-                            current_loss = loss.detach().item()
+                            avg_loss, avg_loss_without_aux, avg_aux_loss = self._avg_loss(
+                                losses=[
+                                    loss_with_aux_accumulation,
+                                    loss_without_aux_accumulation,
+                                    aux_loss_accumulation
+                                ],
+                                gradient_accumulation_steps=1,
+                                batches_accumulated=1
+                            )
 
-                            # ds模式已经集成gradient_clipping
-                            if not isinstance(TrainerTools().parallel, DsParallel) and self.lr_scheduler.can_clip_grad():
-                                # clip grad
-                                self.scalar.unscale_(self.optimizer)
-                                torch.nn.utils.clip_grad_norm_(self._get_trainable_params(self.train_model), 1.0)
-
-                            self._step()
-
-                            self._log_loss(
-                                epoch_tag=f'epoch: {epoch}',
-                                file_tag=f'file: {file_idx + 1}/{file_count}',
-                                batch_tag=f'batch: {batch}/{batch_count_per_file}, grpo_step={grpo_step}',
-                                loss=current_loss
+                            self._log(
+                                keys={
+                                    'epoch': epoch,
+                                    'file': f'{file_idx + 1}/{file_count}',
+                                    'batch': f'{batch}/{batch_count_per_file}',
+                                    'grpo_step': grpo_step
+                                },
+                                values={
+                                    'loss(with aux)': avg_loss,
+                                    'loss(without aux)': avg_loss_without_aux,
+                                    'aux_loss': avg_aux_loss,
+                                    'rewards': (rewards.sum() / rewards.size(0)).item(),
+                                }
                             )
                     except Exception as e:
                         self._on_exception(e, epoch, batch)
@@ -384,9 +344,6 @@ class GRPOTrainer(Trainer):
 
                         if (batch - last_ckpt_batch) >= self.train_config.eval_batch_interval:
                             save_checkpoint(model=self.train_model, optimizer=self.optimizer)
-                            if save_best_checkpoint(current_loss, last_best_checkpoint_loss):
-                                last_best_checkpoint_loss = current_loss
-
                             last_ckpt_batch = batch
                             self._on_batch_end(tag=f'epoch:{epoch}/batch:{batch}')
 
@@ -397,10 +354,7 @@ class GRPOTrainer(Trainer):
             # end epoch
             if not skipping_train:
                 save_steps(global_steps=global_steps, lr_scheduler=self.lr_scheduler)
-
                 save_checkpoint(model=self.train_model, optimizer=self.optimizer)
-                if save_best_checkpoint(current_loss, last_best_checkpoint_loss):
-                    last_best_checkpoint_loss = current_loss
 
                 TrainerTools().parallel.on_epoch_end(epoch)
                 self._on_epoch_end(tag=f'epoch:{epoch}')

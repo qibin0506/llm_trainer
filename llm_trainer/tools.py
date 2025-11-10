@@ -55,7 +55,7 @@ class FileDataset(ABC):
 
 def estimate_data_size(
         file_dataset: FileDataset,
-        max_position_embeddings: int,
+        max_seq_len: int,
         type: str
 ) -> int:
     """
@@ -65,27 +65,27 @@ def estimate_data_size(
     files_count = len(file_dataset)
 
     if type == 'sft':
-        from .dataset import LineByLineTextDataset
+        from .dataset import SFTDataset
         for idx in range(files_count):
-            dataset = LineByLineTextDataset(file_dataset[idx], max_position_embeddings)
+            dataset = SFTDataset(file_dataset[idx], max_seq_len)
             data_size += len(dataset)
     elif type == 'dpo':
         from .dataset import DPODataset
         for idx in range(files_count):
-            dataset = DPODataset(file_dataset[idx], max_position_embeddings)
+            dataset = DPODataset(file_dataset[idx], max_seq_len)
             data_size += len(dataset)
-    elif type == 'grpo':
-        from .dataset import GRPORolloutDataset
+    elif type == 'grpo' or type == 'ppo':
+        from .dataset import RLDataset
         for idx in range(files_count):
-            dataset = GRPORolloutDataset(file_dataset[idx])
+            dataset = RLDataset(file_dataset[idx])
             data_size += len(dataset)
     else:
-        from .dataset import TextDataset
+        from .dataset import PretrainDataset
         for idx in range(files_count):
-            dataset = TextDataset(
+            dataset = PretrainDataset(
                 file_dataset[idx],
-                max_position_embeddings,
-                max_position_embeddings
+                max_seq_len,
+                max_seq_len
             )
             data_size += len(dataset)
 

@@ -101,7 +101,6 @@ def _generate(
         model: torch.nn.Module,
         *,
         tokens: torch.Tensor,
-        max_position_embeddings: int,
         max_new_tokens: int,
         temperature: Optional[float],
         k: Optional[int],
@@ -114,7 +113,6 @@ def _generate(
     """
     :param model:
     :param tokens:
-    :param max_position_embeddings:
     :param max_new_tokens:
     :param temperature: 设置None不不生效temperature
     :param k: top k参数，设置为None或者0不生效topk
@@ -138,7 +136,7 @@ def _generate(
 
     with torch.inference_mode():
         for _ in range(max_new_tokens):
-            t = tokens # tokens[:, -max_position_embeddings:]
+            t = tokens
             with autocast(device):
                 result = model(
                     t,
@@ -197,7 +195,6 @@ def _streaming_generate(
         model: torch.nn.Module,
         *,
         prompt: Union[str, torch.Tensor],
-        max_position_embeddings: int,
         max_new_tokens: int,
         temperature: Optional[float] = 1.0,
         k: Optional[int] = None,
@@ -217,7 +214,6 @@ def _streaming_generate(
     generate_text_iterator = _generate(
         model=model,
         tokens=encoded_tokens,
-        max_position_embeddings=max_position_embeddings,
         max_new_tokens=max_new_tokens,
         temperature=temperature,
         k=k,
@@ -236,7 +232,6 @@ def streaming_generate(
         model: torch.nn.Module,
         *,
         prompt: Union[str, torch.Tensor],
-        max_position_embeddings: int,
         max_new_tokens: int,
         temperature: Optional[float] = 1.0,
         k: Optional[int] = None,
@@ -250,7 +245,6 @@ def streaming_generate(
     text_iterator = _streaming_generate(
         model=model,
         prompt=prompt,
-        max_position_embeddings=max_position_embeddings,
         max_new_tokens=max_new_tokens,
         temperature=temperature,
         k=k,
@@ -273,7 +267,6 @@ def generate(
         model: torch.nn.Module,
         *,
         prompt: Union[str, torch.Tensor],
-        max_position_embeddings: int,
         max_new_tokens: int,
         temperature: Optional[float] = 1.0,
         k: Optional[int] = None,
@@ -287,7 +280,6 @@ def generate(
     text_iterator = _streaming_generate(
         model=model,
         prompt=prompt,
-        max_position_embeddings=max_position_embeddings,
         max_new_tokens=max_new_tokens,
         temperature=temperature,
         k=k,
@@ -314,7 +306,6 @@ def batch_generate(
         tokens: torch.Tensor,
         pad_token_id: torch.Tensor,
         attention_mask: torch.Tensor,
-        max_position_embeddings: int,
         max_new_tokens: int,
         temperature: Optional[float],
         k: Optional[int],
@@ -346,7 +337,7 @@ def batch_generate(
             if done.all():
                 break
 
-            t = tokens #tokens[:, -max_position_embeddings:]
+            t = tokens
             with autocast(device):
                 result = model(
                     t,

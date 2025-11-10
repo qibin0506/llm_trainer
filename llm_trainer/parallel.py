@@ -47,7 +47,7 @@ class Parallel(ABC):
 
             torch.cuda.set_device(self.device)
 
-            log(f'global_rank:{self._global_rank},local_rank:{self._local_rank}, world_size:{self.world_size}')
+            log(f'global_rank={self._global_rank}, local_rank={self._local_rank}, world_size={self.world_size}')
         else:
             device = "cpu"
             if torch.cuda.is_available():

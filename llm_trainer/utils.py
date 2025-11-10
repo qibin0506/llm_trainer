@@ -5,6 +5,7 @@ from torch.nn.utils.rnn import pad_sequence
 import torch.nn.functional as F
 from .tools import TrainerTools
 import numpy as np
+from typing import Union, List
 
 
 def set_seed(seed=42):
@@ -327,6 +328,62 @@ def fill_loss_mask(loss_masks, labels):
                 start_index = -1
 
     return loss_masks
+
+
+# 默认使用torch提供的pad_sequence
+# 如果pad_sequence不支持padding_side参数，则将改参数置为False，使用反转的方式
+_use_origin_pad_sequence = True
+def left_pad_sequence(
+        sequences: Union[torch.Tensor, List[torch.Tensor]],
+        padding_value: float,
+) -> torch.Tensor:
+    global _use_origin_pad_sequence
+
+    if _use_origin_pad_sequence:
+        try:
+            return pad_sequence(sequences, batch_first=True, padding_value=padding_value, padding_side='left')
+        except TypeError:
+            _use_origin_pad_sequence = False
+            return left_pad_sequence(sequences, padding_value)
+    else:
+        # 反转每个序列的顺序（如 [1,2,3] → [3,2,1]）
+        reversed_sequences = [seq.flip(dims=(0,)) for seq in sequences]
+        # 使用默认的右侧填充
+        padded_reversed = pad_sequence(reversed_sequences, batch_first=True, padding_value=padding_value)
+        # 再次反转序列顺序，恢复原始方向（填充在左侧）
+        return padded_reversed.flip(dims=(1,))
+
+
+_use_memory_efficient_log_softmax = True
+def log_softmax(logits, index) -> torch.Tensor:
+    if _use_memory_efficient_log_softmax:
+        return _selective_log_softmax(logits, index)
+
+    # Convert raw logits into log probabilities along the vocabulary axis.
+    # [batch_size, seq_len, vocab_size]
+    log_probs = F.log_softmax(logits, dim=-1)
+
+    # Reshape input_ids from (batch_size, seq_len) to (batch_size, seq_len, 1) for gathering.
+    # Then, gather the log probability for each token in input_ids.
+    selected_log_probs = log_probs.gather(dim=-1, index=index.unsqueeze(-1))
+
+    # Remove the extra last dimension to get back to shape (batch_size, seq_len).
+    return selected_log_probs.squeeze(-1)
+
+
+def _selective_log_softmax(logits, index) -> torch.Tensor:
+    if logits.dtype in [torch.float32, torch.float64]:
+        selected_logits = torch.gather(logits, dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
+        logsumexp_values = torch.stack([torch.logsumexp(lg, dim=-1) for lg in logits])
+        per_token_logps = selected_logits - logsumexp_values
+    else:
+        per_token_logps = []
+        for row_logits, row_labels in zip(logits, index):
+            row_logps = F.log_softmax(row_logits, dim=-1)
+            row_per_token_logps = row_logps.gather(dim=-1, index=row_labels.unsqueeze(-1)).squeeze(-1)
+            per_token_logps.append(row_per_token_logps)
+        per_token_logps = torch.stack(per_token_logps)
+    return per_token_logps
 
 
 def _mask_prompt(labels):

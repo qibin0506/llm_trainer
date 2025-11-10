@@ -104,12 +104,17 @@ def load_checkpoint_for_eval(
         load_checkpoint(model, None, device)
 
 
-def save_steps(global_steps: int, lr_scheduler: Optional[LRScheduler] = None):
+def save_steps(
+    global_steps: int,
+    lr_scheduler: Optional[LRScheduler] = None,
+):
     # 暂时只保存主进程的
     if TrainerTools().parallel.is_main_process:
         steps_checkpoint_name = f"{os.environ.get('LOG_DIR', './')}steps.pt"
         ckpt = {'global_steps': global_steps}
-        ckpt.update(lr_scheduler.get_ckpt_dict())
+        if lr_scheduler:
+            ckpt.update(lr_scheduler.get_ckpt_dict())
+
         torch.save(ckpt, steps_checkpoint_name)
 
 

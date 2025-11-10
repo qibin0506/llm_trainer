@@ -1,10 +1,7 @@
 from typing import Tuple, List, Optional
 import torch
 from torch.utils.data import Dataset
-import torch.distributed as dist
-import torch.nn.functional as F
 
-from .parallel_ds import DsParallel
 from .trainer import Trainer
 from .train_configs import TrainConfig
 from .dataset import DPODataset
@@ -13,13 +10,12 @@ from .tools import TrainerTools
 from .utils import (
     autocast,
     get_dpo_collate_fn,
-    fill_loss_mask
+    fill_loss_mask,
+    log_softmax
 )
-from .partition_utils import sync_model_params
 
 from .checkpoint import (
     save_checkpoint,
-    save_best_checkpoint,
     save_steps,
 )
 
@@ -43,6 +39,10 @@ class DPOTrainer(Trainer):
     def _init_ref_model(self):
         ref_model = self._new_model(self.train_config)
 
+        if self.train_config.dpo_config.ref_model_checkpoint:
+            ref_model.load_state_dict(self.train_config.dpo_config.ref_model_checkpoint)
+            self.train_config.dpo_config.ref_model_checkpoint = {}
+
         ref_model, _ = TrainerTools().parallel.process(
             model=ref_model,
             optimizer=None,
@@ -53,11 +53,6 @@ class DPOTrainer(Trainer):
         ref_model.eval()
         for param in ref_model.parameters():
             param.requires_grad = False
-
-        sync_model_params(
-            _from=self.train_model,
-            _to=ref_model
-        )
 
         return ref_model
 
@@ -79,28 +74,10 @@ class DPOTrainer(Trainer):
 
     def _create_dataset(self, file_idx) -> Tuple[Dataset, str]:
         file_path = self.train_config.file_dataset[file_idx]
-        max_position_embeddings = self.train_config.model_config.max_position_embeddings
-        return DPODataset(file_path, max_position_embeddings), file_path
+        max_seq_len = self.train_config.max_seq_len
+        return DPODataset(file_path, max_seq_len), file_path
 
     def _calc_loss(self, inputs, attention_mask, logits, labels): ...
-
-    def _log_probs_from_logits(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        if logits.dtype in [torch.float32, torch.float64]:
-            logits_labels = torch.gather(logits, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
-            logsumexp_values = torch.stack(
-                [torch.logsumexp(l, dim=-1) for l in logits]  # loop to reduce peak mem consumption
-            )
-            log_probs_labels = logits_labels - logsumexp_values  # log_softmax(x_i) = x_i - logsumexp(x)
-        else:
-            log_probs_labels = []
-            for row_logits, row_labels in zip(logits, labels):  # loop to reduce peak mem consumption
-                row_log_probs = F.log_softmax(row_logits, dim=-1)
-                row_log_probs_labels = row_log_probs.gather(dim=-1, index=row_labels.unsqueeze(-1)).squeeze(-1)
-                log_probs_labels.append(row_log_probs_labels)
-            log_probs_labels = torch.stack(log_probs_labels)
-
-        return log_probs_labels
-
 
     def _logprobs(self, logits, labels, attention_mask):
         """
@@ -127,7 +104,7 @@ class DPOTrainer(Trainer):
         labels[labels == -100] = 0
 
         # Gather the log probabilities for the actual labels
-        per_token_logps = self._log_probs_from_logits(logits, labels)
+        per_token_logps = log_softmax(logits, labels)
 
         # Apply the mask to set log-probs of padding tokens to 0
         logprobs_sums = (per_token_logps * loss_masks).sum(-1)
@@ -141,10 +118,11 @@ class DPOTrainer(Trainer):
         global_steps = 0
         skipping_train = False
 
-        loss_accumulation = 0.0
+        loss_with_aux_accumulation = 0.0
+        loss_without_aux_accumulation = 0.0
+        aux_loss_accumulation = 0.0
+        nll_loss_accumulation = 0.0
         batches_accumulated = 0
-        current_loss: float = 0.0
-        last_best_checkpoint_loss: Optional[float] = None
 
         aux_loss_coef = self.train_config.loss_config.aux_loss_coef
         nll_loss_coef = self.train_config.dpo_config.nll_loss_coef
@@ -208,7 +186,6 @@ class DPOTrainer(Trainer):
                         with autocast(TrainerTools().parallel.device_type):
                             policy_outputs = self.train_model(concat_inputs, attention_mask=concat_attention_masks)
                             policy_logprobs_sums, policy_logprobs_means = self._logprobs(policy_outputs['logits'], concat_labels, concat_attention_masks)
-                            aux_loss = policy_outputs.get('aux_loss')
 
                             with torch.no_grad():
                                 ref_outputs = self.ref_model(concat_inputs, attention_mask=concat_attention_masks)
@@ -230,43 +207,65 @@ class DPOTrainer(Trainer):
                                 ref_rejected_logps
                             )
 
-                            if aux_loss_coef and aux_loss:
-                                loss += aux_loss_coef * aux_loss
+                            if aux_loss_coef and policy_outputs.get('aux_loss'):
+                                aux_loss = aux_loss_coef * policy_outputs.get('aux_loss')
+                            else:
+                                aux_loss = torch.tensor(0.0)
 
                             if nll_loss_coef and nll_loss:
-                                loss += nll_loss_coef * nll_loss
+                                nll_loss = nll_loss_coef * nll_loss
+                            else:
+                                nll_loss = torch.tensor(0.0)
 
                         if gradient_accumulation_steps > 1:
                             loss = loss / gradient_accumulation_steps
+                            aux_loss = aux_loss / gradient_accumulation_steps
+                            nll_loss = nll_loss / gradient_accumulation_steps
 
-                        loss_accumulation += loss.detach().item()
-                        self._backward_loss(loss)
+                        total_loss = loss + aux_loss + nll_loss
+                        self._backward_loss(total_loss)
+
+                        loss_with_aux_accumulation += total_loss.detach().item()
+                        loss_without_aux_accumulation += loss.detach().item()
+                        aux_loss_accumulation += aux_loss.detach().item()
+                        nll_loss_accumulation += nll_loss.detach().item()
+
                         batches_accumulated += 1
 
                         if need_update_grad:
-                            loss_tensor = torch.tensor(loss_accumulation * gradient_accumulation_steps / batches_accumulated, device=TrainerTools().parallel.device)
+                            self._apply_grad_clipping()
+                            self._apply_step()
 
-                            if TrainerTools().parallel.parallel_train:
-                                dist.all_reduce(loss_tensor, dist.ReduceOp.AVG)
-
-                            current_loss = loss_tensor.item()
-
-                            # ds模式已经集成gradient_clipping
-                            if not isinstance(TrainerTools().parallel, DsParallel) and self.lr_scheduler.can_clip_grad():
-                                # clip grad
-                                self.scalar.unscale_(self.optimizer)
-                                torch.nn.utils.clip_grad_norm_(self._get_trainable_params(self.train_model), 1.0)
-
-                            self._step()
-
-                            self._log_loss(
-                                epoch_tag=f'epoch: {epoch}',
-                                file_tag=f'file: {file_idx + 1}/{file_count}',
-                                batch_tag=f'batch: {batch}/{batch_count_per_file}',
-                                loss=current_loss
+                            avg_loss, avg_loss_without_aux, avg_aux_loss, avg_nll_loss = self._avg_loss(
+                                losses=[
+                                    loss_with_aux_accumulation,
+                                    loss_without_aux_accumulation,
+                                    aux_loss_accumulation,
+                                    nll_loss_accumulation,
+                                ],
+                                gradient_accumulation_steps=gradient_accumulation_steps,
+                                batches_accumulated=batches_accumulated
                             )
+
+                            self._log(
+                                keys={
+                                    'epoch': epoch,
+                                    'file': f'{file_idx + 1}/{file_count}',
+                                    'batch': f'{batch}/{batch_count_per_file}',
+                                },
+                                values={
+                                    'loss(with aux and nll)': avg_loss,
+                                    'loss(without aux and nll)': avg_loss_without_aux,
+                                    'aux_loss': avg_aux_loss,
+                                    'nll_loss': avg_nll_loss
+                                }
+                            )
+
                             # reset to default
-                            loss_accumulation = 0.0
+                            loss_with_aux_accumulation = 0.0
+                            loss_without_aux_accumulation = 0.0
+                            aux_loss_accumulation = 0.0
+                            nll_loss_accumulation = 0.0
                             batches_accumulated = 0
                     except Exception as e:
                         self._on_exception(e, epoch, batch)
@@ -276,8 +275,6 @@ class DPOTrainer(Trainer):
 
                             if (batch - last_ckpt_batch) >= self.train_config.eval_batch_interval:
                                 save_checkpoint(model=self.train_model, optimizer=self.optimizer)
-                                if save_best_checkpoint(current_loss, last_best_checkpoint_loss):
-                                    last_best_checkpoint_loss = current_loss
 
                                 last_ckpt_batch = batch
                                 self._on_batch_end(tag=f'epoch:{epoch}/batch:{batch}')
@@ -289,10 +286,7 @@ class DPOTrainer(Trainer):
             # end epoch
             if not skipping_train:
                 save_steps(global_steps=global_steps, lr_scheduler=self.lr_scheduler)
-
                 save_checkpoint(model=self.train_model, optimizer=self.optimizer)
-                if save_best_checkpoint(current_loss, last_best_checkpoint_loss):
-                    last_best_checkpoint_loss = current_loss
 
                 TrainerTools().parallel.on_epoch_end(epoch)
                 self._on_epoch_end(tag=f'epoch:{epoch}')

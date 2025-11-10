@@ -4,7 +4,7 @@ from torch.utils.data import Dataset
 
 from .trainer import Trainer
 from .train_configs import TrainConfig, VLMConfig
-from .dataset import LineByLineTextDataset
+from .dataset import SFTDataset
 from .utils import get_sft_collate_fn
 
 
@@ -32,7 +32,7 @@ class SFTTrainer(Trainer):
 
     def _create_dataset(self, file_idx) -> Tuple[Dataset, str]:
         file_path = self.train_config.file_dataset[file_idx]
-        max_position_embeddings = self.train_config.model_config.max_position_embeddings
+        max_seq_len = self.train_config.max_seq_len
 
         image_tag_file_path = None
         tokens_per_image = -1
@@ -44,4 +44,4 @@ class SFTTrainer(Trainer):
             if self.train_config.model_config.tokens_per_image:
                 tokens_per_image = self.train_config.model_config.tokens_per_image
 
-        return LineByLineTextDataset(file_path, max_position_embeddings, image_tag_file_path, tokens_per_image), file_path
+        return SFTDataset(file_path, max_seq_len, image_tag_file_path, tokens_per_image), file_path

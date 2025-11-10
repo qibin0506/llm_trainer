@@ -1,10 +1,7 @@
 from abc import ABC, abstractmethod
 import math
 import torch
-from .log import (
-    log,
-    get_log_dir
-)
+from .log import log
 
 class LRScheduler(ABC):
     @property
@@ -118,7 +115,7 @@ class WarmupCosineAnnealingLRScheduler(LRScheduler):
         self._current_lr = lr
 
         if self.need_log:
-            log(f"step={self.cur_steps},lr={lr}\n", f'{get_log_dir()}lr.txt')
+            log(f"step: {self.cur_steps}, lr: {lr}\n", 'lr.txt')
 
     def get_ckpt_dict(self) -> dict:
         return {
@@ -130,19 +127,19 @@ class WarmupCosineAnnealingLRScheduler(LRScheduler):
         }
 
     def restore_ckpt_dict(self, ckpt: dict):
-        if ckpt['cur_lr']:
+        if 'cur_lr' in ckpt:
             self._current_lr = ckpt['cur_lr']
 
-        if ckpt['lr_steps']:
+        if 'lr_steps' in ckpt:
             self._steps = ckpt['lr_steps']
 
-        if ckpt['cosine_annealing_base_lr']:
+        if 'cosine_annealing_base_lr' in ckpt:
             self._cosine_annealing_base_lr = ckpt['cosine_annealing_base_lr']
 
-        if ckpt['t_cur']:
+        if 't_cur' in ckpt:
             self.T_cur = ckpt['t_cur']
 
-        if ckpt['cycle']:
+        if 'cycle' in ckpt:
             self.cycle = ckpt['cycle']
 
         self._update_lr()
@@ -169,5 +166,5 @@ class NoneLRScheduler(LRScheduler):
         return {'cur_lr': self._current_lr}
 
     def restore_ckpt_dict(self, ckpt: dict):
-        if ckpt['cur_lr']:
+        if 'cur_lr' in ckpt:
             self._current_lr = ckpt['cur_lr']

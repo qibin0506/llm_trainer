@@ -20,7 +20,7 @@ def _get_file_type(file_path: str):
     return None
 
 
-class TextDataset(Dataset):
+class PretrainDataset(Dataset):
     """
     适用于pretrain阶段，数据格式支持jsonl和pkl，如果是jsonl会在init阶段全部encode成token
     jsonl: {'text': 'text1'}\n{'text': 'text2'}
@@ -58,7 +58,7 @@ class TextDataset(Dataset):
         return torch.tensor(self.input_ids[item]).long()
 
 
-class LineByLineTextDataset(Dataset):
+class SFTDataset(Dataset):
     """
     适用于sft阶段，数据格式支持jsonl和pkl，如果是jsonl，则会在getitem阶段encode成token
     jsonl: [
@@ -203,19 +203,17 @@ class DPODataset(Dataset):
         }
 
 
-class GRPORolloutDataset(Dataset):
+class RLDataset(Dataset):
     """
-        适用于grpo(gspo)阶段，数据格式支持jsonl和pkl，如果是jsonl，则会在getitem阶段encode成token
+        适用于RL阶段（例如：PPO、GRPO、GSPO），数据格式支持jsonl和pkl，如果是jsonl，则会在getitem阶段encode成token
         jsonl: {'prompt':
                     [{'role': 'system', 'content': 'system_content'},
-                    {'role': 'user', 'content': 'user_content'},
-                    {'role': 'assistant', 'think': 'think_content', 'content': 'assistant_content'}],
+                    {'role': 'user', 'content': 'user_content'}]
                 'answer': '10'
                }\n
                {'prompt':
                     [{'role': 'system', 'content': 'system_content'},
-                    {'role': 'user', 'content': 'user_content'},
-                    {'role': 'assistant', 'think': 'think_content', 'content': 'assistant_content'}],
+                    {'role': 'user', 'content': 'user_content'}]
                 'answer': '10'
                }
         pkl: [
@@ -236,14 +234,22 @@ class GRPORolloutDataset(Dataset):
                 for line in f:
                     json_ = json.loads(line.strip())
                     self.questions.append(json_['prompt'])
-                    self.answers.append(json_['answer'])
+
+                    if 'answer' in json_:
+                        self.answers.append(json_['answer'])
+                    else:
+                        self.answers.append(None)
         elif file_type == 'pkl':
             with open(file_path, 'rb') as f:
                 tokens = pickle.load(f)
 
             for token in tokens:
                 self.questions.append(token['prompt'])
-                self.answers.append(token['answer'])
+
+                if 'answer' in token:
+                    self.answers.append(token['answer'])
+                else:
+                    self.answers.append(None)
         else:
             raise Exception(f'unsupported file type for {file_path}')
 
@@ -253,12 +259,18 @@ class GRPORolloutDataset(Dataset):
     def __getitem__(self, item):
         if self.plain_text:
             question = TrainerTools().tokenizer.apply_chat_template(self.questions[item])
-            answer = TrainerTools().tokenizer.encode(self.answers[item])
+            answer = self.answers[item]
+            if answer is not None:
+                answer = TrainerTools().tokenizer.encode(self.answers[item])
         else:
             question = self.questions[item]
             answer = self.answers[item]
 
+        prompt_tensor = torch.tensor(question).long()
+        answer_tensor = torch.tensor(answer).long() if answer is not None else None
+
         return {
-            'prompt': torch.tensor(question).long(),
-            'answer': torch.tensor(answer).long()
+            'prompt': prompt_tensor,
+            'answer': answer_tensor
         }
+

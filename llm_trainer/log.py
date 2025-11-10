@@ -1,6 +1,6 @@
 import time, os
 
-def get_log_dir() -> str:
+def _get_log_dir() -> str:
     log_dir = os.environ['LOG_DIR']
     if not os.path.exists(log_dir):
         os.mkdir(log_dir)
@@ -13,5 +13,5 @@ def log(msg: str, log_file=None):
     if not log_file:
         print(f'[{cur_time}] {msg}')
     else:
-        with open(log_file, 'a') as f:
+        with open(f'{_get_log_dir()}{log_file}', 'a') as f:
             f.write(f"[{cur_time}] {msg}")

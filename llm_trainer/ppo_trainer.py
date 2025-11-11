@@ -253,8 +253,13 @@ class PPOTrainer(Trainer):
         # 3. Mask: 对应动作，所以也从第一个 completion token 开始。
         mask = (full_ids[:, prompt_len:] != TrainerTools().tokenizer.pad).long()
 
-        # 这里的白化保留了原始均值，但将标准差缩放为1，有助于稳定价值函数的学习
-        rewards = masked_whiten(rewards, mask, shift_mean=False)
+        # 根据奖励模式动态选择白化策略
+        if self.train_config.ppo_config.use_sparse_rewards:
+            # 稀疏奖励模式，类似 TRL，保留均值，只缩放方差
+            rewards = masked_whiten(rewards, mask, shift_mean=False)
+        else:
+            # 密集奖励模式，必须将均值中心化以稳定价值函数学习
+            rewards = masked_whiten(rewards, mask, shift_mean=True)
 
         # GAE Calculation
         advantages, returns = self._compute_advantages_and_returns(rewards, values_completion, mask)

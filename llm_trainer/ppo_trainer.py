@@ -14,7 +14,8 @@ from .generate_utils import batch_generate
 from .utils import (
     autocast,
     left_pad_sequence,
-    log_softmax
+    log_softmax,
+    masked_whiten
 )
 from .partition_utils import unwrap_model_for_generation
 from .log import log
@@ -252,15 +253,12 @@ class PPOTrainer(Trainer):
         # 3. Mask: 对应动作，所以也从第一个 completion token 开始。
         mask = (full_ids[:, prompt_len:] != TrainerTools().tokenizer.pad).long()
 
+        # 这里的白化保留了原始均值，但将标准差缩放为1，有助于稳定价值函数的学习
+        rewards = masked_whiten(rewards, mask, shift_mean=False)
+
         # GAE Calculation
         advantages, returns = self._compute_advantages_and_returns(rewards, values_completion, mask)
-
-        # 对优势进行标准化
-        masked_advantages = advantages[mask.bool()]
-        if masked_advantages.numel() > 1:
-            mean = masked_advantages.mean()
-            std = masked_advantages.std()
-            advantages = (advantages - mean) / (std + 1e-8)
+        advantages = masked_whiten(advantages, mask, shift_mean=True) # shift_mean=True 会将均值移至0
 
         loss_with_aux_accumulation = 0
         loss_without_aux_accumulation = 0

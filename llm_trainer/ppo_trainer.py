@@ -231,23 +231,23 @@ class PPOTrainer(Trainer):
         return {
             'full_ids': full_ids,
             'prompt_len': prompt_len,
-            'old_log_probs': log_probs,
-            'values': value_output,
-            'rewards': rewards,
+            'old_log_probs': log_probs.detach(),
+            'values': value_output.detach(),
+            'rewards': rewards.detach(),
             'env_rewards': env_rewards_tensor,
         }
 
     def _ppo_learning_phase(self, rollout_data: dict):
         full_ids, prompt_len = rollout_data['full_ids'].clone(), rollout_data['prompt_len']
         old_log_probs, values = rollout_data['old_log_probs'], rollout_data['values']
-        rewards =  rollout_data['rewards']
+        rewards = rollout_data['rewards']
 
         # 1. Values: 对应状态 s_t。我们需要从 prompt 的最后一个状态开始，因为它产生了第一个 completion token。
         #    切片到倒数第二个 state，因为 GAE 会处理最后一个 state。
-        values_completion = values[:, prompt_len - 1: -1].detach()
+        values_completion = values[:, prompt_len - 1: -1]
 
         # 2. Old Log Probs: 对应动作 a_t (即 token_{t+1})。我们需要从第一个 completion token 开始。
-        old_log_probs_completion = old_log_probs[:, prompt_len -1: -1].detach()
+        old_log_probs_completion = old_log_probs[:, prompt_len -1: -1]
 
         # 3. Mask: 对应动作，所以也从第一个 completion token 开始。
         mask = (full_ids[:, prompt_len:] != TrainerTools().tokenizer.pad).long()
@@ -367,7 +367,7 @@ class PPOTrainer(Trainer):
                                 'aux_loss': avg_aux_loss,
                                 'actor_loss': avg_actor_loss,
                                 'value_loss': avg_value_loss,
-                                'rewards_mean': rollout_data['env_rewards'].mean().item()
+                                'rewards': rollout_data['env_rewards'].mean().item()
                             }
                         )
                     except Exception as e:

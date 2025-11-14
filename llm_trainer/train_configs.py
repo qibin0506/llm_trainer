@@ -147,6 +147,8 @@ class PPOConfig:
     clip_eps: float = 0.1
     vf_coef: float = 0.5
     kl_beta: float = 0.02
+    kl_estimator: str = 'k1' # or k3
+    whiten_rewards: bool = False
     use_sparse_rewards: bool = True
     gen_max_new_tokens: int
     gen_temperature: Optional[float] = None

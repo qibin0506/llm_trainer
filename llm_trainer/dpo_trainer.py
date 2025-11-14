@@ -210,12 +210,12 @@ class DPOTrainer(Trainer):
                             if aux_loss_coef and policy_outputs.get('aux_loss'):
                                 aux_loss = aux_loss_coef * policy_outputs.get('aux_loss')
                             else:
-                                aux_loss = torch.tensor(0.0)
+                                aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
 
                             if nll_loss_coef and nll_loss:
                                 nll_loss = nll_loss_coef * nll_loss
                             else:
-                                nll_loss = torch.tensor(0.0)
+                                nll_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
 
                         if gradient_accumulation_steps > 1:
                             loss = loss / gradient_accumulation_steps

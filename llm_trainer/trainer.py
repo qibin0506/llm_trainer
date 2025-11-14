@@ -629,7 +629,7 @@ class Trainer:
                             if result['aux_loss'] and self.train_config.loss_config.aux_loss_coef:
                                 aux_loss = self.train_config.loss_config.aux_loss_coef * result['aux_loss']
                             else:
-                                aux_loss = torch.tensor(0.0)
+                                aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
 
                         if gradient_accumulation_steps > 1:
                             loss = loss / gradient_accumulation_steps

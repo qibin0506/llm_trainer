@@ -147,7 +147,7 @@ class PPOLoss(nn.Module):
             returns: torch.Tensor,
             advantages: torch.Tensor,
             mask: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ):
         """
         计算PPO的总损失、Actor损失和Value损失。
 
@@ -187,7 +187,16 @@ class PPOLoss(nn.Module):
         # 总损失
         total_loss = actor_loss + value_loss
 
-        return total_loss, actor_loss, value_loss
+        with torch.no_grad():
+            # 计算近似KL散度
+            logratios = log_probs - old_log_probs
+            approx_kl = torch.sum(((torch.exp(logratios) - 1) - logratios) * mask) / mask.sum().clamp(min=1.0)
+
+            # 计算裁剪比例
+            clipped = ratio.gt(1.0 + self.clip_eps) | ratio.lt(1.0 - self.clip_eps)
+            clip_frac = torch.sum(clipped.float() * mask) / mask.sum().clamp(min=1.0)
+
+        return total_loss, actor_loss, value_loss, approx_kl, clip_frac
 
 
 class GRPOLoss(nn.Module):

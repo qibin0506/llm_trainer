@@ -152,7 +152,7 @@ class GRPOTrainer(Trainer):
         prompt_masks = prompt_ids != pad_token_id
 
         # [batch*group_size, max_prompt_len+max_gen_len]
-        outputs: torch.Tensor = batch_generate(
+        outputs, _ = batch_generate(
             model=model,
             tokens=prompt_ids,
             pad_token_id=pad_token_id,
@@ -302,7 +302,7 @@ class GRPOTrainer(Trainer):
                                 if aux_loss_coef and aux_loss:
                                     aux_loss = aux_loss_coef * aux_loss
                                 else:
-                                    aux_loss = torch.tensor(0.0)
+                                    aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
 
                             total_loss = loss + aux_loss
                             self._backward_loss(total_loss)

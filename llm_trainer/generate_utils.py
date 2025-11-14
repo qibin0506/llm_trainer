@@ -330,6 +330,7 @@ def batch_generate(
     # 初始化完成标记
     end_token = TrainerTools().tokenizer.end
     done = torch.zeros(batch_size, dtype=torch.bool, device=device)
+    logits_history = []
 
     with torch.inference_mode():
         for _ in range(max_new_tokens):
@@ -352,6 +353,7 @@ def batch_generate(
 
             # 处理logits
             logits = logits[:, -1, :]  # (batch, vocab_size)
+            logits_history.append(logits)
 
             if done.any():
                 # 强制构造 one-hot 分布，确保 pad_token_id 概率为 1
@@ -409,5 +411,5 @@ def batch_generate(
             new_mask = torch.ones_like(next_token, dtype=torch.bool)
             attention_mask = torch.cat((attention_mask, new_mask), dim=-1)
 
-        # 返回完整结果
-        return tokens if not use_kv_cache else generate_tokens
+        stacked_logits = torch.stack(logits_history, dim=1)
+        return generate_tokens, stacked_logits

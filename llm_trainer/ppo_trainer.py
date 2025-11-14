@@ -30,6 +30,7 @@ class ValueModel(nn.Module):
         super().__init__()
         self.base_model = base_model
         self.value_head = nn.Linear(base_model.config.hidden_size, 1, bias=False)
+        self.value_head.weight.data.zero_()
 
     def forward(self, *args, **kwargs) -> torch.Tensor:
         outputs = self.base_model(*args, **kwargs)
@@ -189,8 +190,10 @@ class PPOTrainer(Trainer):
                     device=device
                 )
 
+            # completion_ids 形状为 [B, N]
             completion_ids = full_ids[:, prompt_len:]
             full_attention_mask = (full_ids != pad_token_id)
+            # completion_mask 形状为 [B, N]
             completion_mask = full_attention_mask[:, prompt_len:]
 
             with autocast(device):
@@ -198,15 +201,22 @@ class PPOTrainer(Trainer):
                 ref_outputs = self.ref_model(full_ids, attention_mask=full_attention_mask)
 
             logits, ref_logits = policy_output['logits'], ref_outputs['logits']
-            log_probs = log_softmax(logits, full_ids)
-            ref_log_probs = log_softmax(ref_logits, full_ids)
 
-            log_probs_completion = log_probs[:, prompt_len - 1: -1]
-            ref_log_probs_completion = ref_log_probs[:, prompt_len - 1: -1]
+            # 获取 completion 部分的 logits (形状: [B, N, V])
+            #    从 L-1 (预测 C1) 到倒数第二个 logit (预测 CN)
+            logits_completion = logits[:, prompt_len - 1: -1]
+            ref_logits_completion = ref_logits[:, prompt_len - 1: -1]
 
+            # 在对齐好的张量上调用 log_softmax
+            #    这将返回 [B, N] 形状的正确 log_probs
+            log_probs_completion = log_softmax(logits_completion, completion_ids)
+            ref_log_probs_completion = log_softmax(ref_logits_completion, completion_ids)
+
+            # rewards 形状为 [B, N]
             rewards = torch.zeros_like(completion_mask, dtype=logits.dtype, device=device)
 
             if self.train_config.ppo_config.kl_beta > 0.0:
+                # kl_div 形状为 [B, N]
                 kl_div = log_probs_completion - ref_log_probs_completion
                 kl_rewards = -self.train_config.ppo_config.kl_beta * kl_div
                 rewards += kl_rewards
@@ -232,7 +242,7 @@ class PPOTrainer(Trainer):
         return {
             'full_ids': full_ids,
             'prompt_len': prompt_len,
-            'old_log_probs': log_probs.detach(),
+            'old_log_probs': log_probs_completion.detach(),
             'values': value_output.detach(),
             'rewards': rewards.detach(),
             'env_rewards': env_rewards_tensor,
@@ -243,27 +253,25 @@ class PPOTrainer(Trainer):
         old_log_probs, values = rollout_data['old_log_probs'], rollout_data['values']
         rewards = rollout_data['rewards']
 
-        # 1. Values: 对应状态 s_t。我们需要从 prompt 的最后一个状态开始，因为它产生了第一个 completion token。
-        #    切片到倒数第二个 state，因为 GAE 会处理最后一个 state。
+        # Values: 对应状态 s_t。我们需要从 prompt 的最后一个状态开始。
+        #    切片到倒数第二个 state，形状 [B, N]
         values_completion = values[:, prompt_len - 1: -1]
 
-        # 2. Old Log Probs: 对应动作 a_t (即 token_{t+1})。我们需要从第一个 completion token 开始。
-        old_log_probs_completion = old_log_probs[:, prompt_len -1: -1]
-
-        # 3. Mask: 对应动作，所以也从第一个 completion token 开始。
-        mask = (full_ids[:, prompt_len:] != TrainerTools().tokenizer.pad).long()
+        # Mask 和 Completion IDs: 对应动作，从第一个 completion token 开始。
+        #    形状 [B, N]
+        completion_ids = full_ids[:, prompt_len:]
+        mask = (completion_ids != TrainerTools().tokenizer.pad).long()
 
         # 根据奖励模式动态选择白化策略
         if self.train_config.ppo_config.use_sparse_rewards:
-            # 稀疏奖励模式，类似 TRL，保留均值，只缩放方差
             rewards = masked_whiten(rewards, mask, shift_mean=False)
         else:
-            # 密集奖励模式，必须将均值中心化以稳定价值函数学习
             rewards = masked_whiten(rewards, mask, shift_mean=True)
 
         # GAE Calculation
+        # rewards, values_completion, mask 均为 [B, N]
         advantages, returns = self._compute_advantages_and_returns(rewards, values_completion, mask)
-        advantages = masked_whiten(advantages, mask, shift_mean=True) # shift_mean=True 会将均值移至0
+        advantages = masked_whiten(advantages, mask, shift_mean=True) # advantages 形状 [B, N]
 
         loss_with_aux_accumulation = 0
         loss_without_aux_accumulation = 0
@@ -275,22 +283,25 @@ class PPOTrainer(Trainer):
                 attention_mask = full_ids != TrainerTools().tokenizer.pad
 
                 policy_output, value_output = self.train_model(full_ids, attention_mask=attention_mask)
-
                 logits = policy_output['logits']
 
+                # current_values 形状 [B, N]
                 current_values = value_output[:, prompt_len - 1: -1]
 
-                current_log_probs_full = log_softmax(logits, full_ids)
-                current_log_probs = current_log_probs_full[:, prompt_len - 1: -1]
+                # 获取 completion 部分的 logits (形状: [B, N, V])
+                logits_completion = logits[:, prompt_len - 1: -1]
+
+                # 在对齐好的张量上调用 log_softmax (形状: [B, N])
+                current_log_probs = log_softmax(logits_completion, completion_ids)
 
                 loss, actor_loss, value_loss = self.criterion(
-                    log_probs=current_log_probs,
-                    old_log_probs=old_log_probs_completion,
-                    values=current_values,
-                    old_values=values_completion,
-                    returns=returns,
-                    advantages=advantages,
-                    mask=mask
+                    log_probs=current_log_probs,             # [B, N]
+                    old_log_probs=old_log_probs,  # [B, N]
+                    values=current_values,                   # [B, N]
+                    old_values=values_completion,            # [B, N]
+                    returns=returns,                         # [B, N]
+                    advantages=advantages,                   # [B, N]
+                    mask=mask                                # [B, N]
                 )
 
                 if policy_output.get('aux_loss') and self.train_config.loss_config.aux_loss_coef:

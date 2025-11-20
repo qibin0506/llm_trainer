@@ -125,6 +125,12 @@ def _generate(
     """
     use_kv_cache = True
 
+    # 确保输入维度是 [Batch, Seq]
+    if tokens.dim() == 1:
+        tokens = tokens.unsqueeze(0)
+
+    attention_mask = torch.ones_like(tokens, device=device, dtype=torch.long)
+
     if isinstance(model, VlmModel):
         tokens = batch_repeat_image_tok(tokens, tokens_per_image)
 
@@ -137,9 +143,10 @@ def _generate(
     with torch.inference_mode():
         for _ in range(max_new_tokens):
             t = tokens
-            with autocast(device):
+            with autocast(TrainerTools().parallel.device_type):
                 result = model(
                     t,
+                    attention_mask=attention_mask,
                     past_key_values=kv_cache,
                     use_cache=use_kv_cache,
                     pixel_values=pixel_values
@@ -183,6 +190,10 @@ def _generate(
                 generate_tokens = torch.cat((generate_tokens, next_token), dim=-1)
             else:
                 tokens = torch.cat((tokens, next_token), dim=-1)
+
+            # [关键修复] 更新 mask：追加 1，让 Position ID 继续增长
+            new_mask_bit = torch.ones((tokens.shape[0], 1), device=device, dtype=attention_mask.dtype)
+            attention_mask = torch.cat((attention_mask, new_mask_bit), dim=-1)
 
             if next_token.item() == TrainerTools().tokenizer.end:
                 break
@@ -304,18 +315,19 @@ def batch_generate(
         model: torch.nn.Module,
         *,
         tokens: torch.Tensor,
-        pad_token_id: torch.Tensor,
         attention_mask: torch.Tensor,
         max_new_tokens: int,
-        temperature: Optional[float],
-        k: Optional[int],
-        p: Optional[float],
+        temperature: Optional[float] = None,
+        k: Optional[int] = None,
+        p: Optional[float] = None,
         pixel_values: Optional[torch.Tensor] = None,
         tokens_per_image: int = -1,
         suppress_tokens: Optional[List[int]] = None,
         device: Union[str, torch.device, int]
 ):
     use_kv_cache = True
+    end_token = TrainerTools().tokenizer.end
+    pad_token_id = TrainerTools().tokenizer.pad
 
     if isinstance(model, VlmModel):
         tokens = batch_repeat_image_tok(tokens, tokens_per_image)
@@ -323,93 +335,102 @@ def batch_generate(
     if pixel_values is not None:
         pixel_values = pixel_values.to(device)
 
+    orig_tokens = tokens.clone()
+    full_attention_mask = attention_mask.clone()
+
     kv_cache: Optional[KVCache] = None
-    generate_tokens = tokens.clone()
     batch_size = tokens.shape[0]
 
-    # 初始化完成标记
-    end_token = TrainerTools().tokenizer.end
+    # 预分配最大长度，避免循环中 cat 造成内存碎片
+    generated_tokens_buffer = torch.full(
+        (batch_size, max_new_tokens),
+        pad_token_id,
+        dtype=torch.long,
+        device=device
+    )
+
     done = torch.zeros(batch_size, dtype=torch.bool, device=device)
-    logits_history = []
+    current_tokens = tokens
+
+    padded_logits = None
+    actual_gen_len = 0
+
+    pad_token_tensor = torch.tensor(pad_token_id, device=device, dtype=torch.long)
 
     with torch.inference_mode():
-        for _ in range(max_new_tokens):
-            # 只处理未完成的样本
+        for i in range(max_new_tokens):
             if done.all():
                 break
 
-            t = tokens
-            with autocast(device):
+            actual_gen_len = i + 1
+
+            if current_tokens.dtype != torch.long:
+                current_tokens = current_tokens.long()
+
+            with autocast(TrainerTools().parallel.device_type):
                 result = model(
-                    t,
-                    attention_mask=attention_mask,
+                    current_tokens,
+                    attention_mask=full_attention_mask,
                     past_key_values=kv_cache,
                     use_cache=use_kv_cache,
                     pixel_values=pixel_values
                 )
-
                 logits = result['logits']
                 kv_cache = result['past_key_values']
 
-            # 处理logits
-            logits = logits[:, -1, :]  # (batch, vocab_size)
-            logits_history.append(logits)
+            logits = logits[:, -1, :]
 
-            if done.any():
-                # 强制构造 one-hot 分布，确保 pad_token_id 概率为 1
-                logits_done = torch.full_like(logits[done], -torch.finfo(logits.dtype).max)
-                logits_done[:, pad_token_id] = 0  # pad_token_id 的 logit 设为 0
-                logits[done] = logits_done
+            if padded_logits is None:
+                vocab_size = logits.shape[-1]
+                padded_logits = torch.zeros(
+                    (batch_size, max_new_tokens, vocab_size),
+                    dtype=logits.dtype,
+                    device=device
+                )
 
-            if suppress_tokens and suppress_tokens:
+            padded_logits[:, i, :] = logits
+
+            if suppress_tokens:
                 logits = _suppress_warper(logits, suppress_tokens)
 
             multinomial = False
             if temperature and temperature > 0:
                 multinomial = True
                 logits = _temperature_warper(logits, temperature)
-
             if k and k != 0:
                 logits = _top_k_warper(logits, k, device)
-
             if p and 0 < p <= 1:
                 logits = _top_p_warper(logits, p)
 
-            prob = logits.softmax(dim=-1)
-
-            # 检查并修正无效概率分布（sum <=0）[[1]][[4]]
-            prob_sum = prob.sum(dim=-1, keepdim=True)
-            invalid_mask = (prob_sum <= 0)
-            if invalid_mask.any():
-                # 为无效样本生成均匀分布，确保概率总和>0
-                uniform_prob = torch.ones_like(prob) / prob.size(-1)
-                prob = torch.where(invalid_mask.unsqueeze(-1), uniform_prob, prob)
-
-            # 抑制已完成样本（确保 pad_token_id 概率为 1）
-            prob[done] = 0
-            prob[done, pad_token_id] = 1
-
-            # 数值稳定性处理
-            if torch.isnan(prob).any() or torch.isinf(prob).any():
-                prob = torch.nan_to_num(prob, nan=0.0, posinf=1.0, neginf=0.0)
-
             if multinomial:
-                next_token = torch.multinomial(prob, num_samples=1)
+                prob = logits.softmax(dim=-1)
+                next_token_active = torch.multinomial(prob, num_samples=1)
             else:
-                next_token = logits.argmax(dim=-1, keepdim=True)
+                next_token_active = logits.argmax(dim=-1, keepdim=True)
 
-            # 更新完成标记
-            done = done | (next_token.squeeze(-1) == end_token)
+            next_token = torch.where(
+                done.unsqueeze(1),
+                pad_token_tensor,
+                next_token_active
+            )
 
-            # 拼接生成结果
-            if use_kv_cache:
-                tokens = next_token
-                generate_tokens = torch.cat((generate_tokens, next_token), dim=-1)
-            else:
-                tokens = torch.cat((tokens, next_token), dim=-1)
+            generated_tokens_buffer[:, i] = next_token.squeeze(-1)
 
-            new_mask = torch.ones_like(next_token, dtype=torch.bool)
-            attention_mask = torch.cat((attention_mask, new_mask), dim=-1)
+            new_done = (next_token.squeeze(-1) == end_token)
+            done = done | new_done
 
-        stacked_logits = torch.stack(logits_history, dim=1)
-        return generate_tokens, stacked_logits
+            current_tokens = next_token
+
+            new_mask = (~done).long().to(full_attention_mask.dtype)
+            full_attention_mask = torch.cat((full_attention_mask, new_mask.unsqueeze(-1)), dim=-1)
+
+    final_generated_tokens = generated_tokens_buffer[:, :actual_gen_len]
+
+    if padded_logits is not None:
+        final_padded_logits = padded_logits[:, :actual_gen_len, :]
+    else:
+        final_padded_logits = None
+
+    final_full_sequences = torch.cat((orig_tokens, final_generated_tokens), dim=1)
+
+    return final_full_sequences, final_padded_logits

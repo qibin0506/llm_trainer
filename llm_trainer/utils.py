@@ -131,14 +131,17 @@ def repeat_image_tok(
 ) -> torch.Tensor:
     # tokens_per_image=3 -> <image>...xxxx -> <image><image><image>...xxx
     image_tok = TrainerTools().tokenizer.image
-    if image_tok not in tokens:
+    mask = (tokens == image_tok)
+    if not mask.any():
         return tokens
 
-    image_tok_idx = torch.where(tokens == image_tok)[0].item()
-    repeat_image_toks = torch.tensor([image_tok] * tokens_per_image, dtype=tokens.dtype, device=tokens.device)
+    idxs = torch.nonzero(mask, as_tuple=False)
+    if idxs.numel() == 0:
+        return tokens
 
-    # repeat image_tok
-    new_tokens = torch.concat([tokens[:image_tok_idx], repeat_image_toks, tokens[image_tok_idx + 1:]], dim=-1)
+    image_tok_idx = idxs[0, 0].item()
+    repeat_image_toks = torch.tensor([image_tok] * tokens_per_image, dtype=tokens.dtype, device=tokens.device)
+    new_tokens = torch.cat([tokens[:image_tok_idx], repeat_image_toks, tokens[image_tok_idx + 1:]], dim=-1)
     return new_tokens
 
 
@@ -378,6 +381,58 @@ def masked_whiten(values: torch.Tensor, mask: torch.Tensor, shift_mean: bool = T
     if not shift_mean:
         whitened += mean
     return whitened
+
+
+def truncate_sequences_at_eos(
+        sequences: torch.Tensor,
+        eos_token_id: int,
+        pad_token_id: int
+) -> torch.Tensor:
+    """
+    高效地将批处理中的序列在第一个EOS标记处截断。
+    第一个EOS标记之后的所有内容（不包括EOS自身）将被替换为pad_token_id。
+
+    这是一个向量化的实现，以确保在GPU上的性能。
+    它使用 torch.where，因此不依赖于 pad_token_id 必须为0。
+
+    Args:
+        sequences (torch.Tensor): 批处理序列, 形状为 (batch_size, seq_len)。
+        eos_token_id (int): 句子结束标记的ID。
+        pad_token_id (int): 填充标记的ID。
+
+    Returns:
+        torch.Tensor: 截断后的序列，形状与输入相同。
+    """
+    # 创建一个布尔掩码，标记所有EOS token的位置
+    eos_mask = (sequences == eos_token_id)
+
+    # 找到每行中第一个True（即第一个EOS token）的索引
+    # .int() 是为了兼容旧版torch，argmax需要非布尔类型
+    first_eos_indices = torch.argmax(eos_mask.int(), dim=1)
+
+    # 检查哪些序列确实包含了EOS token。
+    # 如果某一行完全没有EOS, argmax会返回0, 这会产生歧义。
+    has_eos = eos_mask.any(dim=1)
+
+    # 对于没有EOS token的序列，将截断索引设置为序列最大长度，以防错误截断
+    first_eos_indices[~has_eos] = sequences.shape[1]
+
+    # 创建一个 [0, 1, 2, ..., seq_len-1] 的索引张量
+    indices_mask = torch.arange(sequences.shape[1], device=sequences.device)
+
+    # 利用广播机制创建一个掩码，标记所有应保留的token
+    # 对于每个序列，当 token_index < first_eos_index 时为True
+    keep_mask = indices_mask < first_eos_indices.unsqueeze(1)
+
+    # 使用 torch.where 进行安全替换
+    # 如果 keep_mask 为 True，则保留原始序列的token，否则替换为 pad_token_id
+    truncated_sequences = torch.where(
+        keep_mask,
+        sequences,
+        pad_token_id
+    )
+
+    return truncated_sequences
 
 
 def _masked_mean(values: torch.Tensor, mask: torch.Tensor, axis: Optional[bool] = None) -> torch.Tensor:

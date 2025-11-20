@@ -158,7 +158,7 @@ class PPOLoss(nn.Module):
         :param returns: GAE计算出的回报, 形状: [batch_size, seq_len]
         :param advantages: GAE计算出的优势, 形状: [batch_size, seq_len]
         :param mask: 掩码，只计算生成部分的损失, 形状: [batch_size, seq_len]
-        :return: (总损失, Actor损失, Value损失)
+        :return: (总损失, Actor损失, Value损失, Entropy)
         """
         # Value Loss (价值损失) with clipping
         values_clipped = old_values + torch.clamp(values - old_values, -self.clip_eps, self.clip_eps)
@@ -166,7 +166,7 @@ class PPOLoss(nn.Module):
         vf_loss_clipped = F.mse_loss(values_clipped, returns, reduction='none')
         value_loss = torch.max(vf_loss_unclipped, vf_loss_clipped)
         # Apply mask and average
-        value_loss = (value_loss * mask).sum() / mask.sum().clamp(min=1.0)
+        value_loss = 0.5 * (value_loss * mask).sum() / mask.sum().clamp(min=1.0)
         value_loss = value_loss * self.vf_coef
 
         # Actor Loss (策略损失)

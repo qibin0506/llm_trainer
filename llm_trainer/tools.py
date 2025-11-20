@@ -2,9 +2,7 @@ import os
 from abc import ABC, abstractmethod
 import torch
 from .tokenizer import Tokenizer
-from .parallel_ds import DsParallel
-from .parallel_ddp import DdpParallel
-from .parallel_none import NoneParallel
+from .parallel import DsParallel, DdpParallel, NoneParallel
 from .log import log
 
 

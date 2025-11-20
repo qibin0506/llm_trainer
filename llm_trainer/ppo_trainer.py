@@ -29,8 +29,9 @@ class ValueModel(nn.Module):
     def __init__(self, base_model: Union[LlmModel, VlmModel]):
         super().__init__()
         self.base_model = base_model
-        self.value_head = nn.Linear(base_model.config.hidden_size, 1, bias=False)
-        self.value_head.weight.data.zero_()
+        self.value_head = nn.Linear(base_model.config.hidden_size, 1, bias=True)
+        self.value_head.weight.data.normal_(mean=0.0, std=0.01)
+        self.value_head.bias.data.zero_()
 
     def forward(self, *args, **kwargs) -> torch.Tensor:
         outputs = self.base_model(*args, **kwargs)
@@ -131,7 +132,10 @@ class PPOTrainer(Trainer):
 
     def _init_loss(self):
         ppo_config = self.train_config.ppo_config
-        criterion = PPOLoss(clip_eps=ppo_config.clip_eps, vf_coef=ppo_config.vf_coef)
+        criterion = PPOLoss(
+            clip_eps=ppo_config.clip_eps,
+            vf_coef=ppo_config.vf_coef
+        )
         return criterion, None
 
     def _convert_train_args(self) -> Tuple[dict, dict, dict]:
@@ -148,17 +152,28 @@ class PPOTrainer(Trainer):
     def _check_eval_model(self, eval_model):
         return eval_model.policy_model
 
-    def _compute_advantages_and_returns(self, rewards: torch.Tensor, values: torch.Tensor,
-                                        completion_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _compute_advantages_and_returns(
+            self,
+            rewards: torch.Tensor,
+            values: torch.Tensor,
+            last_values: torch.Tensor,
+            completion_mask: torch.Tensor,
+            dones: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         gamma, lam = self.train_config.ppo_config.gamma, self.train_config.ppo_config.lam
-        last_gae_lam = 0
         advantages_reversed = []
+        last_gae_lam = 0
         seq_len = rewards.size(1)
 
+        values = values * completion_mask
         for t in reversed(range(seq_len)):
-            next_values = values[:, t + 1] if t < seq_len - 1 else 0.0
+            if t == seq_len - 1:
+                next_values = torch.where(dones, 0.0, last_values)
+            else:
+                next_values = values[:, t + 1]
+
             delta = rewards[:, t] + gamma * next_values - values[:, t]
-            last_gae_lam = delta + gamma * lam * last_gae_lam
+            last_gae_lam = delta + gamma * lam * last_gae_lam * completion_mask[:, t]
             advantages_reversed.append(last_gae_lam)
 
         advantages = torch.stack(advantages_reversed[::-1], dim=1)
@@ -167,26 +182,24 @@ class PPOTrainer(Trainer):
         return advantages * completion_mask, returns * completion_mask
 
     def _generate_rollout_data(self, batch_data: List[dict]) -> dict:
-        """
-        生成 rollout 数据
-        """
         ppo_config = self.train_config.ppo_config
         device = TrainerTools().parallel.device
         pad_token_id = TrainerTools().tokenizer.pad
+        eos_token_id = TrainerTools().tokenizer.end
 
-        prompts = [item["prompt"].to(device) for item in batch_data]
+        prompts = [item["prompt"] for item in batch_data]
         answers = [item["answer"] for item in batch_data]
 
         prompt_ids = left_pad_sequence(prompts, padding_value=pad_token_id)
+        prompt_ids = prompt_ids.to(device)
         prompt_masks = (prompt_ids != pad_token_id)
         prompt_len = prompt_ids.shape[1]
 
         with torch.no_grad():
             with unwrap_model_for_generation(self.train_model) as unwrapped_model:
-                full_ids, logits = batch_generate(
+                full_ids, logitss = batch_generate(
                     model=unwrapped_model.policy_model,
                     tokens=prompt_ids,
-                    pad_token_id=pad_token_id,
                     attention_mask=prompt_masks,
                     max_new_tokens=ppo_config.gen_max_new_tokens,
                     temperature=ppo_config.gen_temperature,
@@ -195,134 +208,155 @@ class PPOTrainer(Trainer):
                     suppress_tokens=ppo_config.gen_suppress_tokens,
                     device=device
                 )
-
                 completion_ids = full_ids[:, prompt_len:]
                 full_attention_mask = (full_ids != pad_token_id)
-                completion_mask = full_attention_mask[:, prompt_len:]
 
-                assert logits.shape[1] == completion_ids.shape[1], "Logits and completion length mismatch!"
-                old_log_probs = log_softmax(logits, completion_ids)
-
-                with autocast(device):
+                with autocast(TrainerTools().parallel.device_type):
                     value_output = unwrapped_model.value_model(full_ids, attention_mask=full_attention_mask)
 
-            ref_logits = self.ref_model(full_ids, attention_mask=full_attention_mask)['logits']
+            old_log_probs = log_softmax(logitss.float(), completion_ids)
 
-            ref_logits_completion = ref_logits[:, prompt_len - 1: -1]
-            ref_log_probs_completion = log_softmax(ref_logits_completion, completion_ids)
+            with unwrap_model_for_generation(self.ref_model) as unwrapped_ref_model:
+                ref_outputs = unwrapped_ref_model(full_ids, attention_mask=full_attention_mask)
+                ref_logits_full = ref_outputs['logits']
 
-            rewards = torch.zeros_like(completion_ids, dtype=logits.dtype, device=device)
+            ref_logits_completion = ref_logits_full[:, prompt_len - 1: -1]
+            ref_log_probs_completion = log_softmax(ref_logits_completion.float(), completion_ids)
 
-            # KL 散度奖励惩罚项
+            dones = torch.any(completion_ids == eos_token_id, dim=1)
+            rewards = torch.zeros_like(completion_ids, dtype=torch.float32, device=device)
+            completion_mask = (completion_ids != pad_token_id)
+
             if ppo_config.kl_beta > 0.0:
                 logr = ref_log_probs_completion - old_log_probs
                 kl = -logr if ppo_config.kl_estimator == "k1" else (logr.exp() - 1) - logr
+                kl_rewards = -ppo_config.kl_beta * kl
+                rewards += kl_rewards * completion_mask
 
-                kl_rewards = -ppo_config.kl_beta * kl * completion_mask
-                rewards += kl_rewards
-
-            # 外部环境奖励（例如，来自奖励模型）
             env_rewards_tensor = torch.tensor(
                 self.reward_func(prompts, completion_ids, answers),
-                dtype=logits.dtype,
+                dtype=torch.float32,
                 device=device
             )
 
-            if ppo_config.use_sparse_rewards:
-                last_token_indices = completion_mask.sum(dim=1) - 1
-                for i in range(prompt_ids.size(0)):
-                    if last_token_indices[i] >= 0:
-                        rewards[i, last_token_indices[i]] += env_rewards_tensor[i]
-            else:
-                # 密集奖励，奖励加到全部有效token上
-                final_rewards = env_rewards_tensor.unsqueeze(-1)
-                rewards += final_rewards * completion_mask
+            last_token_indices = completion_mask.sum(dim=1) - 1
+            valid_indices_mask = last_token_indices >= 0
+
+            if valid_indices_mask.any():
+                valid_batch_indices = torch.arange(prompt_ids.size(0), device=device)[valid_indices_mask]
+                valid_last_token_indices = last_token_indices[valid_indices_mask]
+                valid_env_rewards = env_rewards_tensor[valid_indices_mask]
+                rewards[valid_batch_indices, valid_last_token_indices] += valid_env_rewards
 
         return {
-            'prompt_ids': prompt_ids.detach().clone(),
-            'completion_ids': completion_ids.detach().clone(),
+            'prompt_ids': prompt_ids.detach(),
+            'completion_ids': completion_ids.detach(),
             'old_log_probs': old_log_probs.detach(),
             'values': value_output.detach(),
             'rewards': rewards.detach(),
             'env_rewards': env_rewards_tensor.detach(),
+            'dones': dones.detach(),
         }
 
     def _ppo_learning_phase(self, rollout_data: dict):
-        """
-        执行PPO学习阶段，根据 rollout 数据进行多轮优化。
-        """
-        prompt_ids = rollout_data['prompt_ids']
-        completion_ids = rollout_data['completion_ids']
-        old_log_probs = rollout_data['old_log_probs']
-        old_values = rollout_data['values']
-        rewards = rollout_data['rewards']
+        ppo_config = self.train_config.ppo_config
+
+        prompt_ids: torch.Tensor = rollout_data['prompt_ids']
+        completion_ids: torch.Tensor = rollout_data['completion_ids']
+        old_log_probs: torch.Tensor = rollout_data['old_log_probs']
+        old_values: torch.Tensor = rollout_data['values']
+        rewards: torch.Tensor = rollout_data['rewards']
+        dones: torch.Tensor = rollout_data['dones']
 
         prompt_len = prompt_ids.shape[1]
-        values = old_values[:, prompt_len - 1: -1]
-        completion_mask = (completion_ids != TrainerTools().tokenizer.pad)
+        batch_size = prompt_ids.shape[0]
 
-        if self.train_config.ppo_config.whiten_rewards:
+        values_for_gae = old_values[:, prompt_len - 1: -1]
+        last_values = old_values[:, -1]
+        assert values_for_gae.shape[1] == completion_ids.shape[1]
+
+        completion_mask: torch.Tensor = (completion_ids != TrainerTools().tokenizer.pad)
+
+        if ppo_config.whiten_rewards:
             rewards = masked_whiten(rewards, completion_mask, shift_mean=False)
 
-        advantages, returns = self._compute_advantages_and_returns(rewards, values, completion_mask)
+        advantages, returns = self._compute_advantages_and_returns(
+            rewards, values_for_gae, last_values, completion_mask, dones
+        )
+
         advantages_whitened = masked_whiten(advantages, completion_mask, shift_mean=True)
 
         input_ids = torch.cat((prompt_ids, completion_ids), dim=1)
         attention_mask = (input_ids != TrainerTools().tokenizer.pad)
 
-        loss_with_aux_accumulation = 0
-        loss_without_aux_accumulation = 0
-        aux_loss_accumulation = 0
-        actor_loss_accumulation = 0
-        value_loss_accumulation = 0.0
-        approx_kl_accumulation = 0.0
-        clip_frac_accumulation = 0.0
+        ppo_stats = {
+            "loss_with_aux": 0, "loss_without_aux": 0, "aux_loss": 0,
+            "actor_loss": 0, "value_loss": 0, "approx_kl": 0, "clip_frac": 0
+        }
 
-        avg_epochs = self.train_config.ppo_config.ppo_epochs
-        for _ in range(avg_epochs):
-            with autocast(TrainerTools().parallel.device_type):
-                policy_output, value_output = self.train_model(input_ids, attention_mask=attention_mask)
+        ppo_batch_size = ppo_config.ppo_batch_size
+        n_updates = 0
+        for ppo_epoch in range(ppo_config.ppo_epochs):
+            indices = torch.randperm(batch_size, device=TrainerTools().parallel.device)
 
-                logits_completion = policy_output['logits'][:, prompt_len - 1: -1]
-                current_log_probs = log_softmax(logits_completion, completion_ids)
-                current_values = value_output[:, prompt_len - 1: -1]
+            for i in range(0, batch_size, ppo_batch_size):
+                mini_batch_indices = indices[i:i + ppo_batch_size]
 
-                loss, actor_loss, value_loss, approx_kl, clip_frac = self.criterion(
-                    log_probs=current_log_probs,
-                    old_log_probs=old_log_probs,
-                    values=current_values,
-                    old_values=values,
-                    returns=returns,
-                    advantages=advantages_whitened,
-                    mask=completion_mask
-                )
+                mb_input_ids = input_ids[mini_batch_indices]
+                mb_attention_mask = attention_mask[mini_batch_indices]
+                mb_completion_ids = completion_ids[mini_batch_indices]
+                mb_completion_mask = completion_mask[mini_batch_indices]
+                mb_old_log_probs = old_log_probs[mini_batch_indices]
+                mb_values = values_for_gae[mini_batch_indices]
+                mb_returns = returns[mini_batch_indices]
+                mb_advantages = advantages_whitened[mini_batch_indices]
 
-                aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
-                if policy_output.get('aux_loss') and self.train_config.loss_config.aux_loss_coef:
-                    aux_loss = self.train_config.loss_config.aux_loss_coef * policy_output['aux_loss']
+                with autocast(TrainerTools().parallel.device_type):
+                    policy_output, value_output = self.train_model(mb_input_ids, attention_mask=mb_attention_mask)
 
-            total_loss = loss + aux_loss
-            self._backward_loss(total_loss)
-            self._apply_grad_clipping()
-            self._apply_step()
+                    target_dtype = policy_output['logits'].dtype
+                    mb_old_log_probs = mb_old_log_probs.to(target_dtype)
+                    mb_values = mb_values.to(target_dtype)
+                    mb_returns = mb_returns.to(target_dtype)
+                    mb_advantages = mb_advantages.to(target_dtype)
 
-            loss_with_aux_accumulation += total_loss.detach().item()
-            loss_without_aux_accumulation += loss.detach().item()
-            aux_loss_accumulation += aux_loss.detach().item()
-            actor_loss_accumulation += actor_loss.detach().item()
-            value_loss_accumulation += value_loss.detach().item()
-            approx_kl_accumulation += approx_kl.detach().item()
-            clip_frac_accumulation += clip_frac.detach().item()
+                    logits_completion = policy_output['logits'][:, prompt_len - 1: -1]
+                    current_log_probs = log_softmax(logits_completion, mb_completion_ids)
+                    current_values = value_output[:, prompt_len - 1: -1]
 
-        return (
-            loss_with_aux_accumulation / avg_epochs,
-            loss_without_aux_accumulation / avg_epochs,
-            aux_loss_accumulation / avg_epochs,
-            actor_loss_accumulation / avg_epochs,
-            value_loss_accumulation / avg_epochs,
-            approx_kl_accumulation / avg_epochs,
-            clip_frac_accumulation / avg_epochs
-        )
+                    loss, actor_loss, value_loss, approx_kl, clip_frac = self.criterion(
+                        log_probs=current_log_probs,
+                        old_log_probs=mb_old_log_probs,
+                        values=current_values,
+                        old_values=mb_values,
+                        returns=mb_returns,
+                        advantages=mb_advantages,
+                        mask=mb_completion_mask
+                    )
+
+                    aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
+                    if policy_output.get('aux_loss') and self.train_config.loss_config.aux_loss_coef:
+                        aux_loss = self.train_config.loss_config.aux_loss_coef * policy_output['aux_loss']
+
+                total_loss = loss + aux_loss
+                self._backward_loss(total_loss)
+                self._apply_grad_clipping()
+                self._apply_step()
+                n_updates += 1
+
+                ppo_stats["loss_with_aux"] += total_loss.detach().item()
+                ppo_stats["loss_without_aux"] += loss.detach().item()
+                ppo_stats["aux_loss"] += aux_loss.detach().item()
+                ppo_stats["actor_loss"] += actor_loss.detach().item()
+                ppo_stats["value_loss"] += value_loss.detach().item()
+                ppo_stats["approx_kl"] += approx_kl.detach().item()
+                ppo_stats["clip_frac"] += clip_frac.detach().item()
+
+        if n_updates > 0:
+            for key in ppo_stats:
+                ppo_stats[key] /= n_updates
+
+        return ppo_stats
 
     def train(self):
         global_steps = 0
@@ -357,13 +391,7 @@ class PPOTrainer(Trainer):
                     rollout_data = self._generate_rollout_data(batch_data)
 
                     try:
-                        (avg_loss,
-                         avg_loss_without_aux,
-                         avg_aux_loss,
-                         avg_actor_loss,
-                         avg_value_loss,
-                         avg_approx_kl,
-                         avg_clip_frac) = self._ppo_learning_phase(rollout_data)
+                        ppo_stats = self._ppo_learning_phase(rollout_data)
 
                         self._log(
                             keys={
@@ -372,13 +400,13 @@ class PPOTrainer(Trainer):
                                 'batch': f'{batch}/{batch_count_per_file}'
                             },
                             values={
-                                'loss(with aux)': avg_loss,
-                                'loss(without aux)': avg_loss_without_aux,
-                                'aux_loss': avg_aux_loss,
-                                'actor_loss': avg_actor_loss,
-                                'value_loss': avg_value_loss,
-                                'approx_kl': avg_approx_kl,
-                                'clip_frac': avg_clip_frac,
+                                'loss(with aux)': ppo_stats['loss_with_aux'],
+                                'loss(without aux)': ppo_stats['loss_without_aux'],
+                                'aux_loss': ppo_stats['aux_loss'],
+                                'actor_loss': ppo_stats['actor_loss'],
+                                'value_loss': ppo_stats['value_loss'],
+                                'approx_kl': ppo_stats['approx_kl'],
+                                'clip_frac': ppo_stats['clip_frac'],
                                 'rewards': rollout_data['env_rewards'].mean().item()
                             }
                         )
@@ -391,6 +419,8 @@ class PPOTrainer(Trainer):
                             save_checkpoint(model=self.train_model, optimizer=self.optimizer)
                             last_ckpt_batch = batch
                             self._on_batch_end(tag=f'epoch:{epoch}/batch:{batch}')
+
+                        torch.cuda.empty_cache()
 
             if not skipping_train:
                 save_steps(global_steps=global_steps, lr_scheduler=self.lr_scheduler)

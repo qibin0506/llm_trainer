@@ -6,7 +6,7 @@ from torch import nn
 from torch.optim import Optimizer
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from .parallel_ds import DsParallel
+from .parallel import DsParallel
 from .scheduler import LRScheduler
 from .tools import TrainerTools
 

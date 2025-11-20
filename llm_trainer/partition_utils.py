@@ -7,8 +7,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 
 from .tools import TrainerTools
-from .parallel_ds import DsParallel
-from .parallel_ddp import DdpParallel
+from .parallel import DsParallel, DdpParallel
 
 
 @contextmanager

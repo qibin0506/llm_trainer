@@ -1,6 +1,7 @@
 from typing import Tuple, List, Callable, Optional
 import torch
 from torch.utils.data import Dataset
+import torch.nn.functional as F
 
 from .trainer import Trainer
 from .train_configs import TrainConfig
@@ -155,7 +156,6 @@ class GRPOTrainer(Trainer):
         outputs, _ = batch_generate(
             model=model,
             tokens=prompt_ids,
-            pad_token_id=pad_token_id,
             attention_mask=prompt_masks,
             max_new_tokens=self.train_config.grpo_config.gen_max_new_tokens,
             temperature=self.train_config.grpo_config.gen_temperature,
@@ -185,11 +185,9 @@ class GRPOTrainer(Trainer):
             input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
             attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
 
-            # Compute old_log_probs from the current model, with gradients disabled.
             old_log_probs, _ = self._compute_log_probs(generate_model, input_ids, attention_mask)
 
             if self.ref_model:
-                # Compute ref_log_probs from the reference model, which remains static.
                 ref_log_probs, _ = self._compute_log_probs(self.ref_model, input_ids, attention_mask)
             else:
                 ref_log_probs = None
@@ -220,6 +218,8 @@ class GRPOTrainer(Trainer):
         repeated_prompts = rollout_data['repeated_prompts']
         repeated_answers = rollout_data['repeated_answers']
 
+        prompt_len = input_ids.shape[1] - completion_ids.shape[1]
+
         # [batch*group_size]
         rewards = torch.tensor(
             self.reward_func(repeated_prompts, completion_ids, repeated_answers),
@@ -233,11 +233,20 @@ class GRPOTrainer(Trainer):
         # Compute current log probabilities
         log_probs, aux_loss = self._compute_log_probs(self.train_model, input_ids, attention_mask)
 
+        pad_len = prompt_len - 1
+        if pad_len > 0:
+            padded_completion_mask = F.pad(completion_mask, (pad_len, 0), 'constant', 0)
+        else:
+            padded_completion_mask = completion_mask
+
+        assert padded_completion_mask.shape == log_probs.shape, \
+            f"Shape mismatch! Padded completion mask: {padded_completion_mask.shape}, Log probs: {log_probs.shape}"
+
         loss = self.criterion(
             log_probs=log_probs,
             old_log_probs=old_log_probs,
             ref_log_probs=ref_log_probs,
-            completion_mask=completion_mask,
+            completion_mask=padded_completion_mask,
             advantages=advantages
         )
 
@@ -292,6 +301,8 @@ class GRPOTrainer(Trainer):
                         rollout_data = self._generate_rollout_data(generate_model, batch_data)
                     # end generate
 
+                    torch.cuda.empty_cache()
+
                     try:
                         if TrainerTools().parallel.is_main_process:
                             log(f'start train for batch {batch}/{batch_count_per_file}')
@@ -299,7 +310,7 @@ class GRPOTrainer(Trainer):
                         for grpo_step in range(self.train_config.grpo_config.grpo_steps):
                             with autocast(TrainerTools().parallel.device_type):
                                 loss, aux_loss, rewards = self._maximize_grpo_objective(rollout_data)
-                                if aux_loss_coef and aux_loss:
+                                if aux_loss_coef and aux_loss is not None:
                                     aux_loss = aux_loss_coef * aux_loss
                                 else:
                                     aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)

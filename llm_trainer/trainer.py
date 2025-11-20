@@ -8,7 +8,7 @@ import torch.distributed as dist
 from torch.utils.data import Dataset
 from llm_model import LlmModel, VlmModel
 
-from .parallel_ds import DsParallel
+from .parallel import DsParallel
 from .tools import TrainerTools
 from .loss import LMLoss, KDLoss
 from .dataset import PretrainDataset
@@ -442,9 +442,9 @@ class Trainer:
 
         TrainerTools().parallel.synchronize()
 
-    def _get_eval_data(self) -> Tuple[str, Optional[str]]:
+    def _get_eval_data(self) -> Tuple[Optional[str], Optional[str]]:
         if len(self.eval_prompts) == 0:
-            return '', None
+            return None, None
 
         self.eval_idx += 1
         if self.eval_idx == len(self.eval_prompts):
@@ -491,25 +491,27 @@ class Trainer:
     def _eval(self, tag: str):
         with unwrap_model_for_generation(self.train_model) as eval_model:
             if TrainerTools().parallel.is_main_process:
-                eval_model = self._check_eval_model(eval_model)
-                eval_model.eval()
-
                 eval_prompt, eval_image_tag = self._get_eval_data()
 
-                if isinstance(self.train_config, VLMConfig) and self.pixel_values_provider and eval_image_tag:
-                    eval_pixel_values = self.pixel_values_provider([eval_image_tag])
-                else:
-                    eval_pixel_values = None
+                if eval_prompt:
+                    eval_model = self._check_eval_model(eval_model)
+                    eval_model.eval()
 
-                submit_gen_task(
-                    eval_model,
-                    self.train_config,
-                    tag=tag,
-                    prompt=eval_prompt,
-                    pixel_values=eval_pixel_values,
-                    tokens_per_image=self.tokens_per_image
-                )
-                eval_model.train()
+                    if isinstance(self.train_config, VLMConfig) and self.pixel_values_provider and eval_image_tag:
+                        eval_pixel_values = self.pixel_values_provider([eval_image_tag])
+                    else:
+                        eval_pixel_values = None
+
+                    submit_gen_task(
+                        eval_model,
+                        self.train_config,
+                        tag=tag,
+                        prompt=eval_prompt,
+                        pixel_values=eval_pixel_values,
+                        tokens_per_image=self.tokens_per_image
+                    )
+
+                    eval_model.train()
 
         TrainerTools().parallel.wait('eval')
 

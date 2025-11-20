@@ -7,6 +7,12 @@ from torch import nn
 import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+try:
+    import deepspeed
+except: ...
+
 from .log import log
 
 
@@ -147,3 +153,98 @@ class Parallel(ABC):
         log(f'wait at {self.device}{msg}')
         dist.barrier()
         log(f'continue at {self.device}{msg}')
+
+
+class DsParallel(Parallel):
+    def __init__(self):
+        deepspeed.init_distributed(dist_backend='nccl')
+        super().__init__(init_process_group=False)
+
+    def process(
+            self,
+            model: nn.Module,
+            optimizer: torch.optim.Optimizer,
+            kwargs: Optional[dict] = None,
+            save_instance: bool = True
+    ) -> Tuple[nn.Module, torch.optim.Optimizer]:
+        """
+            :param model:
+            :param optimizer:
+            :param kwargs:
+                参考deepspeed配置
+            :param save_instance
+            :return:
+        """
+
+        if save_instance:
+            self.raw_model = model
+
+        model, optim, _, _ = deepspeed.initialize(
+            model=model,
+            optimizer=optimizer,
+            dist_init_required=False,
+            config_params=kwargs
+        )
+
+        if save_instance:
+            self.model = model
+
+        return model, optim
+
+    def synchronize(self): ...
+
+    def destroy(self): ...
+
+
+class DdpParallel(Parallel):
+    def __init__(self):
+        super().__init__()
+
+    def process(
+            self,
+            model: nn.Module,
+            optimizer: torch.optim.Optimizer,
+            kwargs: Optional[dict] = None,
+            save_instance: bool = True
+    ) -> Tuple[nn.Module, torch.optim.Optimizer]:
+        model.to(self.device)
+
+        if self._use_compile:
+            model = torch.compile(model)
+
+        if self._use_parallel:
+            # self.model = DDP(module=model, broadcast_buffers=False, find_unused_parameters=True)
+            model = DDP(module=model, device_ids=[self._local_rank], output_device=self._local_rank)
+            raw_model = model.module
+        else:
+            model = model
+            raw_model = model
+
+        if save_instance:
+            self.model = model
+            self.raw_model = raw_model
+
+        return model, optimizer
+
+
+class NoneParallel(Parallel):
+    def __init__(self):
+        super().__init__(use_parallel=False)
+
+    def process(
+            self,
+            model: nn.Module,
+            optimizer: torch.optim.Optimizer,
+            kwargs: Optional[dict] = None,
+            save_instance: bool = True
+    ) -> Tuple[nn.Module, torch.optim.Optimizer]:
+        model.to(self.device)
+
+        if self._use_compile:
+            model = torch.compile(model)
+
+        if save_instance:
+            self.raw_model = model
+            self.model = model
+
+        return model, optimizer

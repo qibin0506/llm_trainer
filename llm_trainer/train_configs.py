@@ -139,9 +139,10 @@ class DPOConfig:
 
 @dataclass(kw_only=True)
 class PPOConfig:
+    ppo_epochs: int
+    ppo_batch_size: int
     ref_model_checkpoint: Mapping[str, Any]
     value_model_checkpoint: Optional[Mapping[str, Any]] = None
-    ppo_epochs: int = 4
     gamma: float = 1.0
     lam: float = 0.95
     clip_eps: float = 0.1
@@ -149,7 +150,6 @@ class PPOConfig:
     kl_beta: float = 0.02
     kl_estimator: str = 'k1' # or k3
     whiten_rewards: bool = False
-    use_sparse_rewards: bool = True
     gen_max_new_tokens: int
     gen_temperature: Optional[float] = None
     gen_k: Optional[int] = None

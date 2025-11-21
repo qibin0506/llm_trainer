@@ -13,7 +13,8 @@ from .log import log
 from .utils import (
     autocast,
     left_pad_sequence,
-    log_softmax
+    log_softmax,
+    disable_dropout_in_model
 )
 
 from .partition_utils import (
@@ -67,6 +68,11 @@ class GRPOTrainer(Trainer):
             param.requires_grad = False
 
         return ref_model
+
+    def _new_model(self, train_config: TrainConfig):
+        model = super()._new_model(train_config)
+        disable_dropout_in_model(model)
+        return model
 
     def _init_loss(self):
         criterion = GRPOLoss(

@@ -15,7 +15,8 @@ from .utils import (
     autocast,
     left_pad_sequence,
     log_softmax,
-    masked_whiten
+    masked_whiten,
+    disable_dropout_in_model
 )
 from .partition_utils import unwrap_model_for_generation
 from .log import log
@@ -129,6 +130,11 @@ class PPOTrainer(Trainer):
             param.requires_grad = False
 
         return ref_model
+
+    def _new_model(self, train_config: TrainConfig):
+        model = super()._new_model(train_config)
+        disable_dropout_in_model(model)
+        return model
 
     def _init_loss(self):
         ppo_config = self.train_config.ppo_config

@@ -11,7 +11,8 @@ from .utils import (
     autocast,
     get_dpo_collate_fn,
     fill_loss_mask,
-    log_softmax
+    log_softmax,
+    disable_dropout_in_model
 )
 
 from .checkpoint import (
@@ -55,6 +56,11 @@ class DPOTrainer(Trainer):
             param.requires_grad = False
 
         return ref_model
+
+    def _new_model(self, train_config: TrainConfig):
+        model = super()._new_model(train_config)
+        disable_dropout_in_model(model)
+        return model
 
     def _init_loss(self):
         criterion = DPOLoss(

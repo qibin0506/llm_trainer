@@ -326,14 +326,12 @@ class GRPOTrainer(Trainer):
                             self._apply_grad_clipping()
                             self._apply_step()
 
-                            loss_with_aux_accumulation = total_loss.detach().item()
-                            loss_without_aux_accumulation = loss.detach().item()
+                            loss_accumulation = total_loss.detach().item()
                             aux_loss_accumulation = aux_loss.detach().item()
 
-                            avg_loss, avg_loss_without_aux, avg_aux_loss = self._avg_loss(
+                            avg_loss, avg_aux_loss = self._avg_loss(
                                 losses=[
-                                    loss_with_aux_accumulation,
-                                    loss_without_aux_accumulation,
+                                    loss_accumulation,
                                     aux_loss_accumulation
                                 ],
                                 gradient_accumulation_steps=1,
@@ -348,9 +346,8 @@ class GRPOTrainer(Trainer):
                                     'grpo_step': grpo_step
                                 },
                                 values={
-                                    'loss(with aux)': avg_loss,
-                                    'loss(without aux)': avg_loss_without_aux,
-                                    'aux_loss': avg_aux_loss,
+                                    'loss': avg_loss,
+                                    'moe_aux_loss': avg_aux_loss,
                                     'rewards': (rewards.sum() / rewards.size(0)).item(),
                                 }
                             )

@@ -350,9 +350,8 @@ class PPOTrainer(Trainer):
                 self._apply_step()
                 n_updates += 1
 
-                ppo_stats["loss_with_aux"] += total_loss.detach().item()
-                ppo_stats["loss_without_aux"] += loss.detach().item()
-                ppo_stats["aux_loss"] += aux_loss.detach().item()
+                ppo_stats["loss"] += total_loss.detach().item()
+                ppo_stats["moe_aux_loss"] += aux_loss.detach().item()
                 ppo_stats["actor_loss"] += actor_loss.detach().item()
                 ppo_stats["value_loss"] += value_loss.detach().item()
                 ppo_stats["approx_kl"] += approx_kl.detach().item()
@@ -406,9 +405,8 @@ class PPOTrainer(Trainer):
                                 'batch': f'{batch}/{batch_count_per_file}'
                             },
                             values={
-                                'loss(with aux)': ppo_stats['loss_with_aux'],
-                                'loss(without aux)': ppo_stats['loss_without_aux'],
-                                'aux_loss': ppo_stats['aux_loss'],
+                                'loss': ppo_stats['loss'],
+                                'moe_aux_loss': ppo_stats['moe_aux_loss'],
                                 'actor_loss': ppo_stats['actor_loss'],
                                 'value_loss': ppo_stats['value_loss'],
                                 'approx_kl': ppo_stats['approx_kl'],

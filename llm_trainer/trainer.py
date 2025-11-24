@@ -552,8 +552,7 @@ class Trainer:
         global_steps = 0
         skipping_train = False
 
-        loss_with_aux_accumulation = 0.0
-        loss_without_aux_accumulation = 0.0
+        loss_accumulation = 0.0
         aux_loss_accumulation = 0.0
         batches_accumulated = 0
 
@@ -640,8 +639,7 @@ class Trainer:
                         total_loss = loss + aux_loss
                         self._backward_loss(total_loss)
 
-                        loss_with_aux_accumulation += total_loss.detach().item()
-                        loss_without_aux_accumulation += loss.detach().item()
+                        loss_accumulation += total_loss.detach().item()
                         aux_loss_accumulation += aux_loss.detach().item()
 
                         batches_accumulated += 1
@@ -650,10 +648,9 @@ class Trainer:
                             self._apply_grad_clipping()
                             self._apply_step()
 
-                            avg_loss, avg_loss_without_aux, avg_aux_loss = self._avg_loss(
+                            avg_loss, avg_aux_loss = self._avg_loss(
                                 losses=[
-                                    loss_with_aux_accumulation,
-                                    loss_without_aux_accumulation,
+                                    loss_accumulation,
                                     aux_loss_accumulation
                                 ],
                                 gradient_accumulation_steps=gradient_accumulation_steps,
@@ -667,15 +664,13 @@ class Trainer:
                                     'batch': f'{batch}/{batch_count_per_file}'
                                 },
                                 values={
-                                    'loss(with aux)': avg_loss,
-                                    'loss(without aux)': avg_loss_without_aux,
-                                    'aux_loss': avg_aux_loss
+                                    'loss': avg_loss,
+                                    'moe_aux_loss': avg_aux_loss
                                 }
                             )
 
                             # reset to default
-                            loss_with_aux_accumulation = 0.0
-                            loss_without_aux_accumulation = 0.0
+                            loss_accumulation = 0.0
                             aux_loss_accumulation = 0.0
                             batches_accumulated = 0
                     except Exception as e:

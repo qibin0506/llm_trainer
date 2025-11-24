@@ -1,4 +1,5 @@
 from typing import Tuple, List, Union, Callable, Optional
+import gc
 import torch
 from torch.utils.data import Dataset
 import torch.nn as nn
@@ -426,6 +427,16 @@ class PPOTrainer(Trainer):
 
                         torch.cuda.empty_cache()
 
+                # 一个文件训练结束后，清理内存
+                del train_data_loader
+                del dataset
+                if hasattr(TrainerTools().parallel, '_sampler'):
+                    TrainerTools().parallel._sampler = None
+
+                gc.collect()
+                torch.cuda.empty_cache()
+
+            # end epoch
             if not skipping_train:
                 save_steps(global_steps=global_steps, lr_scheduler=self.lr_scheduler)
                 save_checkpoint(model=self.train_model, optimizer=self.optimizer)

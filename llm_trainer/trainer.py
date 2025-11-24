@@ -1,5 +1,6 @@
 from typing import Optional, Tuple, List, Dict, Any
 import copy
+import gc
 import importlib.metadata
 from packaging import version
 
@@ -687,6 +688,15 @@ class Trainer:
                         try:
                             del loss
                         except UnboundLocalError: ...
+
+                # 一个文件训练结束后，清理内存
+                del train_data_loader
+                del dataset
+                if hasattr(TrainerTools().parallel, '_sampler'):
+                    TrainerTools().parallel._sampler = None
+
+                gc.collect()
+                torch.cuda.empty_cache()
 
             # end epoch
             if not skipping_train:

@@ -1,4 +1,5 @@
 from typing import Tuple, List, Callable, Optional
+import gc
 import torch
 from torch.utils.data import Dataset
 import torch.nn.functional as F
@@ -364,6 +365,15 @@ class GRPOTrainer(Trainer):
                         try:
                             del loss
                         except UnboundLocalError: ...
+
+                # 一个文件训练结束后，清理内存
+                del train_data_loader
+                del dataset
+                if hasattr(TrainerTools().parallel, '_sampler'):
+                    TrainerTools().parallel._sampler = None
+
+                gc.collect()
+                torch.cuda.empty_cache()
 
             # end epoch
             if not skipping_train:

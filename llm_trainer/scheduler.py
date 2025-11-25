@@ -101,12 +101,19 @@ class WarmupCosineAnnealingLRScheduler(LRScheduler):
 
             # 更新周期状态
             self.T_cur += 1
+            calc_t = self.T_cur
+
             if self.T_cur >= T_max:
-                self.cycle += 1
-                self.T_cur = 0  # 重置周期步数
+                if self._cosine_annealing_period_mul == 0:
+                    self.T_cur = T_max
+                    calc_t = T_max
+                else:
+                    self.cycle += 1
+                    self.T_cur = 0
+                    calc_t = T_max
 
             # 计算并设置新学习率
-            cos_factor = (1 + math.cos(math.pi * self.T_cur / T_max)) / 2
+            cos_factor = (1 + math.cos(math.pi * calc_t / T_max)) / 2
             lr = self._min_lr + (self._cosine_annealing_base_lr - self._min_lr) * cos_factor
 
             for param_group in self._optimizer.param_groups:

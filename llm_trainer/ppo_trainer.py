@@ -17,7 +17,8 @@ from .utils import (
     left_pad_sequence,
     log_softmax,
     masked_whiten,
-    disable_dropout_in_model
+    disable_dropout_in_model,
+    calc_position_ids
 )
 from .partition_utils import unwrap_model_for_generation
 from .log import log
@@ -77,6 +78,11 @@ class PPOTrainer(Trainer):
         self.reward_func = reward_func
 
         self.ref_model = self._init_ref_model()
+
+        if self.train_config.ppo_config.normalize_rewards and self.train_config.ppo_config.whiten_rewards:
+            self.train_config.ppo_config.whiten_rewards = False
+            if TrainerTools().parallel.is_main_process:
+                log('WARN: ppo_config.normalize_rewards is enabled, ppo_config.whiten_rewards must be disabled.')
 
     def _init_train_model_and_optim(self, initial_lr: float):
         policy_model = self._new_model(self.train_config)
@@ -217,14 +223,23 @@ class PPOTrainer(Trainer):
                 )
                 completion_ids = full_ids[:, prompt_len:]
                 full_attention_mask = (full_ids != pad_token_id)
+                full_position_ids = calc_position_ids(full_attention_mask)
 
                 with autocast(TrainerTools().parallel.device_type):
-                    value_output = unwrapped_model.value_model(full_ids, attention_mask=full_attention_mask)
+                    value_output = unwrapped_model.value_model(
+                        full_ids,
+                        attention_mask=full_attention_mask,
+                        position_ids=full_position_ids
+                    )
 
             old_log_probs = log_softmax(logitss.float(), completion_ids)
 
             with unwrap_model_for_generation(self.ref_model) as unwrapped_ref_model:
-                ref_outputs = unwrapped_ref_model(full_ids, attention_mask=full_attention_mask)
+                ref_outputs = unwrapped_ref_model(
+                    full_ids,
+                    attention_mask=full_attention_mask,
+                    position_ids=full_position_ids
+                )
                 ref_logits_full = ref_outputs['logits']
 
             ref_logits_completion = ref_logits_full[:, prompt_len - 1: -1]
@@ -246,6 +261,17 @@ class PPOTrainer(Trainer):
                 device=device
             )
 
+            if ppo_config.missing_eos_penalty is not None:
+                env_rewards_tensor[~dones] -= ppo_config.missing_eos_penalty
+
+            raw_reward_mean = env_rewards_tensor.mean()
+            if self.train_config.ppo_config.normalize_rewards:
+                batch_std = env_rewards_tensor.std()
+                if torch.isnan(batch_std) or batch_std < 1e-8:
+                    batch_std = 1.0
+
+                env_rewards_tensor = (env_rewards_tensor - raw_reward_mean) / batch_std
+
             last_token_indices = completion_mask.sum(dim=1) - 1
             valid_indices_mask = last_token_indices >= 0
 
@@ -261,7 +287,7 @@ class PPOTrainer(Trainer):
             'old_log_probs': old_log_probs.detach(),
             'values': value_output.detach(),
             'rewards': rewards.detach(),
-            'env_rewards': env_rewards_tensor.detach(),
+            'env_rewards': raw_reward_mean.detach(),
             'dones': dones.detach(),
         }
 
@@ -286,19 +312,20 @@ class PPOTrainer(Trainer):
 
         if ppo_config.whiten_rewards:
             rewards = masked_whiten(rewards, completion_mask, shift_mean=False)
+            rewards = torch.masked_fill(rewards, ~completion_mask, 0.0)
 
         advantages, returns = self._compute_advantages_and_returns(
             rewards, values_for_gae, last_values, completion_mask, dones
         )
 
         advantages_whitened = masked_whiten(advantages, completion_mask, shift_mean=True)
+        advantages_whitened = torch.masked_fill(advantages_whitened, ~completion_mask, 0.0)
 
         input_ids = torch.cat((prompt_ids, completion_ids), dim=1)
         attention_mask = (input_ids != TrainerTools().tokenizer.pad)
 
         ppo_stats = {
-            "loss_with_aux": 0, "loss_without_aux": 0, "aux_loss": 0,
-            "actor_loss": 0, "value_loss": 0, "approx_kl": 0, "clip_frac": 0
+            "loss": 0, "moe_aux_loss": 0, "actor_loss": 0, "value_loss": 0, "approx_kl": 0, "clip_frac": 0
         }
 
         ppo_batch_size = ppo_config.ppo_batch_size
@@ -316,10 +343,15 @@ class PPOTrainer(Trainer):
                 mb_old_log_probs = old_log_probs[mini_batch_indices]
                 mb_values = values_for_gae[mini_batch_indices]
                 mb_returns = returns[mini_batch_indices]
-                mb_advantages = advantages_whitened[mini_batch_indices]
+                mb_advantages = advantages_whitened[mini_batch_indices] 
+                mb_position_ids = calc_position_ids(mb_attention_mask)
 
                 with autocast(TrainerTools().parallel.device_type):
-                    policy_output, value_output = self.train_model(mb_input_ids, attention_mask=mb_attention_mask)
+                    policy_output, value_output = self.train_model(
+                        mb_input_ids,
+                        attention_mask=mb_attention_mask,
+                        position_ids=mb_position_ids
+                    )
 
                     target_dtype = policy_output['logits'].dtype
                     mb_old_log_probs = mb_old_log_probs.to(target_dtype)
@@ -412,7 +444,7 @@ class PPOTrainer(Trainer):
                                 'value_loss': ppo_stats['value_loss'],
                                 'approx_kl': ppo_stats['approx_kl'],
                                 'clip_frac': ppo_stats['clip_frac'],
-                                'rewards': rollout_data['env_rewards'].mean().item()
+                                'rewards': rollout_data['env_rewards'].item()
                             }
                         )
                     except Exception as e:

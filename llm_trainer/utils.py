@@ -125,6 +125,16 @@ def generate_position_ids(input_ids: torch.Tensor):
     return position_ids
 
 
+def calc_position_ids(attention_mask: torch.Tensor) -> torch.Tensor:
+    """
+    根据 attention_mask 计算 position_ids，主要用于 Left Padding 场景。
+    mask: [0, 0, 1, 1, 1] -> position_ids: [0, 0, 0, 1, 2]
+    """
+    position_ids = attention_mask.long().cumsum(-1) - 1
+    position_ids.masked_fill_(attention_mask == 0, 0)
+    return position_ids
+
+
 def repeat_image_tok(
         tokens: torch.Tensor,
         tokens_per_image: int

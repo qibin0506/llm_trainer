@@ -4,7 +4,8 @@ from llm_model import VlmModel, KVCache
 from .tools import TrainerTools
 from .utils import (
     autocast,
-    batch_repeat_image_tok
+    batch_repeat_image_tok,
+    calc_position_ids
 )
 
 
@@ -338,6 +339,9 @@ def batch_generate(
     orig_tokens = tokens.clone()
     full_attention_mask = attention_mask.clone()
 
+    # 初始化 position_ids，处理 left padding
+    position_ids = calc_position_ids(full_attention_mask)
+
     kv_cache: Optional[KVCache] = None
     batch_size = tokens.shape[0]
 
@@ -367,10 +371,19 @@ def batch_generate(
             if current_tokens.dtype != torch.long:
                 current_tokens = current_tokens.long()
 
+            if kv_cache is None:
+                current_position_ids = position_ids
+            else:
+                # 下一个位置ID基于当前mask序列的最后一个有效位置
+                # 如果kv_cache有效，当前token是上一步生成的，位置是前一个位置+1
+                current_position_ids = position_ids[:, -1:] + 1
+                position_ids = torch.cat((position_ids, current_position_ids), dim=-1)
+
             with autocast(TrainerTools().parallel.device_type):
                 result = model(
                     current_tokens,
                     attention_mask=full_attention_mask,
+                    position_ids=current_position_ids,
                     past_key_values=kv_cache,
                     use_cache=use_kv_cache,
                     pixel_values=pixel_values

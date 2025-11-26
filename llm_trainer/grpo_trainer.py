@@ -15,7 +15,8 @@ from .utils import (
     autocast,
     left_pad_sequence,
     log_softmax,
-    disable_dropout_in_model
+    disable_dropout_in_model,
+    calc_position_ids
 )
 
 from .partition_utils import (
@@ -106,10 +107,13 @@ class GRPOTrainer(Trainer):
             input_ids,
             attention_mask
     ):
+        position_ids = calc_position_ids(attention_mask)
+
         # [batch_size, total_seq_len, vocab_size]
         outputs = model(
             input_ids=input_ids,
-            attention_mask=attention_mask
+            attention_mask=attention_mask,
+            position_ids=position_ids
         )
 
         # [batch_size, total_seq_len - 1, vocab_size]

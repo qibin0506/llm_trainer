@@ -5,6 +5,9 @@
 pip3 install project_llm_trainer
 ```
 
+## 数据集格式说明
+可参考：[https://github.com/qibin0506/llm_trainer/blob/master/example/create_dataset.md](https://github.com/qibin0506/llm_trainer/blob/master/example/create_dataset.md)
+
 ## 训练参数说明
 |  字段 | 类型 | 解释 |
 |  ---- |  ----   | ---- |

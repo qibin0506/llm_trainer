@@ -167,7 +167,8 @@ class Trainer:
                     else:
                         optimizer = deepspeed.ops.adam.DeepSpeedCPUAdam
                         use_lion_optim = False
-                        log('When set offload_optimizer, lion optim is unsupported, so set optim to adam!!!!!')
+                        if TrainerTools().parallel.is_main_process:
+                            log('When set offload_optimizer, lion optim is unsupported, so set optim to adam!!!!!')
                 else:
                     optimizer = deepspeed.ops.adam.DeepSpeedCPUAdam
             else:
@@ -255,7 +256,8 @@ class Trainer:
 
             self.lr_scheduler.restore_ckpt_dict(steps_dict)
 
-            log(f'restore steps_dict={steps_dict}')
+            if TrainerTools().parallel.is_main_process:
+                log(f'restore steps_dict={steps_dict}')
 
     def _convert_train_args(self) -> Tuple[dict, dict, dict]:
         parallel_kwargs: Optional[Dict[str, Any]] = None

@@ -3,6 +3,7 @@ from torch.utils.data import Dataset
 import pickle
 import csv
 import json
+import numpy as np
 
 from .tools import TrainerTools
 from .utils import repeat_image_tok
@@ -12,7 +13,9 @@ from .utils import repeat_image_tok
 support jsonl and pkl
 """
 def _get_file_type(file_path: str):
-    if file_path.endswith('.jsonl'):
+    if file_path.endswith('.npy'):
+        return 'npy'
+    elif file_path.endswith('.jsonl'):
         return 'jsonl'
     elif file_path.endswith('.pkl'):
         return 'pkl'
@@ -23,8 +26,9 @@ def _get_file_type(file_path: str):
 class PretrainDataset(Dataset):
     """
     适用于pretrain阶段，数据格式支持jsonl和pkl，如果是jsonl会在init阶段全部encode成token
-    jsonl: {'text': 'text1'}\n{'text': 'text2'}
-    pkl: [0, 1, 2, 3 ...]
+    1. npy:【推荐】numpy 数组，支持 mmap，内存占用极低
+    2. jsonl: {'text': 'text1'}\n{'text': 'text2'}
+    3. pkl: [0, 1, 2, 3 ...]
     """
     def __init__(
             self,
@@ -34,33 +38,60 @@ class PretrainDataset(Dataset):
     ):
         super().__init__()
 
-        self.input_ids = []
+        self.block_size = block_size
+        self.stride = stride
+        self.use_mmap = False
 
         file_type = _get_file_type(file_path)
-        if file_type == 'jsonl':
+
+        if file_type == 'npy':
+            self.input_ids = np.load(file_path, mmap_mode='r')
+            self.use_mmap = True
+        elif file_type == 'jsonl':
             tokens = []
             with open(file_path, 'r') as f:
                 for line in f:
                     tokens.extend(TrainerTools().tokenizer.encode(json.loads(line.strip())['text']))
+            self.input_ids = torch.tensor(tokens, dtype=torch.int32)
+            del tokens
         elif file_type == 'pkl':
             with open(file_path, 'rb') as f:
                 tokens = pickle.load(f)
+            self.input_ids = torch.tensor(tokens, dtype=torch.int32)
+            del tokens
         else:
             raise Exception(f'unsupported file type for {file_path}')
 
-        for i in range(0, len(tokens) - block_size + 1, stride):
-            self.input_ids.append(tokens[i:i+block_size])
+        if len(self.input_ids) < block_size:
+            self.length = 0
+        else:
+            self.length = (len(self.input_ids) - block_size) // stride + 1
 
     def __len__(self):
-        return len(self.input_ids)
+        return self.length
 
     def __getitem__(self, item):
-        return torch.tensor(self.input_ids[item]).long()
+        if item < 0 or item >= self.length:
+            raise IndexError(f"Index {item} out of range")
+
+        start_idx = item * self.stride
+        end_idx = start_idx + self.block_size
+
+        data = self.input_ids[start_idx:end_idx]
+
+        if self.use_mmap:
+            return torch.from_numpy(data.astype(np.int64))
+        else:
+            return data.long()
 
 
 class SFTDataset(Dataset):
     """
     适用于sft阶段，数据格式支持jsonl和pkl，如果是jsonl，则会在getitem阶段encode成token
+    npy: [
+            [0, 1, 2, 3],
+            [4, 5, 6, 7]
+         ]
     jsonl: [
             {'role': 'system', 'content': 'system_content'},
             {'role': 'user', 'content': 'user_content'},
@@ -92,9 +123,14 @@ class SFTDataset(Dataset):
         self.plain_text = False
 
         file_type = _get_file_type(file_path)
-        if file_type == 'jsonl':
-            self.plain_text = True
 
+        if file_type == 'npy':
+            try:
+                self.input_ids = np.load(file_path, mmap_mode='r')
+            except ValueError:
+                self.input_ids = np.load(file_path, allow_pickle=True)
+        elif file_type == 'jsonl':
+            self.plain_text = True
             with open(file_path, 'r') as f:
                 for line in f:
                     self.input_ids.append(json.loads(line.strip()))
@@ -119,7 +155,11 @@ class SFTDataset(Dataset):
         else:
             inputs = self.input_ids[item]
 
-        inputs = torch.tensor(inputs).long()
+        if isinstance(inputs, np.ndarray):
+            inputs = torch.from_numpy(inputs).long()
+        else:
+            inputs = torch.tensor(inputs).long()
+
         image_tag = self.image_tags[item] if self.image_tags else None
 
         if self.tokens_per_image != -1:
@@ -138,6 +178,10 @@ class SFTDataset(Dataset):
 class DPODataset(Dataset):
     """
     适用于dpo阶段，数据格式支持jsonl和pkl，如果是jsonl，则会在getitem阶段encode成token
+    npy: [
+            {'chosen': xxx, 'rejected': xxx},
+            {'chosen': xxx, 'rejected': xxx},
+         ]
     jsonl: {'chosen':
                 [{'role': 'system', 'content': 'system_content'},
                 {'role': 'user', 'content': 'user_content'},
@@ -163,49 +207,59 @@ class DPODataset(Dataset):
     """
     def __init__(self, file_path, max_len):
         self.max_len = max_len
-        self.chosen_ids = []
-        self.rejected_ids = []
+        self.data = []
         self.plain_text = False
 
         file_type = _get_file_type(file_path)
-        if file_type == 'jsonl':
-            self.plain_text = True
 
+        if file_type == 'npy':
+            try:
+                self.data = np.load(file_path, mmap_mode='r')
+            except ValueError:
+                self.data = np.load(file_path, allow_pickle=True)
+        elif file_type == 'jsonl':
+            self.plain_text = True
             with open(file_path, 'r') as f:
                 for line in f:
-                    json_ = json.loads(line.strip())
-                    self.chosen_ids.append(json_['chosen'])
-                    self.rejected_ids.append(json_['rejected'])
+                    self.data.append(json.loads(line.strip()))
         elif file_type == 'pkl':
             with open(file_path, 'rb') as f:
-                tokens = pickle.load(f)
-
-            for token in tokens:
-                self.chosen_ids.append(token['chosen'])
-                self.rejected_ids.append(token['rejected'])
+                self.data = pickle.load(f)
         else:
             raise Exception(f'unsupported file type for {file_path}')
 
     def __len__(self):
-        return len(self.chosen_ids)
+        return len(self.data)
 
     def __getitem__(self, item):
+        record = self.data[item]
+
+        chosen_raw = record['chosen']
+        rejected_raw = record['rejected']
+
         if self.plain_text:
-            chosen_id = TrainerTools().tokenizer.apply_chat_template(self.chosen_ids[item])
-            rejected_id = TrainerTools().tokenizer.apply_chat_template(self.rejected_ids[item])
+            chosen_id = TrainerTools().tokenizer.apply_chat_template(chosen_raw)
+            rejected_id = TrainerTools().tokenizer.apply_chat_template(rejected_raw)
         else:
-            chosen_id = self.chosen_ids[item]
-            rejected_id = self.rejected_ids[item]
+            chosen_id = chosen_raw
+            rejected_id = rejected_raw
+
+        if isinstance(chosen_id, np.ndarray): chosen_id = chosen_id.tolist()
+        if isinstance(rejected_id, np.ndarray): rejected_id = rejected_id.tolist()
 
         return {
-            'chosen': chosen_id[:self.max_len],
-            'rejected': rejected_id[:self.max_len]
+            'chosen': torch.tensor(chosen_id[:self.max_len]).long(),
+            'rejected': torch.tensor(rejected_id[:self.max_len]).long()
         }
 
 
 class RLDataset(Dataset):
     """
         适用于RL阶段（例如：PPO、GRPO、GSPO），数据格式支持jsonl和pkl，如果是jsonl，则会在getitem阶段encode成token
+        npy: [
+                {'prompt': xxx, 'answer': xxx},
+                {'prompt': xxx, 'answer': xxx},
+             ]
         jsonl: {'prompt':
                     [{'role': 'system', 'content': 'system_content'},
                     {'role': 'user', 'content': 'user_content'}]
@@ -222,52 +276,57 @@ class RLDataset(Dataset):
              ]
         """
     def __init__(self, file_path):
-        self.questions = []
-        self.answers = []
+        self.data = []
         self.plain_text = False
 
         file_type = _get_file_type(file_path)
-        if file_type == 'jsonl':
+
+        if file_type == 'npy':
+            try:
+                self.data = np.load(file_path, mmap_mode='r')
+            except ValueError:
+                self.data = np.load(file_path, allow_pickle=True)
+        elif file_type == 'jsonl':
             self.plain_text = True
 
             with open(file_path, 'r') as f:
                 for line in f:
-                    json_ = json.loads(line.strip())
-                    self.questions.append(json_['prompt'])
-
-                    if 'answer' in json_:
-                        self.answers.append(json_['answer'])
-                    else:
-                        self.answers.append(None)
+                    self.data.append(json.loads(line.strip()))
         elif file_type == 'pkl':
             with open(file_path, 'rb') as f:
-                tokens = pickle.load(f)
-
-            for token in tokens:
-                self.questions.append(token['prompt'])
-
-                if 'answer' in token:
-                    self.answers.append(token['answer'])
-                else:
-                    self.answers.append(None)
+                self.data = pickle.load(f)
         else:
             raise Exception(f'unsupported file type for {file_path}')
 
     def __len__(self):
-        return len(self.questions)
+        return len(self.data)
 
     def __getitem__(self, item):
-        if self.plain_text:
-            question = TrainerTools().tokenizer.apply_chat_template(self.questions[item])
-            answer = self.answers[item]
-            if answer is not None:
-                answer = TrainerTools().tokenizer.encode(self.answers[item])
-        else:
-            question = self.questions[item]
-            answer = self.answers[item]
+        record = self.data[item]
 
-        prompt_tensor = torch.tensor(question).long()
-        answer_tensor = torch.tensor(answer).long() if answer is not None else None
+        prompt_raw = record['prompt']
+        answer_raw = record.get('answer', None)
+
+        if self.plain_text:
+            question = TrainerTools().tokenizer.apply_chat_template(prompt_raw)
+            answer = TrainerTools().tokenizer.encode(answer_raw) if answer_raw else None
+        else:
+            question = prompt_raw
+            answer = answer_raw
+
+        # 转换为 Tensor
+        if isinstance(question, np.ndarray):
+            prompt_tensor = torch.from_numpy(question).long()
+        else:
+            prompt_tensor = torch.tensor(question).long()
+
+        if answer is not None:
+            if isinstance(answer, np.ndarray):
+                answer_tensor = torch.from_numpy(answer).long()
+            else:
+                answer_tensor = torch.tensor(answer).long()
+        else:
+            answer_tensor = None
 
         return {
             'prompt': prompt_tensor,

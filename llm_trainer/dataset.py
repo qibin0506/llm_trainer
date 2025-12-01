@@ -248,8 +248,8 @@ class DPODataset(Dataset):
         if isinstance(rejected_id, np.ndarray): rejected_id = rejected_id.tolist()
 
         return {
-            'chosen': torch.tensor(chosen_id[:self.max_len]).long(),
-            'rejected': torch.tensor(rejected_id[:self.max_len]).long()
+            'chosen': chosen_id[:self.max_len],
+            'rejected': rejected_id[:self.max_len]
         }
 
 

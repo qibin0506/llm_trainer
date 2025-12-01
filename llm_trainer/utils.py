@@ -323,26 +323,6 @@ def join_batch(batch_data: list[dict]) -> dict:
     return result
 
 
-def fill_loss_mask(loss_masks, labels):
-    """
-    将loss_mask中prompt部分强制设置为False
-    loss_masks: shape  (B, T)
-    labels: shape (B, T)
-    """
-    tokenizer = TrainerTools().tokenizer
-    # 支持多轮会话的mask
-    for batch, label in enumerate(labels):
-        start_index = -1
-        for index, token in enumerate(label):
-            if token == tokenizer.system or token == tokenizer.user:
-                start_index = index
-            elif token == tokenizer.end and start_index != -1:
-                loss_masks[batch, start_index:index + 1] = False
-                start_index = -1
-
-    return loss_masks
-
-
 # 默认使用torch提供的pad_sequence
 # 如果pad_sequence不支持padding_side参数，则将改参数置为False，使用反转的方式
 _use_origin_pad_sequence = True

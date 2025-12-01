@@ -88,3 +88,29 @@ def estimate_data_size(
             data_size += len(dataset)
 
     return data_size
+
+
+def extract_policy_weights_from_ppo(model_config, ppo_weights):
+    from llm_model import LlmModel
+    from .ppo_trainer import PolicyAndValueModelWrapper, ValueModel
+
+    policy_model = LlmModel(model_config)
+    value_model = ValueModel(LlmModel(model_config))
+
+    wrapper = PolicyAndValueModelWrapper(policy_model, value_model)
+    wrapper.load_state_dict(ppo_weights)
+
+    return wrapper.policy_model.state_dict()
+
+
+def extract_value_weights_from_ppo(model_config, ppo_weights):
+    from llm_model import LlmModel
+    from .ppo_trainer import PolicyAndValueModelWrapper, ValueModel
+
+    policy_model = LlmModel(model_config)
+    value_model = ValueModel(LlmModel(model_config))
+
+    wrapper = PolicyAndValueModelWrapper(policy_model, value_model)
+    wrapper.load_state_dict(ppo_weights)
+
+    return wrapper.value_model.state_dict()

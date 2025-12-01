@@ -11,7 +11,6 @@ from .tools import TrainerTools
 from .utils import (
     autocast,
     get_dpo_collate_fn,
-    fill_loss_mask,
     log_softmax,
     disable_dropout_in_model
 )
@@ -86,22 +85,19 @@ class DPOTrainer(Trainer):
 
     def _calc_loss(self, inputs, attention_mask, logits, labels): ...
 
-    def _logprobs(self, logits, labels, attention_mask):
+    def _logprobs(self, logits, labels):
         """
         Calculate the average log probabilities for a batch of sequences.
 
         Args:
             logits (torch.Tensor): Logits from the model with shape (B, T, V)
             labels (torch.Tensor): Ground truth labels with shape (B, T).
-            attention_mask (torch.Tensor): Mask tensor with shape (B, T) indicating
-                which tokens are not padding (1 for valid tokens, 0 for padding).
 
         Returns:
             torch.Tensor: Average log probabilities for each sequence in the batch.
                           Shape is (B,) representing the mean log probability for each sequence.
         """
-        loss_masks = attention_mask.clone().bool()
-        loss_masks = fill_loss_mask(loss_masks, labels)
+        loss_masks = (labels != -100)
 
         logits = logits[:, :-1, :]
         labels = labels[:, 1:].clone()
@@ -191,11 +187,11 @@ class DPOTrainer(Trainer):
 
                         with autocast(TrainerTools().parallel.device_type):
                             policy_outputs = self.train_model(concat_inputs, attention_mask=concat_attention_masks)
-                            policy_logprobs_sums, policy_logprobs_means = self._logprobs(policy_outputs['logits'], concat_labels, concat_attention_masks)
+                            policy_logprobs_sums, policy_logprobs_means = self._logprobs(policy_outputs['logits'], concat_labels)
 
                             with torch.no_grad():
                                 ref_outputs = self.ref_model(concat_inputs, attention_mask=concat_attention_masks)
-                                ref_logprobs_sums, _ = self._logprobs(ref_outputs['logits'], concat_labels, concat_attention_masks)
+                                ref_logprobs_sums, _ = self._logprobs(ref_outputs['logits'], concat_labels)
 
                             policy_chosen_logps = policy_logprobs_sums[:chosen_inputs.shape[0]]
                             policy_rejected_logps = policy_logprobs_sums[chosen_inputs.shape[0]:]

@@ -447,10 +447,8 @@ def _masked_var(values: torch.Tensor, mask: torch.Tensor, unbiased: bool = True)
     if unbiased:
         mask_sum = mask.sum()
         if mask_sum == 0:
-            raise ValueError(
-                "The sum of the mask is zero, which can happen when `mini_batch_size=1`;"
-                "try increase the `mini_batch_size` or `gradient_accumulation_steps`"
-            )
+            return torch.tensor(0.0, device=values.device, dtype=values.dtype)
+
         # note that if mask_sum == 1, then there is a division by zero issue
         # to avoid it you just need to use a larger minibatch_size
         bessel_correction = mask_sum / (mask_sum - 1)

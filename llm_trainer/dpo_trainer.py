@@ -111,7 +111,7 @@ class DPOTrainer(Trainer):
 
         # Apply the mask to set log-probs of padding tokens to 0
         logprobs_sums = (per_token_logps * loss_masks).sum(-1)
-        logprobs_means = (per_token_logps * loss_masks).sum(-1) / loss_masks.sum(-1)
+        logprobs_means = (per_token_logps * loss_masks).sum(-1) / loss_masks.sum(-1).clamp(min=1.0)
 
         return logprobs_sums, logprobs_means
 

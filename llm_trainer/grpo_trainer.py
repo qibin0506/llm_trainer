@@ -366,10 +366,6 @@ class GRPOTrainer(Trainer):
                             last_ckpt_batch = batch
                             self._on_batch_end(tag=f'epoch:{epoch}/batch:{batch}')
 
-                        try:
-                            del loss
-                        except UnboundLocalError: ...
-
                 # 一个文件训练结束后，清理内存
                 del train_data_loader
                 del dataset

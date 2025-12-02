@@ -474,16 +474,63 @@ def _selective_log_softmax(logits, index) -> torch.Tensor:
 
 
 def _mask_prompt(labels):
-    tokenizer = TrainerTools().tokenizer
-    # 支持多轮会话的mask
+    """
+    Mask 掉 Prompt 部分以及固定的模版标签，只保留模型需要生成的真正内容。
+    策略：
+    1. <system>/<user> 到 </s> 之间：全部 Mask。
+    2. </s> 后的 <assistant>：Mask
+    3. <assistant> 后的 <answer>：Mask
+    4. <assistant> 后的 <think>：保留
+    例如：
+    1. 原始: <system>system</s><user>user</s><assistant>content</s>
+       mask: mask mask mask mask mask mask mask content</s>
+    2. 原始: <system>system</s><user>user</s><assistant><answer>content</answer></s>
+       mask: mask mask mask mask mask mask mask mask content</answer></s>
+    3. 原始：<system>system</s><user>user</s><assistant><think>think</think><answer>content</answer></s>
+       mask: mask mask mask mask mask mask mask <think>think</think><answer>content</answer></s>
+    """
+    system_token_id = TrainerTools().tokenizer.system
+    user_token_id = TrainerTools().tokenizer.user
+    end_token_id = TrainerTools().tokenizer.end
+    assistant_token_id = TrainerTools().tokenizer.assistant
+    answer_start_token_id = TrainerTools().tokenizer.answer_start
+    think_start_token_id = TrainerTools().tokenizer.think_start
+    ignore_index = -100
+
     for batch, label in enumerate(labels):
         start_index = -1
+        seq_len = len(label)
+
         for index, token in enumerate(label):
-            if token == tokenizer.system or token == tokenizer.user:
+            if token == system_token_id or token == user_token_id:
+                if start_index != -1:
+                    labels[batch, start_index: index] = ignore_index
+
                 start_index = index
-            elif token == tokenizer.end and start_index != -1:
-                labels[batch, start_index:index + 1] = -100
+
+            elif token == end_token_id and start_index != -1:
+                end_mask_index = index
+                next_idx = index + 1
+
+                if next_idx < seq_len and label[next_idx] == assistant_token_id:
+                    end_mask_index = next_idx
+
+                    after_assistant_idx = next_idx + 1
+                    if after_assistant_idx < seq_len:
+                        token_after = label[after_assistant_idx]
+
+                        if token_after == answer_start_token_id:
+                            end_mask_index = after_assistant_idx
+                        elif token_after == think_start_token_id:
+                            pass
+
+                labels[batch, start_index: end_mask_index + 1] = ignore_index
                 start_index = -1
+
+        # 循环结束后，如果 start_index 仍然不是 -1，说明序列被截断了（Truncation）。
+        # 此时整个尾部都属于 Prompt（例如 User 说到一半被截断），必须全部 Mask。
+        if start_index != -1:
+            labels[batch, start_index:] = ignore_index
 
     return labels
 

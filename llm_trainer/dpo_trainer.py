@@ -34,7 +34,6 @@ class DPOTrainer(Trainer):
             eval_prompts=eval_prompts,
             eval_image_tags=eval_image_tags
         )
-        self.packed_sequences = False
         self.ref_model = self._init_ref_model()
 
     def _init_ref_model(self):

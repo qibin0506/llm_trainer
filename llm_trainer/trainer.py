@@ -39,8 +39,6 @@ from .checkpoint import (
 from .utils import (
     set_seed,
     autocast,
-    create_doc_boundary_mask,
-    generate_position_ids,
     pretrain_collate_fn,
 )
 
@@ -56,17 +54,6 @@ class Trainer:
     ):
         set_seed()
 
-        # 是否打包序列，仅pretrain阶段需要打包序列，
-        # [[1, 1, eos, 2, 2, eos]]
-        #   doc_boundary_mask=[[[[0., 0., 0., 0., 0., 0.],
-        #           [0., 0., 0., 0., 0., 0.],
-        #           [0., 0., 0., 0., 0., 0.],
-        #           [-inf, -inf, -inf, 0., 0., 0.],
-        #           [-inf, -inf, -inf, 0., 0., 0.],
-        #           [-inf, -inf, -inf, 0., 0., 0.]]]]
-        #   position_ids=[[0, 1, 2, 0, 1, 2]]
-        self.packed_sequences = True
-
         self.train_config: TrainConfig = train_config
         self.eval_prompts = eval_prompts
         self.eval_image_tags = eval_image_tags
@@ -78,7 +65,7 @@ class Trainer:
 
         self.parallel_kwargs, self.data_loader_kwargs, self.sampler_kwargs = self._convert_train_args()
         # initialize a GradScaler. If enabled=False scaler is a no-op
-        self.scalar = torch.GradScaler(enabled=TrainerTools().use_amp)
+        self.scaler = torch.GradScaler(enabled=TrainerTools().use_amp)
 
         # 注意：学习率要根据GPU的数量进行倍增：
         # 在训练的过程中，损失梯度决定下降的方向，学习率决定下降的步长。如果有两块gpu，前进的综合步长为：平均学习率*2
@@ -425,13 +412,13 @@ class Trainer:
         if isinstance(TrainerTools().parallel, DsParallel):
             self.train_model.backward(loss)
         else:
-            self.scalar.scale(loss).backward()
+            self.scaler.scale(loss).backward()
 
     def _apply_grad_clipping(self):
         # ds模式已经集成gradient_clipping
         if not isinstance(TrainerTools().parallel, DsParallel) and self.lr_scheduler.can_clip_grad():
             # clip grad
-            self.scalar.unscale_(self.optimizer)
+            self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self._get_trainable_params(self.train_model), 1.0)
 
     def _apply_step(self):
@@ -439,8 +426,8 @@ class Trainer:
         if isinstance(TrainerTools().parallel, DsParallel):
             self.train_model.step()
         else:
-            self.scalar.step(self.optimizer)
-            self.scalar.update()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
             self.optimizer.zero_grad(set_to_none=True)
 
         TrainerTools().parallel.synchronize()
@@ -603,13 +590,6 @@ class Trainer:
                         inputs, labels = inputs.to(TrainerTools().parallel.device), labels.to(TrainerTools().parallel.device)
                         attention_mask = inputs != TrainerTools().tokenizer.pad
 
-                        if self.packed_sequences:
-                            doc_boundary_mask = create_doc_boundary_mask(inputs, self._get_model_dtype())
-                            position_ids = generate_position_ids(inputs)
-                        else:
-                            doc_boundary_mask = None
-                            position_ids = None
-
                         if self.pixel_values_provider and 'image_tags' in batch_data:
                             image_tags = batch_data['image_tags']
                             pixel_values = self.pixel_values_provider(image_tags).to(TrainerTools().parallel.device)
@@ -623,8 +603,6 @@ class Trainer:
                             result = self.train_model(
                                 inputs,
                                 attention_mask=attention_mask,
-                                doc_boundary_mask=doc_boundary_mask,
-                                position_ids=position_ids,
                                 pixel_values=pixel_values
                             )
 

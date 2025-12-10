@@ -47,7 +47,6 @@ class GRPOTrainer(Trainer):
             eval_image_tags=eval_image_tags
         )
 
-        self.packed_sequences = False
         self.reward_func = reward_func
         self.ref_model = self._init_ref_model()
 

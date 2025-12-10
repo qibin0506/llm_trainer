@@ -29,6 +29,7 @@ def autocast(device_type):
         return nullcontext()
 
 
+
 def create_doc_boundary_mask(
         input_ids: torch.Tensor,
         dtype: torch.dtype

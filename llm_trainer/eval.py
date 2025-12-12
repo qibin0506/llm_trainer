@@ -1,3 +1,4 @@
+import os
 import torch
 
 from .generate_utils import generate
@@ -28,5 +29,5 @@ def submit_gen_task(
         device=TrainerTools().parallel.device
     )
 
-    with open(f'{_get_log_dir()}gen.txt', 'a') as f:
+    with open(os.path.join(_get_log_dir(), 'gen.txt'), 'a') as f:
         f.write(f"{tag}, gen->{gen_result}\n")

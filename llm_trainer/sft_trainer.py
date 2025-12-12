@@ -1,5 +1,4 @@
 from typing import Optional, Tuple, List
-
 from torch.utils.data import Dataset
 
 from .trainer import Trainer

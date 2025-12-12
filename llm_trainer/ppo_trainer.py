@@ -21,7 +21,7 @@ from .utils import (
     calc_position_ids
 )
 from .partition_utils import unwrap_model_for_generation
-from .log import log
+from .log import Logger
 from .checkpoint import (
     save_checkpoint,
     save_steps,
@@ -81,7 +81,7 @@ class PPOTrainer(Trainer):
         if self.train_config.ppo_config.normalize_rewards and self.train_config.ppo_config.whiten_rewards:
             self.train_config.ppo_config.whiten_rewards = False
             if TrainerTools().parallel.is_main_process:
-                log('WARN: ppo_config.normalize_rewards is enabled, ppo_config.whiten_rewards must be disabled.')
+                Logger.std_log('WARN: ppo_config.normalize_rewards is enabled, ppo_config.whiten_rewards must be disabled.')
 
     def _init_train_model_and_optim(self, initial_lr: float):
         policy_model = self._new_model(self.train_config)
@@ -100,14 +100,14 @@ class PPOTrainer(Trainer):
         if TrainerTools().parallel.is_main_process:
             for name, model in zip(['policy', 'value'], [policy_model, value_model]):
                 total_params = sum(p.numel() for p in model.parameters())
-                log(f"Total number of {name} model parameters: {total_params:,}")
+                Logger.std_log(f"Total number of {name} model parameters: {total_params:,}")
 
                 trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-                log(f"Trainable number of {name} model parameters: {trainable_params:,}")
+                Logger.std_log(f"Trainable number of {name} model parameters: {trainable_params:,}")
 
                 total_size_bytes = total_params * 4
                 total_size_mb = total_size_bytes / (1024 * 1024)
-                log(f"Total size of {name} model model: {total_size_mb:.2f} MB")
+                Logger.std_log(f"Total size of {name} model model: {total_size_mb:.2f} MB")
 
         model, optim = TrainerTools().parallel.process(
             model=train_model,

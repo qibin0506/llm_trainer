@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='project_llm_trainer',
-    version='0.11.3',
+    version='0.11.4',
     description='LLM and VLM trainer',
     scripts=[
         'scripts/smart_train',

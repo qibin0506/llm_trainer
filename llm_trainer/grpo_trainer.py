@@ -10,7 +10,7 @@ from .dataset import RLDataset
 from .loss import GRPOLoss
 from .tools import TrainerTools
 from .generate_utils import batch_generate
-from .log import log
+from .log import Logger
 from .utils import (
     autocast,
     left_pad_sequence,
@@ -304,7 +304,7 @@ class GRPOTrainer(Trainer):
 
                     # start generate
                     if TrainerTools().parallel.is_main_process:
-                        log(f'start generate for batch {batch}/{batch_count_per_file}')
+                        Logger.std_log(f'start generate for batch {batch}/{batch_count_per_file}')
 
                     # 生成数据
                     with unwrap_model_for_generation(self.train_model) as generate_model:
@@ -315,7 +315,7 @@ class GRPOTrainer(Trainer):
 
                     try:
                         if TrainerTools().parallel.is_main_process:
-                            log(f'start train for batch {batch}/{batch_count_per_file}')
+                            Logger.std_log(f'start train for batch {batch}/{batch_count_per_file}')
 
                         for grpo_step in range(self.train_config.grpo_config.grpo_steps):
                             with autocast(TrainerTools().parallel.device_type):

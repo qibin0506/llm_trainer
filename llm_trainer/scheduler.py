@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 import math
 import torch
-from .log import log
+from .log import Logger
 
 class LRScheduler(ABC):
     @property
@@ -61,8 +61,10 @@ class WarmupCosineAnnealingLRScheduler(LRScheduler):
         self._current_lr = initial_lr
         self._cosine_annealing_base_lr = None
 
-        self.need_log = need_log
-
+        if need_log:
+            self.logger = Logger('lr.txt')
+        else:
+            self.logger = None
 
     @property
     def cur_steps(self):
@@ -121,8 +123,8 @@ class WarmupCosineAnnealingLRScheduler(LRScheduler):
 
         self._current_lr = lr
 
-        if self.need_log:
-            log(f"step: {self.cur_steps}, lr: {lr}\n", 'lr.txt')
+        if self.logger:
+            self.logger.log(f"step: {self.cur_steps}, lr: {lr}", log_to_console=False)
 
     def get_ckpt_dict(self) -> dict:
         return {

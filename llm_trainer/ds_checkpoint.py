@@ -1,5 +1,4 @@
 import os
-from typing import Optional
 from glob import glob
 import shutil
 from torch import nn

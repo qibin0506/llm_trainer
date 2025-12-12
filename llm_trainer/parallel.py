@@ -13,7 +13,7 @@ try:
     import deepspeed
 except: ...
 
-from .log import log
+from .log import Logger
 
 
 class Parallel(ABC):
@@ -53,7 +53,7 @@ class Parallel(ABC):
 
             torch.cuda.set_device(self.device)
 
-            log(f'global_rank={self._global_rank}, local_rank={self._local_rank}, world_size={self.world_size}')
+            Logger.std_log(f'global_rank={self._global_rank}, local_rank={self._local_rank}, world_size={self.world_size}')
         else:
             device = "cpu"
             if torch.cuda.is_available():
@@ -150,9 +150,9 @@ class Parallel(ABC):
             return
 
         msg = f' for {msg}' if msg else ''
-        log(f'wait at {self.device}{msg}')
+        Logger.std_log(f'wait at {self.device}{msg}')
         dist.barrier()
-        log(f'continue at {self.device}{msg}')
+        Logger.std_log(f'continue at {self.device}{msg}')
 
 
 class DsParallel(Parallel):

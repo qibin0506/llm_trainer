@@ -3,13 +3,11 @@ import warnings
 from typing import List, Dict, Union
 from transformers import AutoTokenizer
 import torch
-from .log import log
 
 
 class Tokenizer:
     def __init__(self):
         self.tokenizer = AutoTokenizer.from_pretrained(os.environ['TOKEN_DIR'])
-        log(f'is fast tokenizer={self.tokenizer.is_fast}')
 
         self.text_end = '</s>'
 

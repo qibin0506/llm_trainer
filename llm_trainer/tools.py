@@ -3,7 +3,7 @@ from abc import ABC, abstractmethod
 import torch
 from .tokenizer import Tokenizer
 from .parallel import DsParallel, DdpParallel, NoneParallel
-from .log import log
+from .log import Logger
 
 
 parallel_types = {
@@ -29,11 +29,11 @@ class TrainerTools:
             self.tokenizer = Tokenizer()
             self.use_amp = 'cuda' in self.parallel.device and not isinstance(self.parallel, DsParallel)
 
-            log(f'word_size={self.parallel.world_size}, use_amp={self.use_amp}')
+            Logger.std_log(f'word_size={self.parallel.world_size}, use_amp={self.use_amp}')
 
     def _new_parallel(self):
         parallel_type = os.environ.get('PARALLEL_TYPE', 'none')
-        log(f'parallel_type={parallel_type}')
+        Logger.std_log(f'parallel_type={parallel_type}')
         return parallel_types[parallel_type]()
 
     def __new__(cls, *args, **kwargs):

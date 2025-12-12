@@ -42,7 +42,7 @@ from .utils import (
     pretrain_collate_fn,
 )
 
-from .log import log
+from .log import Logger
 
 class Trainer:
     def __init__(
@@ -59,6 +59,8 @@ class Trainer:
         self.eval_image_tags = eval_image_tags
         self.eval_idx = -1
         self.last_global_steps = 0
+
+        self.logger = Logger('log.txt')
 
         if self.eval_image_tags:
             assert len(self.eval_prompts) == len(self.eval_image_tags)
@@ -122,14 +124,14 @@ class Trainer:
 
         if TrainerTools().parallel.is_main_process:
             total_params = sum(p.numel() for p in model.parameters())
-            log(f"Total number of parameters: {total_params:,}")
+            Logger.std_log(f"Total number of parameters: {total_params:,}")
 
             trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            log(f"Trainable number of parameters: {trainable_params:,}")
+            Logger.std_log(f"Trainable number of parameters: {trainable_params:,}")
 
             total_size_bytes = total_params * 4
             total_size_mb = total_size_bytes / (1024 * 1024)
-            log(f"Total size of the model: {total_size_mb:.2f} MB")
+            Logger.std_log(f"Total size of the model: {total_size_mb:.2f} MB")
 
         model, optim = TrainerTools().parallel.process(
             model=model,
@@ -155,7 +157,7 @@ class Trainer:
                         optimizer = deepspeed.ops.adam.DeepSpeedCPUAdam
                         use_lion_optim = False
                         if TrainerTools().parallel.is_main_process:
-                            log('When set offload_optimizer, lion optim is unsupported, so set optim to adam!!!!!')
+                            Logger.std_log('When set offload_optimizer, lion optim is unsupported, so set optim to adam!!!!!')
                 else:
                     optimizer = deepspeed.ops.adam.DeepSpeedCPUAdam
             else:
@@ -244,7 +246,7 @@ class Trainer:
             self.lr_scheduler.restore_ckpt_dict(steps_dict)
 
             if TrainerTools().parallel.is_main_process:
-                log(f'restore steps_dict={steps_dict}')
+                Logger.std_log(f'restore steps_dict={steps_dict}')
 
     def _convert_train_args(self) -> Tuple[dict, dict, dict]:
         parallel_kwargs: Optional[Dict[str, Any]] = None
@@ -452,10 +454,9 @@ class Trainer:
         if TrainerTools().parallel.is_main_process:
             log_tags = ', '.join([f'{k}: {v}' for k, v in keys.items()])
             log_values = ', '.join([f'{k}: {v}' for k, v in values.items()])
-            log_msg = f'{log_tags} -> {log_values}'
 
-            log(log_msg)
-            log(f"{log_msg}\n", 'log.txt')
+            log_msg = f'{log_tags} -> {log_values}'
+            self.logger.log(log_msg)
 
     def _on_exception(
             self,
@@ -465,8 +466,8 @@ class Trainer:
     ):
         exception_file = e.__traceback__.tb_frame.f_globals["__file__"]
         exception_line = e.__traceback__.tb_lineno
-        log_msg = f"epoch: {epoch}, batch: {batch} -> {e} at {exception_file} line {exception_line}\n"
-        log(log_msg, 'exception.txt')
+        log_msg = f"epoch: {epoch}, batch: {batch} -> {e} at {exception_file} line {exception_line}"
+        Logger('exception.txt').log(log_msg, log_to_console=False).release()
 
         raise e
 
@@ -520,7 +521,7 @@ class Trainer:
             file_name: str
     ):
         if TrainerTools().parallel.is_main_process:
-            log(f"====epoch: {epoch}, start train {file_name}====\n", 'log.txt')
+            self.logger.log(f"====epoch: {epoch}, start train {file_name}====", log_to_console=False)
 
     def _avg_loss(self, losses: List[float], gradient_accumulation_steps, batches_accumulated) -> List[float]:
         avg_losses = []

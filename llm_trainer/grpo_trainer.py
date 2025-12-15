@@ -172,7 +172,8 @@ class GRPOTrainer(Trainer):
             k=self.train_config.grpo_config.gen_k,
             p=self.train_config.grpo_config.gen_p,
             device=device,
-            suppress_tokens=self.train_config.grpo_config.gen_suppress_tokens
+            suppress_tokens=self.train_config.grpo_config.gen_suppress_tokens,
+            return_logits=False
         )
 
         # [batch*group_size, max_gen_len]

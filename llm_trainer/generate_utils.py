@@ -324,7 +324,8 @@ def batch_generate(
         pixel_values: Optional[torch.Tensor] = None,
         tokens_per_image: int = -1,
         suppress_tokens: Optional[List[int]] = None,
-        device: Union[str, torch.device, int]
+        device: Union[str, torch.device, int],
+        return_logits: bool = True
 ):
     use_kv_cache = True
     end_token = TrainerTools().tokenizer.end
@@ -393,15 +394,15 @@ def batch_generate(
 
             logits = logits[:, -1, :]
 
-            if padded_logits is None:
-                vocab_size = logits.shape[-1]
-                padded_logits = torch.zeros(
-                    (batch_size, max_new_tokens, vocab_size),
-                    dtype=logits.dtype,
-                    device=device
-                )
-
-            padded_logits[:, i, :] = logits
+            if return_logits:
+                if padded_logits is None:
+                    vocab_size = logits.shape[-1]
+                    padded_logits = torch.zeros(
+                        (batch_size, max_new_tokens, vocab_size),
+                        dtype=logits.dtype,
+                        device=device
+                    )
+                padded_logits[:, i, :] = logits
 
             if suppress_tokens:
                 logits = _suppress_warper(logits, suppress_tokens)

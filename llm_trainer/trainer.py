@@ -100,10 +100,6 @@ class Trainer:
         else:
             return LlmModel(train_config.model_config)
 
-    def _get_trainable_params(self, model):
-        freeze_llm_model = self.train_config.freeze_llm_model
-        return model.parameters() if not freeze_llm_model else filter(lambda p: p.requires_grad, model.parameters())
-
     def _init_train_model_and_optim(self, initial_lr: float):
         model = self._new_model(self.train_config)
 
@@ -192,8 +188,32 @@ class Trainer:
             else:
                 weight_decay = 0.01
 
+        no_decay_name_list = ["bias", "norm.weight"]
+        decay_params = []
+        no_decay_params = []
+
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            if any(nd in name for nd in no_decay_name_list):
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+
+        optimizer_grouped_parameters = [
+            {
+                "params": decay_params,
+                "weight_decay": weight_decay,
+            },
+            {
+                "params": no_decay_params,
+                "weight_decay": 0.0,
+            },
+        ]
+
         return optimizer(
-            self._get_trainable_params(model),
+            optimizer_grouped_parameters,
             lr=initial_lr,
             betas=betas,
             weight_decay=weight_decay
@@ -421,7 +441,9 @@ class Trainer:
         if not isinstance(TrainerTools().parallel, DsParallel) and self.lr_scheduler.can_clip_grad():
             # clip grad
             self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self._get_trainable_params(self.train_model), 1.0)
+
+            trainable_params = filter(lambda p: p.requires_grad, self.train_model.parameters())
+            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
 
     def _apply_step(self):
         self.lr_scheduler.step()

@@ -29,7 +29,8 @@ def mock_pretrain_data():
 
     tokens = []
     for item in data:
-        tokens.extend(TrainerTools().tokenizer.encode(item['text']))
+        text = json.loads(item)['text']
+        tokens.extend(TrainerTools().tokenizer.encode(text))
 
     with open("./data/pretrain.pkl", 'wb') as f:
         pickle.dump(tokens, f)

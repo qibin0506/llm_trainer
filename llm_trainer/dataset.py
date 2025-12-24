@@ -156,7 +156,7 @@ class SFTDataset(Dataset):
             inputs = self.input_ids[item]
 
         if isinstance(inputs, np.ndarray):
-            inputs = torch.from_numpy(inputs).long()
+            inputs = torch.from_numpy(inputs.astype(np.int64))
         else:
             inputs = torch.tensor(inputs).long()
 
@@ -316,13 +316,13 @@ class RLDataset(Dataset):
 
         # 转换为 Tensor
         if isinstance(question, np.ndarray):
-            prompt_tensor = torch.from_numpy(question).long()
+            prompt_tensor = torch.from_numpy(question.astype(np.int64))
         else:
             prompt_tensor = torch.tensor(question).long()
 
         if answer is not None:
             if isinstance(answer, np.ndarray):
-                answer_tensor = torch.from_numpy(answer).long()
+                answer_tensor = torch.from_numpy(answer.astype(np.int64))
             else:
                 answer_tensor = torch.tensor(answer).long()
         else:

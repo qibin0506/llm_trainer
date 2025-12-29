@@ -128,17 +128,52 @@ def _get_train_config(
         model_config: ModelConfig,
         train_stage: str
 ):
+    last_checkpoint = './last_checkpoint.bin'
+    if train_stage != 'pretrain':
+        assert os.path.exists(last_checkpoint)
+
+    init_state_dict = torch.load(last_checkpoint, weights_only=True) \
+        if os.path.exists(last_checkpoint) else None
+
     gradient_accumulation_steps = 3
-    eval_batch_interval = 10 if train_stage == 'grpo' else 100
+    eval_batch_interval = 10 if train_stage == 'grpo' or train_stage == 'ppo' else 100
 
     ds_config = train_configs.DsConfig(
         zero_config=train_configs.DsZero3Config(
-            offload_param=train_configs.DsOffloadConfig() if train_stage == 'grpo' else None,
-            offload_optimizer=train_configs.DsOffloadConfig() if train_stage == 'grpo' else None
+            offload_param=train_configs.DsOffloadConfig() if train_stage == 'grpo' or train_stage == 'ppo' else None,
+            offload_optimizer=train_configs.DsOffloadConfig() if train_stage == 'grpo' or train_stage == 'ppo' else None
         )
     )
 
+    pretrain_config = train_configs.PretrainConfig(
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        kd_config=None
+    ) if train_stage == 'pretrain' or train_stage == 'midtrain' else None
+
+    sft_config = train_configs.SFTConfig(
+        mask_prompt=True,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        kd_config=None
+    ) if train_stage == 'cot' or train_stage == 'mix' else None
+
+    ppo_config = train_configs.PPOConfig(
+        ppo_epochs=1,
+        ppo_batch_size=2,
+        rollout_accumulation_steps=8,
+        vf_coef=0.5,
+        kl_beta=0.02,
+        kl_estimator='k3',
+        normalize_rewards=True,
+        ref_model_checkpoint=init_state_dict,
+        gen_max_new_tokens=2048,
+        gen_temperature=1.0,
+        gen_p=0.95,
+    ) if train_stage == 'ppo' else None
+
     dpo_config = train_configs.DPOConfig(
+        ref_model_checkpoint=init_state_dict,
+        mask_prompt=True,
+        gradient_accumulation_steps=gradient_accumulation_steps,
         loss_beta=0.1,
         loss_label_smoothing=0.0,
         nll_loss_coef=0.2
@@ -154,21 +189,65 @@ def _get_train_config(
         gen_max_new_tokens=1024,
         gen_temperature=1.0,
         gen_k=None,
-        gen_p=0.85,
+        gen_p=0.95,
         gen_suppress_tokens=None,
     ) if train_stage == 'grpo' else None
 
-    lr_mul = TrainerTools().parallel.world_size
     min_lr_ratio = 0.1
+    max_lr = -1
+    warmup_iters = -1
+    period = -1
+    enable_lr_scheduler = False
 
-    initial_lr = 1e-4
-    max_lr = 5e-4
-    warmup_iters = 2000
-    period = 100_000_000
+    if train_stage == 'ppo':
+        initial_lr = 5e-6
+    elif train_stage == 'grpo':
+        initial_lr = 1e-5
+    elif train_stage == 'dpo':
+        initial_lr = 1e-6
+    elif train_stage == 'cot':
+        enable_lr_scheduler = True
+        initial_lr = 1e-5 * TrainerTools().parallel.world_size
+        max_lr = 5e-5 * TrainerTools().parallel.world_size
+        warmup_iters, period = calc_lr_schedular_args(
+            epochs=n_epochs,
+            all_data_size=80000,  # 82431
+            batch_size=real_batch_size,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+        )
+    elif train_stage == 'mix':
+        enable_lr_scheduler = True
+        initial_lr = 1e-5 * TrainerTools().parallel.world_size
+        max_lr = 5e-5 * TrainerTools().parallel.world_size
+        warmup_iters, period = calc_lr_schedular_args(
+            epochs=n_epochs,
+            all_data_size=50000,  # 56498
+            batch_size=real_batch_size,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+        )
+    elif train_stage == 'midtrain':
+        enable_lr_scheduler = True
+        initial_lr = 1e-4 * TrainerTools().parallel.world_size
+        max_lr = 5e-4 * TrainerTools().parallel.world_size
+        warmup_iters, period = calc_lr_schedular_args(
+            epochs=n_epochs,
+            all_data_size=1000000,  # 1059891
+            batch_size=real_batch_size,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+        )
+    else:
+        enable_lr_scheduler = True
+        initial_lr = 1e-4 * TrainerTools().parallel.world_size
+        max_lr = 5e-4 * TrainerTools().parallel.world_size
+        warmup_iters, period = calc_lr_schedular_args(
+            epochs=n_epochs,
+            all_data_size=11000000,  # 11533122
+            batch_size=real_batch_size,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+        )
 
     optim_config = train_configs.OptimConfig(
-        optim_type='adam',
-        enable_lr_scheduler=True,
+        enable_lr_scheduler=enable_lr_scheduler,
         initial_lr=initial_lr,
         warmup_iters=warmup_iters,
         max_lr=max_lr,
@@ -183,27 +262,30 @@ def _get_train_config(
         data_loader_drop_last=True
     )
 
-    init_state_dict = torch.load('./last_checkpoint.bin', weights_only=True) if os.path.exists('./last_checkpoint.bin') else None
-
     train_config = train_configs.TrainConfig(
         n_epochs=n_epochs,
         batch_size=real_batch_size,
         model_config=model_config,
         file_dataset=file_dataset,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        eval_batch_interval=eval_batch_interval,
+        max_seq_len=model_config.max_position_embeddings,
         loss_config=train_configs.LossConfig(),
-        dpo_config=dpo_config,
-        grpo_config=grpo_config,
         optim_config=optim_config,
         ds_config=ds_config,
         data_loader_config=data_loader_config,
-        kd_config=None,
         init_state_dict=init_state_dict,
-        eval_config=train_configs.EvalConfig()
+        eval_config=train_configs.EvalConfig(
+            max_new_tokens=model_config.max_position_embeddings,
+            eval_batch_interval=eval_batch_interval,
+        ),
+        pretrain_config=pretrain_config,
+        sft_config=sft_config,
+        ppo_config=ppo_config,
+        dpo_config=dpo_config,
+        grpo_config=grpo_config
     )
 
     return train_config
+
 
 def get_pretrain_config():
     return _get_train_config(

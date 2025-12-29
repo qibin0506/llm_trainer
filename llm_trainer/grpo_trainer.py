@@ -4,7 +4,7 @@ import torch
 from torch.utils.data import Dataset
 import torch.nn.functional as F
 
-from .trainer import Trainer
+from .base_trainer import BaseTrainer
 from .train_configs import TrainConfig
 from .dataset import RLDataset
 from .loss import GRPOLoss
@@ -29,7 +29,7 @@ from .checkpoint import (
     save_steps,
 )
 
-class GRPOTrainer(Trainer):
+class GRPOTrainer(BaseTrainer):
     """
         reward_func(prompt_ids, complete_ids, answer_ids) -> scores
     """
@@ -38,13 +38,12 @@ class GRPOTrainer(Trainer):
             *,
             train_config: TrainConfig,
             reward_func: Callable[[List[torch.Tensor], torch.Tensor, List[Optional[torch.Tensor]]], List[float]],
-            eval_prompts: List[str],
-            eval_image_tags: Optional[List[str]] = None
+            eval_prompts: List[str]
     ):
+        self.grpo_config = train_config.grpo_config
         super().__init__(
             train_config=train_config,
-            eval_prompts=eval_prompts,
-            eval_image_tags=eval_image_tags
+            eval_prompts=eval_prompts
         )
 
         self.reward_func = reward_func
@@ -52,10 +51,14 @@ class GRPOTrainer(Trainer):
 
     def _init_ref_model(self):
         # beta == 0，不需要ref_model
-        if self.train_config.grpo_config.loss_beta == 0.0:
+        if self.grpo_config.loss_beta == 0.0:
             return None
 
         ref_model = self._new_model(self.train_config)
+
+        ref_model.eval()
+        for param in ref_model.parameters():
+            param.requires_grad = False
 
         ref_model, _ = TrainerTools().parallel.process(
             model=ref_model,
@@ -63,10 +66,6 @@ class GRPOTrainer(Trainer):
             kwargs=self._init_ref_model_args(),
             save_instance=False
         )
-
-        ref_model.eval()
-        for param in ref_model.parameters():
-            param.requires_grad = False
 
         return ref_model
 
@@ -77,13 +76,13 @@ class GRPOTrainer(Trainer):
 
     def _init_loss(self):
         criterion = GRPOLoss(
-            beta=self.train_config.grpo_config.loss_beta,
-            clip_eps_low=self.train_config.grpo_config.loss_clip_eps,
-            clip_eps_high=self.train_config.grpo_config.loss_clip_eps_high,
-            delta=self.train_config.grpo_config.loss_delta,
-            importance_sampling_level=self.train_config.grpo_config.loss_importance_sampling_level,
-            loss_type=self.train_config.grpo_config.loss_type,
-            gen_max_new_tokens=self.train_config.grpo_config.gen_max_new_tokens
+            beta=self.grpo_config.loss_beta,
+            clip_eps_low=self.grpo_config.loss_clip_eps,
+            clip_eps_high=self.grpo_config.loss_clip_eps_high,
+            delta=self.grpo_config.loss_delta,
+            importance_sampling_level=self.grpo_config.loss_importance_sampling_level,
+            loss_type=self.grpo_config.loss_type,
+            gen_max_new_tokens=self.grpo_config.gen_max_new_tokens
         )
 
         return criterion, None
@@ -123,7 +122,7 @@ class GRPOTrainer(Trainer):
         return log_softmax(logits, input_ids), outputs['aux_loss']
 
     def _compute_group_relative_advantages(self, rewards):
-        group_size = self.train_config.grpo_config.group_size
+        group_size = self.grpo_config.group_size
 
         # Reshape rewards to group by prompt
         # [batch, group_size]
@@ -167,12 +166,12 @@ class GRPOTrainer(Trainer):
             model=model,
             tokens=prompt_ids,
             attention_mask=prompt_masks,
-            max_new_tokens=self.train_config.grpo_config.gen_max_new_tokens,
-            temperature=self.train_config.grpo_config.gen_temperature,
-            k=self.train_config.grpo_config.gen_k,
-            p=self.train_config.grpo_config.gen_p,
+            max_new_tokens=self.grpo_config.gen_max_new_tokens,
+            temperature=self.grpo_config.gen_temperature,
+            k=self.grpo_config.gen_k,
+            p=self.grpo_config.gen_p,
             device=device,
-            suppress_tokens=self.train_config.grpo_config.gen_suppress_tokens,
+            suppress_tokens=self.grpo_config.gen_suppress_tokens,
             return_logits=False
         )
 
@@ -186,7 +185,7 @@ class GRPOTrainer(Trainer):
     def _generate_rollout_data(self, generate_model, batch_data: List[dict]):
         prompts = [item["prompt"] for item in batch_data]
         answers = [item["answer"] for item in batch_data]
-        group_size = self.train_config.grpo_config.group_size
+        group_size = self.grpo_config.group_size
 
         # 使用no_grad替换inference_mode
         # 修复问题：Inference tensors cannot be saved for backward. To work around you can make a clone to get a normal
@@ -273,7 +272,7 @@ class GRPOTrainer(Trainer):
                 sync_model_params(
                     _from=self.train_model,
                     _to=self.ref_model,
-                    mixup_alpha=self.train_config.grpo_config.mixup_alpha
+                    mixup_alpha=self.grpo_config.mixup_alpha
                 )
 
             file_count = len(self.train_config.file_dataset)
@@ -318,7 +317,7 @@ class GRPOTrainer(Trainer):
                         if TrainerTools().parallel.is_main_process:
                             Logger.std_log(f'start train for batch {batch}/{batch_count_per_file}')
 
-                        for grpo_step in range(self.train_config.grpo_config.grpo_steps):
+                        for grpo_step in range(self.grpo_config.grpo_steps):
                             with autocast(TrainerTools().parallel.device_type):
                                 loss, aux_loss, rewards = self._maximize_grpo_objective(rollout_data)
                                 if aux_loss_coef and aux_loss is not None:
@@ -361,7 +360,7 @@ class GRPOTrainer(Trainer):
                     finally:
                         save_steps(global_steps=global_steps, lr_scheduler=self.lr_scheduler)
 
-                        if (batch - last_ckpt_batch) >= self.train_config.eval_batch_interval:
+                        if (batch - last_ckpt_batch) >= self.train_config.eval_config.eval_batch_interval:
                             save_checkpoint(model=self.train_model, optimizer=self.optimizer)
                             last_ckpt_batch = batch
                             self._on_batch_end(tag=f'epoch:{epoch}/batch:{batch}')

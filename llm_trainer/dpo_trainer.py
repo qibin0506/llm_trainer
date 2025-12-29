@@ -3,7 +3,7 @@ import gc
 import torch
 from torch.utils.data import Dataset
 
-from .trainer import Trainer
+from .base_trainer import BaseTrainer
 from .train_configs import TrainConfig
 from .dataset import DPODataset
 from .loss import DPOLoss
@@ -21,27 +21,30 @@ from .checkpoint import (
 )
 
 
-class DPOTrainer(Trainer):
+class DPOTrainer(BaseTrainer):
     def __init__(
             self,
             *,
             train_config: TrainConfig,
-            eval_prompts: List[str],
-            eval_image_tags: Optional[List[str]] = None
+            eval_prompts: List[str]
     ):
+        self.dpo_config = train_config.dpo_config
         super().__init__(
             train_config=train_config,
-            eval_prompts=eval_prompts,
-            eval_image_tags=eval_image_tags
+            eval_prompts=eval_prompts
         )
         self.ref_model = self._init_ref_model()
 
     def _init_ref_model(self):
         ref_model = self._new_model(self.train_config)
 
-        if self.train_config.dpo_config.ref_model_checkpoint:
-            ref_model.load_state_dict(self.train_config.dpo_config.ref_model_checkpoint)
-            self.train_config.dpo_config.ref_model_checkpoint = {}
+        if self.dpo_config.ref_model_checkpoint:
+            ref_model.load_state_dict(self.dpo_config.ref_model_checkpoint)
+            self.dpo_config.ref_model_checkpoint = {}
+
+        ref_model.eval()
+        for param in ref_model.parameters():
+            param.requires_grad = False
 
         ref_model, _ = TrainerTools().parallel.process(
             model=ref_model,
@@ -49,10 +52,6 @@ class DPOTrainer(Trainer):
             kwargs=self._init_ref_model_args(),
             save_instance=False
         )
-
-        ref_model.eval()
-        for param in ref_model.parameters():
-            param.requires_grad = False
 
         return ref_model
 
@@ -63,15 +62,15 @@ class DPOTrainer(Trainer):
 
     def _init_loss(self):
         criterion = DPOLoss(
-            beta=self.train_config.dpo_config.loss_beta,
-            label_smoothing=self.train_config.dpo_config.loss_label_smoothing,
-            ipo=self.train_config.dpo_config.loss_ipo
+            beta=self.dpo_config.loss_beta,
+            label_smoothing=self.dpo_config.loss_label_smoothing,
+            ipo=self.dpo_config.loss_ipo
         )
 
         return criterion, None
 
     def _convert_train_args(self) -> Tuple[dict, dict, dict]:
-        dpo_collate_fn = get_dpo_collate_fn(self.train_config.mask_prompt)
+        dpo_collate_fn = get_dpo_collate_fn(self.dpo_config.mask_prompt)
         parallel_kwargs, data_loader_kwargs, sampler_kwargs = super()._convert_train_args()
         data_loader_kwargs.update({"collate_fn": dpo_collate_fn})
 
@@ -116,7 +115,7 @@ class DPOTrainer(Trainer):
 
     def train(self):
         # 梯度累积步数
-        gradient_accumulation_steps = self.train_config.gradient_accumulation_steps
+        gradient_accumulation_steps = self.dpo_config.gradient_accumulation_steps
         global_steps = 0
         skipping_train = False
 
@@ -126,7 +125,7 @@ class DPOTrainer(Trainer):
         batches_accumulated = 0
 
         aux_loss_coef = self.train_config.loss_config.aux_loss_coef
-        nll_loss_coef = self.train_config.dpo_config.nll_loss_coef
+        nll_loss_coef = self.dpo_config.nll_loss_coef
 
         for epoch in range(self.train_config.n_epochs):
             self.train_model.train()
@@ -270,7 +269,7 @@ class DPOTrainer(Trainer):
                         if need_update_grad:
                             save_steps(global_steps=global_steps, lr_scheduler=self.lr_scheduler)
 
-                            if (batch - last_ckpt_batch) >= self.train_config.eval_batch_interval:
+                            if (batch - last_ckpt_batch) >= self.train_config.eval_config.eval_batch_interval:
                                 save_checkpoint(model=self.train_model, optimizer=self.optimizer)
 
                                 last_ckpt_batch = batch

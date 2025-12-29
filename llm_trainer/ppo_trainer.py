@@ -1,4 +1,4 @@
-from typing import Tuple, List, Union, Callable, Optional
+from typing import Tuple, List, Union, Callable, Optional, Dict
 import gc
 import torch
 from torch.utils.data import Dataset
@@ -6,7 +6,7 @@ import torch.nn as nn
 
 from llm_model import LlmModel, VlmModel
 
-from .trainer import Trainer
+from .base_trainer import BaseTrainer
 from .train_configs import TrainConfig
 from .dataset import RLDataset
 from .loss import PPOLoss
@@ -56,7 +56,7 @@ class PolicyAndValueModelWrapper(nn.Module):
         return self.policy_model(*args, **kwargs), self.value_model(*args, **kwargs)
 
 
-class PPOTrainer(Trainer):
+class PPOTrainer(BaseTrainer):
     """
     reward_func(prompt_ids, complete_ids, answer_ids) -> scores
     """
@@ -66,13 +66,11 @@ class PPOTrainer(Trainer):
             *,
             train_config: TrainConfig,
             reward_func: Callable[[List[torch.Tensor], torch.Tensor, List[Optional[torch.Tensor]]], List[float]],
-            eval_prompts: List[str],
-            eval_image_tags: Optional[List[str]] = None
+            eval_prompts: List[str]
     ):
         super().__init__(
             train_config=train_config,
-            eval_prompts=eval_prompts,
-            eval_image_tags=eval_image_tags
+            eval_prompts=eval_prompts
         )
         self.reward_func = reward_func
 
@@ -124,16 +122,16 @@ class PPOTrainer(Trainer):
             ref_model.load_state_dict(self.train_config.ppo_config.ref_model_checkpoint)
             self.train_config.ppo_config.ref_model_checkpoint = {}
 
+        ref_model.eval()
+        for param in ref_model.parameters():
+            param.requires_grad = False
+
         ref_model, _ = TrainerTools().parallel.process(
             model=ref_model,
             optimizer=None,
             kwargs=self._init_ref_model_args(),
             save_instance=False
         )
-
-        ref_model.eval()
-        for param in ref_model.parameters():
-            param.requires_grad = False
 
         return ref_model
 
@@ -263,14 +261,7 @@ class PPOTrainer(Trainer):
             if ppo_config.missing_eos_penalty is not None:
                 env_rewards_tensor[~dones] -= ppo_config.missing_eos_penalty
 
-            raw_reward_mean = env_rewards_tensor.mean()
-            if self.train_config.ppo_config.normalize_rewards:
-                batch_std = env_rewards_tensor.std()
-                if torch.isnan(batch_std) or batch_std < 1e-8:
-                    batch_std = 1.0
-
-                env_rewards_tensor = (env_rewards_tensor - raw_reward_mean) / batch_std
-
+            raw_reward_mean = env_rewards_tensor.mean().item()
             last_token_indices = completion_mask.sum(dim=1) - 1
             valid_indices_mask = last_token_indices >= 0
 
@@ -286,9 +277,28 @@ class PPOTrainer(Trainer):
             'old_log_probs': old_log_probs.detach(),
             'values': value_output.detach(),
             'rewards': rewards.detach(),
-            'env_rewards': raw_reward_mean.detach(),
+            'env_rewards': raw_reward_mean,
             'dones': dones.detach(),
         }
+
+    def _collate_rollout_data(self, rollout_buffer: List[dict]) -> dict:
+        if not rollout_buffer:
+            return {}
+
+        first_item = rollout_buffer[0]
+        collated = {}
+
+        for key in first_item.keys():
+            if isinstance(first_item[key], torch.Tensor):
+                tensors = [item[key] for item in rollout_buffer]
+                collated[key] = torch.cat(tensors, dim=0)
+            elif isinstance(first_item[key], (int, float)):
+                values = [item[key] for item in rollout_buffer]
+                collated[key] = sum(values) / len(values)
+            else:
+                collated[key] = first_item[key]
+
+        return collated
 
     def _ppo_learning_phase(self, rollout_data: dict):
         ppo_config = self.train_config.ppo_config
@@ -299,6 +309,14 @@ class PPOTrainer(Trainer):
         old_values: torch.Tensor = rollout_data['values']
         rewards: torch.Tensor = rollout_data['rewards']
         dones: torch.Tensor = rollout_data['dones']
+
+        if ppo_config.normalize_rewards:
+            reward_mean = rewards.mean()
+            reward_std = rewards.std()
+            if torch.isnan(reward_std) or reward_std < 1e-8:
+                reward_std = 1.0
+
+            rewards = (rewards - reward_mean) / reward_std
 
         prompt_len = prompt_ids.shape[1]
         batch_size = prompt_ids.shape[0]
@@ -329,6 +347,8 @@ class PPOTrainer(Trainer):
 
         ppo_batch_size = ppo_config.ppo_batch_size
         n_updates = 0
+
+        self.lr_scheduler.step()
         for ppo_epoch in range(ppo_config.ppo_epochs):
             indices = torch.randperm(batch_size, device=TrainerTools().parallel.device)
 
@@ -342,7 +362,7 @@ class PPOTrainer(Trainer):
                 mb_old_log_probs = old_log_probs[mini_batch_indices]
                 mb_values = values_for_gae[mini_batch_indices]
                 mb_returns = returns[mini_batch_indices]
-                mb_advantages = advantages_whitened[mini_batch_indices] 
+                mb_advantages = advantages_whitened[mini_batch_indices]
                 mb_position_ids = calc_position_ids(mb_attention_mask)
 
                 with autocast(TrainerTools().parallel.device_type):
@@ -377,9 +397,10 @@ class PPOTrainer(Trainer):
                         aux_loss = self.train_config.loss_config.aux_loss_coef * policy_output['aux_loss']
 
                 total_loss = loss + aux_loss
+
                 self._backward_loss(total_loss)
                 self._apply_grad_clipping()
-                self._apply_step()
+                self._apply_model_step()
                 n_updates += 1
 
                 ppo_stats["loss"] += total_loss.detach().item()
@@ -398,6 +419,12 @@ class PPOTrainer(Trainer):
     def train(self):
         global_steps = 0
         skipping_train = False
+
+        rollout_acc_steps = self.train_config.ppo_config.rollout_accumulation_steps
+        if rollout_acc_steps is None or rollout_acc_steps < 1:
+            rollout_acc_steps = 1
+
+        rollout_buffer = []
 
         for epoch in range(self.train_config.n_epochs):
             file_count = len(self.train_config.file_dataset)
@@ -425,7 +452,18 @@ class PPOTrainer(Trainer):
                         TrainerTools().parallel.wait('skip train')
                         skipping_train = False
 
-                    rollout_data = self._generate_rollout_data(batch_data)
+                    micro_rollout = self._generate_rollout_data(batch_data)
+                    rollout_buffer.append(micro_rollout)
+
+                    is_accumulating = (len(rollout_buffer) < rollout_acc_steps)
+                    is_last_batch = (batch == batch_count_per_file - 1)
+
+                    # 累积一部分数据
+                    if is_accumulating and not is_last_batch:
+                        continue
+
+                    rollout_data = self._collate_rollout_data(rollout_buffer)
+                    rollout_buffer = [] # 清空 buffer
 
                     try:
                         ppo_stats = self._ppo_learning_phase(rollout_data)
@@ -443,7 +481,7 @@ class PPOTrainer(Trainer):
                                 'value_loss': ppo_stats['value_loss'],
                                 'approx_kl': ppo_stats['approx_kl'],
                                 'clip_frac': ppo_stats['clip_frac'],
-                                'rewards': rollout_data['env_rewards'].item()
+                                'rewards': rollout_data['env_rewards']
                             }
                         )
                     except Exception as e:
@@ -451,7 +489,7 @@ class PPOTrainer(Trainer):
                     finally:
                         save_steps(global_steps=global_steps, lr_scheduler=self.lr_scheduler)
 
-                        if (batch - last_ckpt_batch) >= self.train_config.eval_batch_interval:
+                        if (batch - last_ckpt_batch) >= self.train_config.eval_config.eval_batch_interval:
                             save_checkpoint(model=self.train_model, optimizer=self.optimizer)
                             last_ckpt_batch = batch
                             self._on_batch_end(tag=f'epoch:{epoch}/batch:{batch}')

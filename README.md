@@ -91,7 +91,6 @@ def _get_train_config(
     ppo_config = train_configs.PPOConfig(
         ppo_epochs=1,
         ppo_batch_size=2,
-        rollout_accumulation_steps=8,
         vf_coef=0.5,
         kl_beta=0.02,
         kl_estimator='k3',
@@ -255,6 +254,15 @@ def get_dpo_config():
         model_config=get_model_config(long_context=True),
         train_stage='dpo'
     )
+
+def get_ppo_config():
+    return _get_train_config(
+        n_epochs=1,
+        real_batch_size=8,
+        file_dataset=PPODataset(),
+        model_config=get_model_config(long_context=True),
+        train_stage='ppo'
+    )
 ```
 
 ### 训练入口
@@ -331,6 +339,39 @@ if __name__ == '__main__':
 
     trainer = DPOTrainer(
         train_config=get_dpo_config(),
+        eval_prompts=eval_prompts
+    )
+
+    trainer.train()
+```
+
+PPO
+``` python
+import os
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+
+from typing import List, Optional
+import torch
+from llm_trainer import PPOTrainer, TrainerTools
+from utils import init_env, get_ppo_config, get_eval_prompt
+
+init_env()
+
+
+def reward_func(
+        prompt_ids: List[torch.Tensor],
+        completion_ids: torch.Tensor,
+        answers: List[Optional[torch.Tensor]]) -> List[float]:
+    scores = []
+    return scores
+
+
+if __name__ == '__main__':
+    eval_prompts = ['测试prompt']
+
+    trainer = PPOTrainer(
+        train_config=get_ppo_config(),
+        reward_func=reward_func,
         eval_prompts=eval_prompts
     )
 

@@ -228,7 +228,6 @@ class PPOConfig:
     ppo_batch_size: int
     ref_model_checkpoint: Mapping[str, Any]
     value_model_checkpoint: Optional[Mapping[str, Any]] = None
-    rollout_accumulation_steps: int = 1
     gamma: float = 1.0
     lam: float = 0.95
     clip_eps: float = 0.1

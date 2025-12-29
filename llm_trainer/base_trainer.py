@@ -421,7 +421,8 @@ class BaseTrainer:
             trainable_params = filter(lambda p: p.requires_grad, self.train_model.parameters())
             torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
 
-    def _apply_model_step(self):
+    def _apply_step(self):
+        self.lr_scheduler.step()
         if isinstance(TrainerTools().parallel, DsParallel):
             self.train_model.step()
         else:
@@ -430,10 +431,6 @@ class BaseTrainer:
             self.optimizer.zero_grad(set_to_none=True)
 
         TrainerTools().parallel.synchronize()
-
-    def _apply_step(self):
-        self.lr_scheduler.step()
-        self._apply_model_step()
 
     def _get_eval_data(self) -> Optional[str]:
         if len(self.eval_prompts) == 0:

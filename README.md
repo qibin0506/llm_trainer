@@ -9,75 +9,7 @@ pip3 install project_llm_trainer
 可参考：[https://github.com/qibin0506/llm_trainer/blob/master/example/create_dataset.md](https://github.com/qibin0506/llm_trainer/blob/master/example/create_dataset.md)
 
 ## 训练参数说明
-|  字段 | 类型 | 解释 |
-|  ---- |  ----   | ---- |
-| n_epochs | int | 指定训练轮数 |
-| batch_size | int | 指定batch size |
-| model_config | Union[ModelConfig, VLMConfig] | 指定模型配置，参考[https://github.com/qibin0506/llm-model](https://github.com/qibin0506/llm-model) |
-| file_dataset | FileDataset | 指定训练文件数据集 |
-| data_loader_config.data_loader_pin_memory | bool | 指定dataloader是否pin memory |
-| data_loader_config.data_loader_num_workers | int | 指定dataloader加载线程数 |
-| data_loader_config.data_loader_shuffle | bool | 是否shuffle数据 |
-| data_loader_config.data_loader_drop_last | bool | 最后一个batch不满足batch_size时，是否丢弃 |
-| image_tags_file_dataset | Optional[FileDataset] | 训练VLM时，指定image tags训练文件 |
-| loss_config.critical_tokens | Optional[List[int]] | 指定计算loss时需要加强的token |
-| loss_config.critical_alpha | float | 指定计算loss时需要加强的token的alpha |
-| loss_config.aux_loss_coef | Optional[float] | 训练MoE模型时，aux loss的系数 |
-| optim_config.optim_type | str | 指定训练优化器类型，支持adam和lion |
-| optim_config.enable_lr_scheduler | bool | 是否使用lr调度器 |
-| optim_config.initial_lr | float | 初始化lr |
-| optim_config.weight_decay | float | 优化器weight_decay |
-| optim_config.warmup_iters | Optional[int] | warmup迭代轮次 |
-| optim_config.max_lr | float | 最大lr |
-| optim_config.min_lr | float | 最小lr |
-| optim_config.cosine_annealing_period | Optional[int] | 余弦退火周期 |
-| optim_config.cosine_annealing_period_mul | int | 余弦退火mul |
-| optim_config.ds_config | DsConfig | deepspeed配置字段，支持配置zero_config、fp16_config、bf16_config、gradient_clipping、activation_checkpointing，字段跟deepspeed官网一直，参考：[https://www.deepspeed.ai/docs/config-json/](https://www.deepspeed.ai/docs/config-json/) |
-| kd_config | KDConfig | 用于logits蒸馏时使用 |
-| dpo_config.ref_model_checkpoint | Mapping[str, Any] | DPO训练，指定ref_model的checkpoint |
-| dpo_config.loss_beta | float | DPO训练，loss beta值 |
-| dpo_config.loss_label_smoothing | float | DPO训练，loss loss_label_smoothing |
-| dpo_config.loss_ipo | bool | DPO训练，是否使用IPO loss |
-| dpo_config.nll_loss_coef | float | DPO训练，nll loss系数 |
-| ppo_config.ref_model_checkpoint | Mapping[str, Any] | PPO训练，指定ref_model的checkpoint |
-| ppo_config.value_model_checkpoint | Mapping[str, Any] | PPO训练，指定value_model的checkpoint |
-| ppo_config.ppo_epochs | int | PPO训练，指定每次生成数据后训练的epoch次数 |
-| ppo_config.gamma | float | PPO训练，GAE gamma参数 |
-| ppo_config.lam | float | PPO训练，GAE lam参数 |
-| ppo_config.clip_eps | float | PPO训练，clip_eps参数 |
-| ppo_config.vf_coef | float | PPO训练，vf_coef参数 |
-| ppo_config.kl_beta | float | PPO训练，kl_beta参数 |
-| ppo_config.use_sparse_rewards | bool | PPO训练，是否使用稀疏奖励 |
-| ppo_config.gen_max_new_tokens | int | PPO训练，最大生成序列长度 |
-| ppo_config.gen_temperature | float | PPO训练，生成数据时temperature参数 |
-| ppo_config.gen_k | int | PPO训练，生成数据时top k参数 |
-| ppo_config.gen_p | float | PPO训练，生成数据时top p参数 |
-| ppo_config.gen_suppress_tokens | list[int] | PPO训练，生成数据时抑制生成token列表 |
-| grpo_config.grpo_steps | int | GRPO训练，时指定每次生成数据后迭代训练次数 |
-| grpo_config.group_size | int | GRPO训练，组大小 |
-| grpo_config.mixup_alpha | float | GRPO训练，同步ref_model参数mixup_alpha |
-| grpo_config.loss_beta | float | GRPO训练，loss beta |
-| grpo_config.loss_clip_eps | float | GRPO训练，loss clip ps low |
-| grpo_config.loss_clip_eps_high | Optional[float] | GRPO训练，loss clip eps high |
-| grpo_config.loss_delta | Optional[float] | GRPO训练，loss delta |
-| grpo_config.loss_importance_sampling_level | str | GRPO训练，取值token或seq，当token时是GRPO，当seq时是GSPO |
-| grpo_config.loss_type | str | GRPO训练，grpo or bnpo or dr_grpo |
-| grpo_config.gen_max_new_tokens | Optional[int] | GRPO训练，生成数据时最大长度 |
-| grpo_config.gen_temperature | Optional[float] | GRPO训练，生成数据时temperature |
-| grpo_config.gen_k | Optional[int] | GRPO训练，生成数据时top k |
-| grpo_config.gen_p | Optional[int] | GRPO训练，生成数据时top p |
-| grpo_config.gen_suppress_tokens | int | GRPO训练，生成数据时抑制token id |
-| mask_prompt | bool | 进行SFT时，计算loss是否mask掉prompt部分，默认为True |
-| gradient_accumulation_steps | int | 梯度累积步数 |
-| eval_batch_interval | int | 指定每隔多少轮，进行一次数据生成 |
-| eval_config.max_new_tokens | int | eval时最大生成长度 |
-| eval_config.temperature | float | eval时生成数据temperature |
-| eval_config.top_p | float | eval时生成数据top p |
-| eval_config.top_k | float | eval时生成数据top k |
-| max_seq_len | int | 指定训练最大序列长度 |
-| pixel_values_provider | Optional[Callable[[list[str]], torch.Tensor]] | 训练VLM时指定图片pixel提供者 |
-| init_state_dict | Optional[Mapping[str, Any]] | 指定初始化checkpoint |
-| freeze_llm_model | bool | 是否冻结llm参数，主要用于vlm训练 |
+可参考：[train_configs.py](https://github.com/qibin0506/llm_trainer/blob/master/llm_trainer/train_configs.py)或者下面配置训练文件的说明
 
 
 ## 开启训练流程

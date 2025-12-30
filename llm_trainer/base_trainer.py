@@ -49,7 +49,7 @@ class BaseTrainer:
             train_config: TrainConfig,
             eval_prompts: List[str],
             kd_config: Optional[KDConfig] = None,
-            gradient_accumulation_steps: int = 0
+            gradient_accumulation_steps: int = 1
     ):
         set_seed()
 
@@ -541,7 +541,7 @@ class BaseTrainer:
 
     def train(self):
         # 梯度累积步数
-        gradient_accumulation_steps = self.gradient_accumulation_steps
+        gradient_accumulation_steps = max(1, self.gradient_accumulation_steps)
         global_steps = 0
         skipping_train = False
 

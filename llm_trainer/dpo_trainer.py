@@ -31,7 +31,8 @@ class DPOTrainer(BaseTrainer):
         self.dpo_config = train_config.dpo_config
         super().__init__(
             train_config=train_config,
-            eval_prompts=eval_prompts
+            eval_prompts=eval_prompts,
+            gradient_accumulation_steps=self.dpo_config.gradient_accumulation_steps
         )
         self.ref_model = self._init_ref_model()
 
@@ -115,7 +116,7 @@ class DPOTrainer(BaseTrainer):
 
     def train(self):
         # 梯度累积步数
-        gradient_accumulation_steps = self.dpo_config.gradient_accumulation_steps
+        gradient_accumulation_steps = max(1, self.gradient_accumulation_steps)
         global_steps = 0
         skipping_train = False
 

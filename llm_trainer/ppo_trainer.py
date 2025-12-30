@@ -1,6 +1,7 @@
 from typing import Tuple, List, Union, Callable, Optional
 import gc
 import torch
+import torch.distributed as dist
 from torch.utils.data import Dataset
 import torch.nn as nn
 
@@ -68,9 +69,12 @@ class PPOTrainer(BaseTrainer):
             reward_func: Callable[[List[torch.Tensor], torch.Tensor, List[Optional[torch.Tensor]]], List[float]],
             eval_prompts: List[str]
     ):
+        self.ppo_config = train_config.ppo_config
+
         super().__init__(
             train_config=train_config,
-            eval_prompts=eval_prompts
+            eval_prompts=eval_prompts,
+            gradient_accumulation_steps=self.ppo_config.gradient_accumulation_steps
         )
         self.reward_func = reward_func
 
@@ -322,16 +326,32 @@ class PPOTrainer(BaseTrainer):
         attention_mask = (input_ids != TrainerTools().tokenizer.pad)
 
         ppo_stats = {
-            "loss": 0, "moe_aux_loss": 0, "actor_loss": 0, "value_loss": 0, "approx_kl": 0, "clip_frac": 0
+            "loss": 0.0, "moe_aux_loss": 0.0, "actor_loss": 0.0,
+            "value_loss": 0.0, "approx_kl": 0.0, "clip_frac": 0.0
         }
 
+        grad_acc_steps = max(1, self.gradient_accumulation_steps)
         ppo_batch_size = ppo_config.ppo_batch_size
-        n_updates = 0
+        num_micro_batches = (batch_size + ppo_batch_size - 1) // ppo_batch_size
+        total_micro_batches_processed = 0
+
         for ppo_epoch in range(ppo_config.ppo_epochs):
             indices = torch.randperm(batch_size, device=TrainerTools().parallel.device)
 
             for i in range(0, batch_size, ppo_batch_size):
                 mini_batch_indices = indices[i:i + ppo_batch_size]
+                micro_batch_idx = i // ppo_batch_size
+                is_last_micro_batch = (micro_batch_idx == num_micro_batches - 1)
+                need_update_grad = ((micro_batch_idx + 1) % grad_acc_steps == 0) or is_last_micro_batch
+
+                if is_last_micro_batch:
+                    remainder = (micro_batch_idx + 1) % grad_acc_steps
+                    actual_acc_steps = remainder if remainder > 0 else grad_acc_steps
+                else:
+                    actual_acc_steps = grad_acc_steps
+
+                if TrainerTools().parallel.parallel_train:
+                    self.train_model.require_backward_grad_sync = need_update_grad
 
                 mb_input_ids = input_ids[mini_batch_indices]
                 mb_attention_mask = attention_mask[mini_batch_indices]
@@ -375,10 +395,8 @@ class PPOTrainer(BaseTrainer):
                         aux_loss = self.train_config.loss_config.aux_loss_coef * policy_output['aux_loss']
 
                 total_loss = loss + aux_loss
-                self._backward_loss(total_loss)
-                self._apply_grad_clipping()
-                self._apply_step()
-                n_updates += 1
+                scaled_total_loss = total_loss / actual_acc_steps
+                self._backward_loss(scaled_total_loss)
 
                 ppo_stats["loss"] += total_loss.detach().item()
                 ppo_stats["moe_aux_loss"] += aux_loss.detach().item()
@@ -386,10 +404,15 @@ class PPOTrainer(BaseTrainer):
                 ppo_stats["value_loss"] += value_loss.detach().item()
                 ppo_stats["approx_kl"] += approx_kl.detach().item()
                 ppo_stats["clip_frac"] += clip_frac.detach().item()
+                total_micro_batches_processed += 1
 
-        if n_updates > 0:
+                if need_update_grad:
+                    self._apply_grad_clipping()
+                    self._apply_step()
+
+        if total_micro_batches_processed > 0:
             for key in ppo_stats:
-                ppo_stats[key] /= n_updates
+                ppo_stats[key] /= total_micro_batches_processed
 
         return ppo_stats
 
@@ -429,6 +452,27 @@ class PPOTrainer(BaseTrainer):
                     try:
                         ppo_stats = self._ppo_learning_phase(rollout_data)
 
+                        stats_tensor = torch.tensor([
+                            ppo_stats['loss'],
+                            ppo_stats['moe_aux_loss'],
+                            ppo_stats['actor_loss'],
+                            ppo_stats['value_loss'],
+                            ppo_stats['approx_kl'],
+                            ppo_stats['clip_frac'],
+                            rollout_data['env_rewards'].item()
+                        ], device=TrainerTools().parallel.device)
+
+                        if TrainerTools().parallel.parallel_train:
+                            dist.all_reduce(stats_tensor, op=dist.ReduceOp.AVG)
+
+                        ppo_stats['loss'] = stats_tensor[0].item()
+                        ppo_stats['moe_aux_loss'] = stats_tensor[1].item()
+                        ppo_stats['actor_loss'] = stats_tensor[2].item()
+                        ppo_stats['value_loss'] = stats_tensor[3].item()
+                        ppo_stats['approx_kl'] = stats_tensor[4].item()
+                        ppo_stats['clip_frac'] = stats_tensor[5].item()
+                        reward_value = stats_tensor[6].item()
+
                         self._log(
                             keys={
                                 'epoch': epoch,
@@ -442,7 +486,7 @@ class PPOTrainer(BaseTrainer):
                                 'value_loss': ppo_stats['value_loss'],
                                 'approx_kl': ppo_stats['approx_kl'],
                                 'clip_frac': ppo_stats['clip_frac'],
-                                'rewards': rollout_data['env_rewards'].item()
+                                'rewards': reward_value
                             }
                         )
                     except Exception as e:

@@ -165,13 +165,13 @@ class PretrainConfig:
     训练参数配置项
 
     Args:
-        gradient_accumulation_steps (`int`, *Optional*, default is 0):
+        gradient_accumulation_steps (`int`, *Optional*, default is 1):
             梯度累积步数，为0时不使用梯度累积
             目前仅适用于pretrain\sft\dpo，不适用于ppo\grpo\gspo
         kd_config: (`KDConfig`, *Optional*, default is None):
             知识蒸馏配置项，为None时不使用知识蒸馏
     """
-    gradient_accumulation_steps: int = 0
+    gradient_accumulation_steps: int = 1
     kd_config: Optional[KDConfig] = None
 
 
@@ -183,7 +183,7 @@ class SFTConfig:
     Args:
         mask_prompt (`bool`)
             指定是否mask prompt部分的token
-        gradient_accumulation_steps (`int`, *Optional*, default is 0):
+        gradient_accumulation_steps (`int`, *Optional*, default is 1):
             梯度累积步数，为0时不使用梯度累积
             目前仅适用于pretrain\sft\dpo，不适用于ppo\grpo\gspo
         kd_config: (`KDConfig`, *Optional*, default is None):
@@ -194,7 +194,7 @@ class SFTConfig:
             是否冻结llm部分model参数，用于训练vlm
     """
     mask_prompt: bool = True
-    gradient_accumulation_steps: int = 0
+    gradient_accumulation_steps: int = 1
     kd_config: Optional[KDConfig] = None
     image_tags_file_dataset: Optional[FileDataset] = None
     pixel_values_provider: Optional[Callable[[list[str]], torch.Tensor]] = None
@@ -209,13 +209,13 @@ class DPOConfig:
     Args:
         mask_prompt (`bool`)
             指定是否mask prompt部分的token
-        gradient_accumulation_steps (`int`, *Optional*, default is 0):
+        gradient_accumulation_steps (`int`, *Optional*, default is 1):
             梯度累积步数，为0时不使用梯度累积
             目前仅适用于pretrain\sft\dpo，不适用于ppo\grpo\gspo
     """
     ref_model_checkpoint: Mapping[str, Any]
     mask_prompt: bool = True
-    gradient_accumulation_steps: int = 0
+    gradient_accumulation_steps: int = 1
     loss_beta: float
     loss_label_smoothing: float = 0.0
     loss_ipo: bool = False
@@ -228,6 +228,7 @@ class PPOConfig:
     ppo_batch_size: int
     ref_model_checkpoint: Mapping[str, Any]
     value_model_checkpoint: Optional[Mapping[str, Any]] = None
+    gradient_accumulation_steps: int = 1
     gamma: float = 1.0
     lam: float = 0.95
     clip_eps: float = 0.1

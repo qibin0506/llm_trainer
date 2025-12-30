@@ -91,6 +91,7 @@ def _get_train_config(
     ppo_config = train_configs.PPOConfig(
         ppo_epochs=1,
         ppo_batch_size=2,
+        gradient_accumulation_steps=8,
         vf_coef=0.5,
         kl_beta=0.02,
         kl_estimator='k3',
@@ -258,7 +259,7 @@ def get_dpo_config():
 def get_ppo_config():
     return _get_train_config(
         n_epochs=1,
-        real_batch_size=8,
+        real_batch_size=16,
         file_dataset=PPODataset(),
         model_config=get_model_config(long_context=True),
         train_stage='ppo'

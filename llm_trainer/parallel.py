@@ -19,38 +19,36 @@ from .log import Logger
 class Parallel(ABC):
     def __init__(
             self,
-            init_process_group: bool = True,
-            use_parallel: bool = True,
-            use_compile: bool = False
+            _init_process_group: bool = True,
+            _use_parallel: bool = True
     ):
-        self._initialize(init_process_group, use_parallel, use_compile)
+        self._initialize(_init_process_group, _use_parallel)
 
     def _initialize(
             self,
-            init_process_group: bool,
-            use_parallel: bool,
-            use_compile: bool
+            _init_process_group: bool,
+            _use_parallel: bool
     ):
         self._global_rank: int = int(os.environ.get('RANK', -1))
         self._local_rank: int = int(os.environ.get('LOCAL_RANK', -1))
-        self._use_parallel: bool = use_parallel and self._global_rank != -1
-        self._use_compile = use_compile
+        self._use_parallel: bool = _use_parallel and self._global_rank != -1
 
         self._sampler: Optional[DistributedSampler] = None
-
         self.model: Optional[nn.Module] = None
-        self.raw_model: Optional[nn.Module] = None
 
-        if use_compile:
+        try:
             torch.set_float32_matmul_precision('high')
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        except:
+            pass
 
         if self._use_parallel:
-            if init_process_group:
+            if _init_process_group:
                 dist.init_process_group(backend='nccl')
 
             self.device: str = f'cuda:{self._local_rank}'
             self.device_type: str = 'cuda'
-
             torch.cuda.set_device(self.device)
 
             Logger.std_log(f'global_rank={self._global_rank}, local_rank={self._local_rank}, world_size={self.world_size}')
@@ -63,7 +61,6 @@ class Parallel(ABC):
 
             self.device: str = device
             self.device_type: str = device
-
 
     @abstractmethod
     def process(
@@ -115,19 +112,6 @@ class Parallel(ABC):
         if self._use_parallel:
             dist.destroy_process_group()
 
-    # def reduce_loss(self, avg_loss: torch.Tensor, loss: torch.Tensor, batch) -> torch.Tensor:
-    #     if self._use_parallel:
-    #         world_size = dist.get_world_size()
-    #         if world_size < 2:
-    #             return loss.detach()
-    #
-    #         torch.distributed.all_reduce(loss)
-    #         # 整个训练过程的滑动损失均值=在历史平均损失的基础上，加上最新损失再求平均
-    #         avg_loss = (avg_loss * batch + loss.detach()) / (batch + 1)
-    #         return avg_loss
-    #
-    #     return loss.detach()
-
     @property
     def parallel_train(self) -> bool:
         return self._use_parallel
@@ -158,7 +142,7 @@ class Parallel(ABC):
 class DsParallel(Parallel):
     def __init__(self):
         deepspeed.init_distributed(dist_backend='nccl')
-        super().__init__(init_process_group=False)
+        super().__init__(_init_process_group=False)
 
     def process(
             self,
@@ -175,10 +159,6 @@ class DsParallel(Parallel):
             :param save_instance
             :return:
         """
-
-        if save_instance:
-            self.raw_model = model
-
         model, optim, _, _ = deepspeed.initialize(
             model=model,
             optimizer=optimizer,
@@ -209,27 +189,21 @@ class DdpParallel(Parallel):
     ) -> Tuple[nn.Module, torch.optim.Optimizer]:
         model.to(self.device)
 
-        if self._use_compile:
-            model = torch.compile(model)
-
         if self._use_parallel:
             # self.model = DDP(module=model, broadcast_buffers=False, find_unused_parameters=True)
             model = DDP(module=model, device_ids=[self._local_rank], output_device=self._local_rank)
-            raw_model = model.module
         else:
             model = model
-            raw_model = model
 
         if save_instance:
             self.model = model
-            self.raw_model = raw_model
 
         return model, optimizer
 
 
 class NoneParallel(Parallel):
     def __init__(self):
-        super().__init__(use_parallel=False)
+        super().__init__(_use_parallel=False)
 
     def process(
             self,
@@ -240,11 +214,7 @@ class NoneParallel(Parallel):
     ) -> Tuple[nn.Module, torch.optim.Optimizer]:
         model.to(self.device)
 
-        if self._use_compile:
-            model = torch.compile(model)
-
         if save_instance:
-            self.raw_model = model
             self.model = model
 
         return model, optimizer

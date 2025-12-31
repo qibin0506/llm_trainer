@@ -73,13 +73,6 @@ def sync_model_params(_from: nn.Module, _to: Optional[nn.Module], mixup_alpha: f
                     alpha=mixup_alpha
                 )
 
-    # if isinstance(TrainerTools().parallel, DsParallel):
-    #     _sync_ds_model_params(_from, _to, mixup_alpha)
-    # elif isinstance(TrainerTools().parallel, DdpParallel):
-    #     _sync_ddp_model_params(_from, _to, mixup_alpha)
-    # else:
-    #     _copy_params(_from, _to, mixup_alpha)
-
 
 def unwrap_model(model) -> nn.Module:
     try:

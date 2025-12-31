@@ -523,18 +523,17 @@ class BaseTrainer:
             gradient_accumulation_steps,
             batches_accumulated
     ) -> List[float]:
-        avg_losses = []
-        for loss in losses:
-            avg_loss = torch.tensor(
-                loss * gradient_accumulation_steps / batches_accumulated,
-                device=TrainerTools().parallel.device)
+        loss_tensors = [
+            torch.tensor(loss * gradient_accumulation_steps / batches_accumulated,
+                         device=TrainerTools().parallel.device)
+            for loss in losses
+        ]
 
-            if TrainerTools().parallel.parallel_train:
-                dist.all_reduce(avg_loss, dist.ReduceOp.AVG)
+        stacked_losses = torch.stack(loss_tensors)
+        if TrainerTools().parallel.parallel_train:
+            dist.all_reduce(stacked_losses, dist.ReduceOp.AVG)
 
-            avg_losses.append(avg_loss.detach().item())
-
-        return avg_losses
+        return stacked_losses.detach().cpu().tolist()
 
     def _get_pixel_values(self, batch_data):
         return None

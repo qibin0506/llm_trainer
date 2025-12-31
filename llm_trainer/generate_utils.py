@@ -135,10 +135,15 @@ def _generate(
     if isinstance(model, VlmModel):
         tokens = batch_repeat_image_tok(tokens, tokens_per_image)
 
+    kv_cache: Optional[KVCache] = None
+    if use_kv_cache:
+        # Prompt Length + Max Generation Length
+        total_capacity = tokens.shape[1] + max_new_tokens
+        kv_cache = KVCache(max_capacity=total_capacity)
+
     if pixel_values is not None:
         pixel_values = pixel_values.to(device)
 
-    kv_cache: Optional[KVCache] = None
     generate_tokens = tokens.clone()
 
     with torch.inference_mode():
@@ -155,7 +160,6 @@ def _generate(
 
                 # logits (batch, seq_len, vocab_size)
                 logits = result['logits']
-                kv_cache = result['past_key_values']
 
             # (batch, vocab_size)
             logits = logits[:, -1, :]
@@ -192,7 +196,7 @@ def _generate(
             else:
                 tokens = torch.cat((tokens, next_token), dim=-1)
 
-            # [关键修复] 更新 mask：追加 1，让 Position ID 继续增长
+            # 更新 mask：追加 1
             new_mask_bit = torch.ones((tokens.shape[0], 1), device=device, dtype=attention_mask.dtype)
             attention_mask = torch.cat((attention_mask, new_mask_bit), dim=-1)
 
@@ -346,6 +350,11 @@ def batch_generate(
     kv_cache: Optional[KVCache] = None
     batch_size = tokens.shape[0]
 
+    if use_kv_cache:
+        # Prompt Length + Max Generation Length
+        total_capacity = tokens.shape[1] + max_new_tokens
+        kv_cache = KVCache(max_capacity=total_capacity)
+
     # 预分配最大长度，避免循环中 cat 造成内存碎片
     generated_tokens_buffer = torch.full(
         (batch_size, max_new_tokens),
@@ -377,8 +386,13 @@ def batch_generate(
             else:
                 # 下一个位置ID基于当前mask序列的最后一个有效位置
                 # 如果kv_cache有效，当前token是上一步生成的，位置是前一个位置+1
-                current_position_ids = position_ids[:, -1:] + 1
-                position_ids = torch.cat((position_ids, current_position_ids), dim=-1)
+                # 注意：第一次迭代（Prefill）kv_cache 内部虽空，但我们传入了完整的 tokens
+                # prefill 阶段不需要单独处理 position_ids，因为我们直接传入了全量 position_ids
+                if i == 0:
+                     current_position_ids = position_ids
+                else:
+                     current_position_ids = position_ids[:, -1:] + 1
+                     position_ids = torch.cat((position_ids, current_position_ids), dim=-1)
 
             with autocast(TrainerTools().parallel.device_type):
                 result = model(
@@ -390,7 +404,6 @@ def batch_generate(
                     pixel_values=pixel_values
                 )
                 logits = result['logits']
-                kv_cache = result['past_key_values']
 
             logits = logits[:, -1, :]
 

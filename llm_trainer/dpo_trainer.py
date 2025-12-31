@@ -2,6 +2,7 @@ from typing import Tuple, List, Optional
 import gc
 import torch
 from torch.utils.data import Dataset
+from itertools import islice
 
 from .base_trainer import BaseTrainer
 from .train_configs import TrainConfig
@@ -19,6 +20,7 @@ from .checkpoint import (
     save_checkpoint,
     save_steps,
 )
+from .log import Logger
 
 
 class DPOTrainer(BaseTrainer):
@@ -117,8 +119,6 @@ class DPOTrainer(BaseTrainer):
     def train(self):
         # 梯度累积步数
         gradient_accumulation_steps = max(1, self.gradient_accumulation_steps)
-        global_steps = 0
-        skipping_train = False
 
         loss_accumulation = 0.0
         aux_loss_accumulation = 0.0
@@ -128,11 +128,12 @@ class DPOTrainer(BaseTrainer):
         aux_loss_coef = self.train_config.loss_config.aux_loss_coef
         nll_loss_coef = self.dpo_config.nll_loss_coef
 
-        for epoch in range(self.train_config.n_epochs):
+        for epoch in range(self.resume_epoch, self.train_config.n_epochs):
             self.train_model.train()
             file_count = len(self.train_config.file_dataset)
+            start_file_idx = self.resume_file_idx if epoch == self.resume_epoch else 0
 
-            for file_idx in range(file_count):
+            for file_idx in range(start_file_idx, file_count):
                 dataset, file_path = self._create_dataset(file_idx)
                 train_data_loader = TrainerTools().parallel.process_dataloader(
                     dataset=dataset,
@@ -146,24 +147,25 @@ class DPOTrainer(BaseTrainer):
                 TrainerTools().parallel.on_epoch_start(epoch)
                 self._on_file_start(epoch, file_path)
 
-                for batch, batch_data in enumerate(train_data_loader):
-                    global_steps += 1
-                    if global_steps < self.last_global_steps:
-                        skipping_train = True
-                        continue
+                skip_batches = 0
+                if epoch == self.resume_epoch and file_idx == self.resume_file_idx:
+                    skip_batches = self.resume_batch_idx
+                    if skip_batches > 0 and TrainerTools().parallel.is_main_process:
+                        Logger.std_log(f"Fast forwarding {skip_batches} batches in {file_path}...")
+
+                data_iterator = iter(train_data_loader)
+                if skip_batches > 0:
+                    data_iterator = islice(data_iterator, skip_batches, None)
+                    last_ckpt_batch = skip_batches
+
+                for batch, batch_data in enumerate(data_iterator):
+                    batch = skip_batches + batch
 
                     # 是否需要更新梯度
-                    if skipping_train:
-                        need_update_grad = False
-                    elif gradient_accumulation_steps > 1:
+                    if gradient_accumulation_steps > 1:
                         need_update_grad = (batch + 1) % gradient_accumulation_steps == 0 or batch == batch_count_per_file - 1
                     else:
                         need_update_grad = True
-
-                    # 要放在need_update_grad赋值下面，解决在继续训练时未知原因的卡死现象
-                    if skipping_train:
-                        TrainerTools().parallel.wait('skip train')
-                        skipping_train = False
 
                     try:
                         chosen_inputs: torch.Tensor = batch_data['chosen_inputs'].to(TrainerTools().parallel.device)
@@ -250,7 +252,7 @@ class DPOTrainer(BaseTrainer):
                                 keys={
                                     'epoch': epoch,
                                     'file': f'{file_idx + 1}/{file_count}',
-                                    'batch': f'{batch}/{batch_count_per_file}',
+                                    'batch': f'{batch + 1}/{batch_count_per_file}',
                                 },
                                 values={
                                     'loss': avg_loss,
@@ -264,17 +266,20 @@ class DPOTrainer(BaseTrainer):
                             aux_loss_accumulation = 0.0
                             nll_loss_accumulation = 0.0
                             batches_accumulated = 0
-                    except Exception as e:
-                        self._on_exception(e, epoch, batch)
-                    finally:
-                        if need_update_grad:
-                            save_steps(global_steps=global_steps, lr_scheduler=self.lr_scheduler)
 
                             if (batch - last_ckpt_batch) >= self.train_config.eval_config.eval_batch_interval:
                                 save_checkpoint(model=self.train_model, optimizer=self.optimizer)
+                                save_steps(
+                                    epoch=epoch,
+                                    file_idx=file_idx,
+                                    batch_idx=batch + 1,
+                                    lr_scheduler=self.lr_scheduler
+                                )
 
                                 last_ckpt_batch = batch
                                 self._on_batch_end(tag=f'epoch:{epoch}/batch:{batch}')
+                    except Exception as e:
+                        self._on_exception(e, epoch, batch)
 
                 # 一个文件训练结束后，清理内存
                 del train_data_loader
@@ -286,12 +291,21 @@ class DPOTrainer(BaseTrainer):
                 torch.cuda.empty_cache()
 
             # end epoch
-            if not skipping_train:
-                save_steps(global_steps=global_steps, lr_scheduler=self.lr_scheduler)
-                save_checkpoint(model=self.train_model, optimizer=self.optimizer)
 
-                TrainerTools().parallel.on_epoch_end(epoch)
-                self._on_epoch_end(tag=f'epoch:{epoch}')
+            # reset resume state
+            self.resume_file_idx = 0
+            self.resume_batch_idx = 0
+
+            save_checkpoint(model=self.train_model, optimizer=self.optimizer)
+            save_steps(
+                epoch=epoch + 1,
+                file_idx=0,
+                batch_idx=0,
+                lr_scheduler=self.lr_scheduler
+            )
+
+            TrainerTools().parallel.on_epoch_end(epoch)
+            self._on_epoch_end(tag=f'epoch:{epoch}')
 
         TrainerTools().parallel.destroy()
 

@@ -5,6 +5,7 @@ import torch
 from torch import nn
 from torch.optim import Optimizer
 from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 
 from .parallel import DsParallel
 from .scheduler import LRScheduler
@@ -105,13 +106,24 @@ def load_checkpoint_for_eval(
 
 
 def save_steps(
-    global_steps: int,
-    lr_scheduler: Optional[LRScheduler] = None,
+    epoch: int = 0,
+    file_idx: int = 0,
+    batch_idx: int = 0,
+    lr_scheduler: Optional[LRScheduler] = None
 ):
     # 暂时只保存主进程的
     if TrainerTools().parallel.is_main_process:
         steps_checkpoint_name = f"{os.environ.get('LOG_DIR', './')}steps.pt"
-        ckpt = {'global_steps': global_steps}
+        ckpt = {
+            'epoch': epoch,
+            'file_idx': file_idx,
+            'batch_idx': batch_idx,
+            'cpu_rng_state': torch.get_rng_state(),
+        }
+
+        if torch.cuda.is_available():
+            ckpt['cuda_rng_state'] = torch.cuda.get_rng_state()
+
         if lr_scheduler:
             ckpt.update(lr_scheduler.get_ckpt_dict())
 
@@ -119,8 +131,28 @@ def save_steps(
 
 
 def load_steps() -> Optional[dict]:
-    steps_checkpoint_name = f"{os.environ.get('LOG_DIR', './')}steps.pt"
-    if os.path.exists(steps_checkpoint_name):
-        return torch.load(steps_checkpoint_name, weights_only=True)
+    steps_dict = None
 
-    return None
+    if TrainerTools().parallel.is_main_process:
+        steps_checkpoint_name = f"{os.environ.get('LOG_DIR', './')}steps.pt"
+        if os.path.exists(steps_checkpoint_name):
+            try:
+                steps_dict = torch.load(steps_checkpoint_name, weights_only=True)
+            except:
+                steps_dict = None
+
+    if TrainerTools().parallel.world_size > 1:
+        object_list = [steps_dict]
+        dist.broadcast_object_list(object_list, src=0)
+        steps_dict = object_list[0]
+        TrainerTools().parallel.wait('broadcast steps_dict')
+
+    if steps_dict:
+        if 'cpu_rng_state' in steps_dict:
+            torch.set_rng_state(steps_dict['cpu_rng_state'])
+        if 'cuda_rng_state' in steps_dict and torch.cuda.is_available():
+            try:
+                torch.cuda.set_rng_state(steps_dict['cuda_rng_state'])
+            except: ...
+
+    return steps_dict

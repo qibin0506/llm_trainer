@@ -2,15 +2,15 @@ from setuptools import setup, find_packages
 
 setup(
     name='project_llm_trainer',
-    version='0.12.5',
+    version='0.12.6',
     description='LLM and VLM trainer',
     scripts=[
         'scripts/smart_train',
         'scripts/ds_train',
         'scripts/ddp_train',
         'scripts/py_train',
-        'scripts/plot_lr',
-        'scripts/plot_loss',
+        'scripts/vis_lr',
+        'scripts/vis_log',
         'scripts/calc_intermediate_size'
     ],
     author='qibin',

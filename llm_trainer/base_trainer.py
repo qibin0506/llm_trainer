@@ -315,18 +315,18 @@ class BaseTrainer:
                 }
                 parallel_kwargs['bf16'] = bf16
             elif self.train_config.ds_config.fp16_config:
-                fb16_config = self.train_config.ds_config.fp16_config
+                fp16_config = self.train_config.ds_config.fp16_config
                 fp16 = {
-                    'enabled': fb16_config.enabled,
-                    'loss_scale': fb16_config.loss_scale,
-                    'loss_scale_window': fb16_config.loss_scale_window,
-                    'initial_scale_power': fb16_config.initial_scale_power,
-                    'hysteresis': fb16_config.hysteresis,
-                    'min_loss_scale': fb16_config.min_loss_scale
+                    'enabled': fp16_config.enabled,
+                    'loss_scale': fp16_config.loss_scale,
+                    'loss_scale_window': fp16_config.loss_scale_window,
+                    'initial_scale_power': fp16_config.initial_scale_power,
+                    'hysteresis': fp16_config.hysteresis,
+                    'min_loss_scale': fp16_config.min_loss_scale
                 }
 
-                if fb16_config.fp16_opt_level is not None:
-                    fp16['fp16_opt_level'] = fb16_config.fp16_opt_level
+                if fp16_config.fp16_opt_level is not None:
+                    fp16['fp16_opt_level'] = fp16_config.fp16_opt_level
 
                 parallel_kwargs['fp16'] = fp16
 

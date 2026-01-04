@@ -443,8 +443,8 @@ TrainerTools().tokenizer.apply_chat_template(template, covert_tensor=True) # ret
 项目内置多个方便用户使用的脚本，除上面提到的`smart_train`、`ds_train`、`ddp_train`外，还有以下脚本可以使用
 |  脚本 | 解释 | 实例 |
 | --- | --- | --- |
-| plot_log | 绘制训练日志曲线，包括loss、reward等 | plot_log ./log/log.txt |
-| plot_lr | 绘制训练lr曲线，将学习率可视化 | plot_lr ./log/lr.txt |
+| vis_log | 绘制训练日志曲线，包括loss、reward等 | vis_log ./log/log.txt |
+| vis_lr | 绘制训练lr曲线，将学习率可视化 | vis_lr ./log/lr.txt |
 | calc_intermediate_size | 根据hidden_size计算intermediate_size | calc_intermediate_size 1024 # 结果为2752 |
 
 ### 调整断点续训
@@ -452,7 +452,9 @@ TrainerTools().tokenizer.apply_chat_template(template, covert_tensor=True) # ret
 
 ``` python
 ckpt = torch.load('./log/steps.pt', weights_only=True)
-ckpt['global_steps'] = 0 # 重置训练步数
+ckpt['epoch'] = 0 # 重置训练epoch
+ckpt['file_idx'] = 0 # 重置当前训练的文件index
+ckpt['batch_idx'] = 0 # 重置当前训练的batch
 ckpt['cur_lr'] = 0.0018589864724561254 # 指定当前lr
 ckpt['lr_steps'] = 0 # 重置lr部分
 ckpt['cosine_annealing_base_lr'] = 0.002 # 重置余弦退火基础lr

@@ -223,9 +223,13 @@ class PPOTrainer(BaseTrainer):
                     suppress_tokens=ppo_config.gen_suppress_tokens,
                     device=device
                 )
+
                 completion_ids = full_ids[:, prompt_len:]
                 full_attention_mask = (full_ids != pad_token_id)
                 full_position_ids = calc_position_ids(full_attention_mask)
+
+                old_log_probs = log_softmax(logitss.float(), completion_ids)
+                del logitss
 
                 with autocast(TrainerTools().parallel.device_type):
                     value_output = unwrapped_model.value_model(
@@ -233,8 +237,6 @@ class PPOTrainer(BaseTrainer):
                         attention_mask=full_attention_mask,
                         position_ids=full_position_ids
                     )
-
-            old_log_probs = log_softmax(logitss.float(), completion_ids)
 
             with unwrap_model_for_generation(self.ref_model) as unwrapped_ref_model:
                 ref_outputs = unwrapped_ref_model(
@@ -246,6 +248,7 @@ class PPOTrainer(BaseTrainer):
 
             ref_logits_completion = ref_logits_full[:, prompt_len - 1: -1]
             ref_log_probs_completion = log_softmax(ref_logits_completion.float(), completion_ids)
+            del ref_outputs, ref_logits_full, ref_logits_completion
 
             dones = torch.any(completion_ids == eos_token_id, dim=1)
             rewards = torch.zeros_like(completion_ids, dtype=torch.float32, device=device)
@@ -506,7 +509,7 @@ class PPOTrainer(BaseTrainer):
                             last_ckpt_batch = batch
                             self._on_batch_end(tag=f'epoch:{epoch}/batch:{batch}')
 
-                        torch.cuda.empty_cache()
+                        del rollout_data
                     except Exception as e:
                         self._on_exception(e, epoch, batch)
 

@@ -89,6 +89,11 @@ class PPOTrainer(BaseTrainer):
     def _init_train_model_and_optim(self, initial_lr: float):
         policy_model = self._new_model(self.train_config)
         value_model = ValueModel(self._new_model(self.train_config))
+
+        if self.train_config.ds_config and self.train_config.ds_config.activation_checkpointing:
+            policy_model.gradient_checkpointing_enable()
+            value_model.base_model.gradient_checkpointing_enable()
+
         train_model = PolicyAndValueModelWrapper(policy_model, value_model)
 
         if self.train_config.init_state_dict:

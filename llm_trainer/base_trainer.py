@@ -101,6 +101,9 @@ class BaseTrainer:
 
         self._check_freeze_llm_model(model)
 
+        if self.train_config.ds_config and self.train_config.ds_config.activation_checkpointing:
+            model.gradient_checkpointing_enable()
+
         if TrainerTools().parallel.is_main_process:
             total_params = sum(p.numel() for p in model.parameters())
             Logger.std_log(f"Total number of parameters: {total_params:,}")

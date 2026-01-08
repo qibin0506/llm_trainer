@@ -208,7 +208,6 @@ class GRPOLoss(nn.Module):
             delta: Optional[float] = None,
             importance_sampling_level: str = 'token',
             loss_type: str = 'grpo',
-            gen_max_new_tokens: Optional[float] = None
     ):
         super().__init__()
 
@@ -218,7 +217,6 @@ class GRPOLoss(nn.Module):
         self.delta = delta
         self.importance_sampling_level = importance_sampling_level
         self.loss_type = loss_type
-        self.gen_max_new_tokens = gen_max_new_tokens
 
     def forward(
             self,
@@ -226,9 +224,9 @@ class GRPOLoss(nn.Module):
             old_log_probs: torch.Tensor,
             ref_log_probs: torch.Tensor,
             completion_mask: torch.Tensor,
-            advantages: torch.Tensor
+            advantages: torch.Tensor,
+            max_seq_len: int
     ) -> torch.Tensor:
-
         if self.beta != 0.0:
             per_token_kl = torch.exp(ref_log_probs - log_probs) - (ref_log_probs - log_probs) - 1
         else:
@@ -260,8 +258,8 @@ class GRPOLoss(nn.Module):
         if self.loss_type == "bnpo":
             loss = (per_token_loss * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
         elif self.loss_type == "dr_grpo":
-            assert self.gen_max_new_tokens is not None
-            loss = (per_token_loss * completion_mask).sum() / (per_token_loss.size(0) * self.gen_max_new_tokens)
+            max_seq_len = max(max_seq_len, 1)
+            loss = (per_token_loss * completion_mask).sum() / (per_token_loss.size(0) * max_seq_len)
         else:
             loss = ((per_token_loss * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)).mean()
 

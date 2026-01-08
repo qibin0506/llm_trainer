@@ -152,7 +152,8 @@ class EvalConfig:
         eval_batch_interval (`int`, default is 100):
             每隔多少个batch进行模型eval
     """
-    max_new_tokens: int
+    max_seq_len: int
+
     eval_batch_interval: int = 100
     temperature: float = 1.0
     top_p: float = 0.95
@@ -238,7 +239,7 @@ class PPOConfig:
     missing_eos_penalty: Optional[float] = None
     normalize_rewards: bool = False
     whiten_rewards: bool = False
-    gen_max_new_tokens: int
+    gen_max_seq_len: int
     gen_temperature: Optional[float] = None
     gen_k: Optional[int] = None
     gen_p: Optional[float] = None
@@ -256,7 +257,7 @@ class GRPOConfig:
     loss_delta: Optional[float] = None
     loss_importance_sampling_level: str = 'seq' # token or seq
     loss_type: str = 'grpo' # grpo or bnpo or dr_grpo
-    gen_max_new_tokens: int
+    gen_max_seq_len: int
     gen_temperature: Optional[float] = None
     gen_k: Optional[int] = None
     gen_p: Optional[float] = None
@@ -279,7 +280,7 @@ class TrainConfig:
             初始化检查点
         file_dataset (`FileDataset`):
             训练文件dataset
-        max_seq_len (`int`, default is None)
+        dataset_block_size (`int`, default is None)
             训练序列最大长度，为None时取model的max_position_embedding
         data_loader_config: (`DataLoaderConfig`):
             data loader配置项
@@ -308,7 +309,7 @@ class TrainConfig:
     init_state_dict: Optional[Mapping[str, Any]] = None
 
     file_dataset: FileDataset
-    max_seq_len: int
+    dataset_block_size: int
     data_loader_config: DataLoaderConfig = field(default_factory=DataLoaderConfig)
 
     loss_config: LossConfig = field(default_factory=LossConfig)

@@ -110,13 +110,13 @@ class SFTDataset(Dataset):
     def __init__(
             self,
             file_path,
-            max_len,
+            block_size,
             image_tags_file_path=None,
             tokens_per_image=-1
     ):
         super().__init__()
 
-        self.max_len = max_len
+        self.block_size = block_size
         self.tokens_per_image = tokens_per_image
         self.input_ids = []
         self.image_tags = []
@@ -167,7 +167,7 @@ class SFTDataset(Dataset):
         else:
             image_tag = None
 
-        inputs = inputs[:self.max_len]
+        inputs = inputs[:self.block_size]
 
         return {
             'inputs': inputs,
@@ -205,8 +205,8 @@ class DPODataset(Dataset):
             {'chosen': xxx, 'rejected': xxx},
          ]
     """
-    def __init__(self, file_path, max_len):
-        self.max_len = max_len
+    def __init__(self, file_path, block_size):
+        self.block_size = block_size
         self.data = []
         self.plain_text = False
 
@@ -248,8 +248,8 @@ class DPODataset(Dataset):
         if isinstance(rejected_id, np.ndarray): rejected_id = rejected_id.tolist()
 
         return {
-            'chosen': chosen_id[:self.max_len],
-            'rejected': rejected_id[:self.max_len]
+            'chosen': chosen_id[:self.block_size],
+            'rejected': rejected_id[:self.block_size]
         }
 
 

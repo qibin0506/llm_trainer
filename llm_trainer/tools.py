@@ -53,7 +53,7 @@ class FileDataset(ABC):
 
 def estimate_data_size(
         file_dataset: FileDataset,
-        max_seq_len: int,
+        block_size: int,
         type: str
 ) -> int:
     """
@@ -65,12 +65,12 @@ def estimate_data_size(
     if type == 'sft':
         from .dataset import SFTDataset
         for idx in range(files_count):
-            dataset = SFTDataset(file_dataset[idx], max_seq_len)
+            dataset = SFTDataset(file_dataset[idx], block_size)
             data_size += len(dataset)
     elif type == 'dpo':
         from .dataset import DPODataset
         for idx in range(files_count):
-            dataset = DPODataset(file_dataset[idx], max_seq_len)
+            dataset = DPODataset(file_dataset[idx], block_size)
             data_size += len(dataset)
     elif type == 'grpo' or type == 'ppo':
         from .dataset import RLDataset
@@ -82,8 +82,8 @@ def estimate_data_size(
         for idx in range(files_count):
             dataset = PretrainDataset(
                 file_dataset[idx],
-                max_seq_len,
-                max_seq_len
+                block_size,
+                block_size
             )
             data_size += len(dataset)
 

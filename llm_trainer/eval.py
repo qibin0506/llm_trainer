@@ -15,7 +15,7 @@ def submit_gen_task(
         tokens_per_image
 ):
     tokens = TrainerTools().tokenizer.encode(prompt, unsqueeze=True, covert_tensor=True)
-    max_new_tokens = train_config.eval_config.max_new_tokens
+    max_new_tokens = max(train_config.eval_config.max_seq_len - tokens.shape[1], 0)
 
     gen_result = generate(
         eval_model,

@@ -82,8 +82,7 @@ class GRPOTrainer(BaseTrainer):
             clip_eps_high=self.grpo_config.loss_clip_eps_high,
             delta=self.grpo_config.loss_delta,
             importance_sampling_level=self.grpo_config.loss_importance_sampling_level,
-            loss_type=self.grpo_config.loss_type,
-            gen_max_new_tokens=self.grpo_config.gen_max_new_tokens
+            loss_type=self.grpo_config.loss_type
         )
 
         return criterion, None
@@ -162,12 +161,19 @@ class GRPOTrainer(BaseTrainer):
         # [batch*group_size, max_prompt_len]
         prompt_masks = prompt_ids != pad_token_id
 
+        max_new_tokens = self.grpo_config.gen_max_seq_len - prompt_len
+        if max_new_tokens <= 0:
+            raise ValueError(
+                f"Prompt length ({prompt_len}) >= gen_max_seq_len ({self.grpo_config.gen_max_seq_len}). "
+                f"Cannot generate any tokens. Please increase gen_max_seq_len or reduce dataset_block_size."
+            )
+
         # [batch*group_size, max_prompt_len+max_gen_len]
         outputs, _ = batch_generate(
             model=model,
             tokens=prompt_ids,
             attention_mask=prompt_masks,
-            max_new_tokens=self.grpo_config.gen_max_new_tokens,
+            max_new_tokens=max_new_tokens,
             temperature=self.grpo_config.gen_temperature,
             k=self.grpo_config.gen_k,
             p=self.grpo_config.gen_p,
@@ -258,7 +264,8 @@ class GRPOTrainer(BaseTrainer):
             old_log_probs=old_log_probs,
             ref_log_probs=ref_log_probs,
             completion_mask=padded_completion_mask,
-            advantages=advantages
+            advantages=advantages,
+            max_seq_len=completion_ids.shape[1]
         )
 
         return loss, aux_loss, rewards

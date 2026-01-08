@@ -30,5 +30,5 @@ class Trainer(BaseTrainer):
 
     def _create_dataset(self, file_idx) -> Tuple[Dataset, str]:
         file_path = self.train_config.file_dataset[file_idx]
-        max_seq_len = self.train_config.max_seq_len
-        return PretrainDataset(file_path, max_seq_len, max_seq_len), file_path
+        block_size = self.train_config.dataset_block_size
+        return PretrainDataset(file_path, block_size, block_size), file_path

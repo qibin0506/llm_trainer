@@ -215,13 +215,20 @@ class PPOTrainer(BaseTrainer):
         prompt_masks = (prompt_ids != pad_token_id)
         prompt_len = prompt_ids.shape[1]
 
+        max_new_tokens = ppo_config.gen_max_seq_len - prompt_len
+        if max_new_tokens <= 0:
+            raise ValueError(
+                f"Prompt length ({prompt_len}) >= gen_max_seq_len ({ppo_config.gen_max_seq_len}). "
+                f"Cannot generate any tokens. Please increase gen_max_seq_len or reduce dataset_block_size."
+            )
+
         with torch.no_grad():
             with unwrap_model_for_generation(self.train_model) as unwrapped_model:
                 full_ids, logitss = batch_generate(
                     model=unwrapped_model.policy_model,
                     tokens=prompt_ids,
                     attention_mask=prompt_masks,
-                    max_new_tokens=ppo_config.gen_max_new_tokens,
+                    max_new_tokens=max_new_tokens,
                     temperature=ppo_config.gen_temperature,
                     k=ppo_config.gen_k,
                     p=ppo_config.gen_p,

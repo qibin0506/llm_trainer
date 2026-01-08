@@ -81,8 +81,8 @@ class DPOTrainer(BaseTrainer):
 
     def _create_dataset(self, file_idx) -> Tuple[Dataset, str]:
         file_path = self.train_config.file_dataset[file_idx]
-        max_seq_len = self.train_config.max_seq_len
-        return DPODataset(file_path, max_seq_len), file_path
+        block_size = self.train_config.dataset_block_size
+        return DPODataset(file_path, block_size), file_path
 
     def _calc_loss(self, inputs, attention_mask, logits, labels): ...
 

@@ -265,7 +265,7 @@ class GRPOTrainer(BaseTrainer):
             ref_log_probs=ref_log_probs,
             completion_mask=padded_completion_mask,
             advantages=advantages,
-            max_seq_len=completion_ids.shape[1]
+            completion_len=completion_ids.shape[1]
         )
 
         return loss, aux_loss, rewards

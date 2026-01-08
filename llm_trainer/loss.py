@@ -225,7 +225,7 @@ class GRPOLoss(nn.Module):
             ref_log_probs: torch.Tensor,
             completion_mask: torch.Tensor,
             advantages: torch.Tensor,
-            max_seq_len: int
+            completion_len: int
     ) -> torch.Tensor:
         if self.beta != 0.0:
             per_token_kl = torch.exp(ref_log_probs - log_probs) - (ref_log_probs - log_probs) - 1
@@ -258,8 +258,8 @@ class GRPOLoss(nn.Module):
         if self.loss_type == "bnpo":
             loss = (per_token_loss * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
         elif self.loss_type == "dr_grpo":
-            max_seq_len = max(max_seq_len, 1)
-            loss = (per_token_loss * completion_mask).sum() / (per_token_loss.size(0) * max_seq_len)
+            completion_len = max(completion_len, 1)
+            loss = (per_token_loss * completion_mask).sum() / (per_token_loss.size(0) * completion_len)
         else:
             loss = ((per_token_loss * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)).mean()
 

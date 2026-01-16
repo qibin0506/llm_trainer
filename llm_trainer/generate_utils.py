@@ -130,10 +130,10 @@ def _generate(
     if tokens.dim() == 1:
         tokens = tokens.unsqueeze(0)
 
-    attention_mask = torch.ones_like(tokens, device=device, dtype=torch.long)
-
     if isinstance(model, VlmModel):
-        tokens = batch_repeat_image_tok(tokens, tokens_per_image)
+        tokens, _ = batch_repeat_image_tok(tokens, tokens_per_image)
+
+    attention_mask = torch.ones_like(tokens, device=device, dtype=torch.long)
 
     kv_cache: Optional[KVCache] = None
     if use_kv_cache:
@@ -336,7 +336,7 @@ def batch_generate(
     pad_token_id = TrainerTools().tokenizer.pad
 
     if isinstance(model, VlmModel):
-        tokens = batch_repeat_image_tok(tokens, tokens_per_image)
+        tokens, attention_mask = batch_repeat_image_tok(tokens, tokens_per_image, attention_mask)
 
     if pixel_values is not None:
         pixel_values = pixel_values.to(device)

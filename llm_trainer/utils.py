@@ -5,7 +5,7 @@ from torch.nn.utils.rnn import pad_sequence
 import torch.nn.functional as F
 from .tools import TrainerTools
 import numpy as np
-from typing import Union, List, Optional
+from typing import Union, List, Optional, Tuple
 
 
 def set_seed(seed=42):
@@ -138,34 +138,57 @@ def calc_position_ids(attention_mask: torch.Tensor) -> torch.Tensor:
 
 def repeat_image_tok(
         tokens: torch.Tensor,
-        tokens_per_image: int
-) -> torch.Tensor:
+        tokens_per_image: int,
+        attention_mask: Optional[torch.Tensor] = None
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     # tokens_per_image=3 -> <image>...xxxx -> <image><image><image>...xxx
     image_tok = TrainerTools().tokenizer.image
     mask = (tokens == image_tok)
     if not mask.any():
-        return tokens
+        return tokens, attention_mask
 
-    idxs = torch.nonzero(mask, as_tuple=False)
-    if idxs.numel() == 0:
-        return tokens
+    # 计算每个位置的重复次数：默认为1，image token 位置为 tokens_per_image
+    repeats = torch.ones_like(tokens, dtype=torch.long)
+    repeats[mask] = tokens_per_image
 
-    image_tok_idx = idxs[0, 0].item()
-    repeat_image_toks = torch.tensor([image_tok] * tokens_per_image, dtype=tokens.dtype, device=tokens.device)
-    new_tokens = torch.cat([tokens[:image_tok_idx], repeat_image_toks, tokens[image_tok_idx + 1:]], dim=-1)
-    return new_tokens
+    # 使用 repeat_interleave 进行高效扩展
+    new_tokens = torch.repeat_interleave(tokens, repeats, dim=0)
+
+    if attention_mask is not None:
+        # 对 mask 做同样的操作
+        new_mask = torch.repeat_interleave(attention_mask, repeats, dim=0)
+        return new_tokens, new_mask
+
+    return new_tokens, None
 
 
 def batch_repeat_image_tok(
         tokens: torch.Tensor,
-        tokens_per_image: int
-) -> torch.Tensor:
-    new_tokens = []
+        tokens_per_image: int,
+        attention_mask: Optional[torch.Tensor] = None
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    new_tokens_list = []
+    new_masks_list = []
+    has_mask = attention_mask is not None
 
-    for token in tokens:
-        new_tokens.append(repeat_image_tok(token, tokens_per_image))
+    for i in range(len(tokens)):
+        token_seq = tokens[i]
+        mask_seq = attention_mask[i] if has_mask else None
 
-    return torch.stack(new_tokens, dim=0)
+        if has_mask:
+            new_tok, new_mask = repeat_image_tok(token_seq, tokens_per_image, mask_seq)
+            new_tokens_list.append(new_tok)
+            new_masks_list.append(new_mask)
+        else:
+            new_tok, _ = repeat_image_tok(token_seq, tokens_per_image)
+            new_tokens_list.append(new_tok)
+
+    ret_tokens = torch.stack(new_tokens_list, dim=0)
+    if has_mask:
+        ret_masks = torch.stack(new_masks_list, dim=0)
+        return ret_tokens, ret_masks
+
+    return ret_tokens, None
 
 
 def pretrain_collate_fn(batch_data):

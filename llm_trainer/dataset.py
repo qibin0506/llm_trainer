@@ -163,7 +163,7 @@ class SFTDataset(Dataset):
         image_tag = self.image_tags[item] if self.image_tags else None
 
         if self.tokens_per_image != -1:
-            inputs = repeat_image_tok(inputs, self.tokens_per_image)
+            inputs, _ = repeat_image_tok(inputs, self.tokens_per_image)
         else:
             image_tag = None
 

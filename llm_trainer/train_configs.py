@@ -229,6 +229,7 @@ class PPOConfig:
     ppo_batch_size: int
     ref_model_checkpoint: Mapping[str, Any]
     value_model_checkpoint: Optional[Mapping[str, Any]] = None
+    value_optim_config: Optional['OptimConfig'] = None
     gradient_accumulation_steps: int = 1
     gamma: float = 1.0
     lam: float = 0.95

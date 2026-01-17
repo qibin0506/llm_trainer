@@ -126,55 +126,16 @@ class BaseTrainer:
     def _check_freeze_llm_model(self, model): ...
 
     def _config_optim(self, model, initial_lr):
-        optimizer = None
-        use_lion_optim = self.train_config.optim_config.optim_type == 'lion'
-
-        if isinstance(TrainerTools().parallel, DsParallel) and self.parallel_kwargs:
-            import deepspeed
-            if ('zero_optimization' in self.parallel_kwargs
-                    and 'offload_optimizer' in self.parallel_kwargs['zero_optimization']
-                    and self.parallel_kwargs['zero_optimization']['offload_optimizer']['device'] == 'cpu'):
-                if self.train_config.optim_config.optim_type == 'lion':
-                    if version.parse(importlib.metadata.version("deepspeed")) >= version.parse('0.17.6'):
-                        optimizer = deepspeed.ops.lion.DeepSpeedCPULion
-                    else:
-                        optimizer = deepspeed.ops.adam.DeepSpeedCPUAdam
-                        use_lion_optim = False
-                        if TrainerTools().parallel.is_main_process:
-                            Logger.std_log('When set offload_optimizer, lion optim is unsupported, so set optim to adam!!!!!')
-                else:
-                    optimizer = deepspeed.ops.adam.DeepSpeedCPUAdam
-            else:
-                if self.train_config.optim_config.optim_type == 'lion':
-                    optimizer = deepspeed.ops.lion.FusedLion
-                else:
-                    optimizer = deepspeed.ops.adam.FusedAdam
-
-        if not optimizer:
-            if self.train_config.optim_config.optim_type == 'lion':
-                try:
-                    import lion_pytorch
-                except:
-                    raise Exception('lion is not detected, please use `pip3 install lion_pytorch` to install or set optim_type to adam')
-
-                optimizer = lion_pytorch.Lion
-            else:
-                optimizer = torch.optim.AdamW
+        optimizer_cls, use_lion_optim = self._get_optim_cls()
 
         betas = self.train_config.optim_config.betas
-        weight_decay = self.train_config.optim_config.weight_decay
+        weight_decay = self.train_config.optim_config.betas
 
         if betas is None:
-            if use_lion_optim:
-                betas = (0.95, 0.98)
-            else:
-                betas = (0.9, 0.999)
+            betas = (0.95, 0.98) if use_lion_optim else (0.9, 0.999)
 
         if weight_decay is None:
-            if use_lion_optim:
-                weight_decay = 0.015
-            else:
-                weight_decay = 0.01
+            weight_decay = 0.015 if use_lion_optim else 0.01
 
         no_decay_name_list = ["bias", "norm.weight"]
         decay_params = []
@@ -200,12 +161,52 @@ class BaseTrainer:
             },
         ]
 
-        return optimizer(
+        return optimizer_cls(
             optimizer_grouped_parameters,
             lr=initial_lr,
             betas=betas,
             weight_decay=weight_decay
         )
+
+    def _get_optim_cls(self):
+        optimizer = None
+        use_lion_optim = self.train_config.optim_config.optim_type == 'lion'
+
+        if isinstance(TrainerTools().parallel, DsParallel) and self.parallel_kwargs:
+            import deepspeed
+            if ('zero_optimization' in self.parallel_kwargs
+                    and 'offload_optimizer' in self.parallel_kwargs['zero_optimization']
+                    and self.parallel_kwargs['zero_optimization']['offload_optimizer']['device'] == 'cpu'):
+                if self.train_config.optim_config.optim_type == 'lion':
+                    if version.parse(importlib.metadata.version("deepspeed")) >= version.parse('0.17.6'):
+                        optimizer = deepspeed.ops.lion.DeepSpeedCPULion
+                    else:
+                        optimizer = deepspeed.ops.adam.DeepSpeedCPUAdam
+                        use_lion_optim = False
+                        if TrainerTools().parallel.is_main_process:
+                            Logger.std_log(
+                                'When set offload_optimizer, lion optim is unsupported, so set optim to adam!!!!!')
+                else:
+                    optimizer = deepspeed.ops.adam.DeepSpeedCPUAdam
+            else:
+                if self.train_config.optim_config.optim_type == 'lion':
+                    optimizer = deepspeed.ops.lion.FusedLion
+                else:
+                    optimizer = deepspeed.ops.adam.FusedAdam
+
+        if not optimizer:
+            if self.train_config.optim_config.optim_type == 'lion':
+                try:
+                    import lion_pytorch
+                except:
+                    raise Exception(
+                        'lion is not detected, please use `pip3 install lion_pytorch` to install or set optim_type to adam')
+
+                optimizer = lion_pytorch.Lion
+            else:
+                optimizer = torch.optim.AdamW
+
+        return optimizer, use_lion_optim
 
     def _init_lr_scheduler(self, initial_lr: float, optimizer) -> LRScheduler:
         if self.train_config.optim_config.enable_lr_scheduler:

@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from typing import List, Optional
 import math
 import torch
 from .log import Logger
@@ -36,6 +37,7 @@ class WarmupCosineAnnealingLRScheduler(LRScheduler):
             max_lr: float,
             cosine_annealing_period: int, # 每个周期的步数
             cosine_annealing_period_mul: int = 0, # 周期长度的倍数
+            param_group_indices: Optional[List[int]] = None,
             need_log: bool = False
     ):
         super().__init__()
@@ -48,6 +50,8 @@ class WarmupCosineAnnealingLRScheduler(LRScheduler):
 
         self._cosine_annealing_period = cosine_annealing_period
         self._cosine_annealing_period_mul = cosine_annealing_period_mul
+
+        self.param_group_indices = param_group_indices
 
         self.T_cur = 0  # 当前周期内已走过的步数
         self.cycle = 0  # 当前周期编号
@@ -82,16 +86,21 @@ class WarmupCosineAnnealingLRScheduler(LRScheduler):
         return self._steps > self._warmup_iters
 
     def _update_lr(self):
+        if self.param_group_indices is None:
+            target_groups = self._optimizer.param_groups
+        else:
+            target_groups = [self._optimizer.param_groups[i] for i in self.param_group_indices]
+
         # 如果period_mul是0，则认为没有周期，超过余弦退火总步数，则一直保持最小lr
         if self._cosine_annealing_period_mul == 0 and self._steps >= self._cosine_annealing_period + self._warmup_iters:
             lr = self._min_lr
-            for param_group in self._optimizer.param_groups:
+            for param_group in target_groups:
                 param_group['lr'] = lr
         elif self._steps <= self._warmup_iters:
             # Warmup: adjust learning rate linearly
             # (max_lr - initial_lr) / warmup_iters
             lr = self._initial_lr + self._steps * self._lr_increment
-            for param_group in self._optimizer.param_groups:
+            for param_group in target_groups:
                 param_group['lr'] = lr
         else:
             if not self._cosine_annealing_base_lr:
@@ -118,7 +127,7 @@ class WarmupCosineAnnealingLRScheduler(LRScheduler):
             cos_factor = (1 + math.cos(math.pi * calc_t / T_max)) / 2
             lr = self._min_lr + (self._cosine_annealing_base_lr - self._min_lr) * cos_factor
 
-            for param_group in self._optimizer.param_groups:
+            for param_group in target_groups:
                 param_group['lr'] = lr
 
         self._current_lr = lr
@@ -177,3 +186,35 @@ class NoneLRScheduler(LRScheduler):
     def restore_ckpt_dict(self, ckpt: dict):
         if 'cur_lr' in ckpt:
             self._current_lr = ckpt['cur_lr']
+
+
+class CompositeLRScheduler(LRScheduler):
+    def __init__(self, schedulers: List[LRScheduler]):
+        self.schedulers = schedulers
+
+    @property
+    def cur_steps(self):
+        return self.schedulers[0].cur_steps if self.schedulers else 0
+
+    @property
+    def cur_lr(self):
+        return self.schedulers[0].cur_lr if self.schedulers else 0.0
+
+    def step(self):
+        for scheduler in self.schedulers:
+            scheduler.step()
+
+    def can_clip_grad(self):
+        return all(s.can_clip_grad() for s in self.schedulers)
+
+    def get_ckpt_dict(self) -> dict:
+        ckpt = {}
+        for i, scheduler in enumerate(self.schedulers):
+            ckpt[f'scheduler_{i}'] = scheduler.get_ckpt_dict()
+        return ckpt
+
+    def restore_ckpt_dict(self, ckpt: dict):
+        for i, scheduler in enumerate(self.schedulers):
+            key = f'scheduler_{i}'
+            if key in ckpt:
+                scheduler.restore_ckpt_dict(ckpt[key])

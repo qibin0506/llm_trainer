@@ -28,6 +28,12 @@ from .checkpoint import (
     save_checkpoint,
     save_steps,
 )
+from .scheduler import (
+    LRScheduler,
+    WarmupCosineAnnealingLRScheduler,
+    CompositeLRScheduler,
+    NoneLRScheduler
+)
 
 
 class ValueModel(nn.Module):
@@ -124,6 +130,103 @@ class PPOTrainer(BaseTrainer):
         )
 
         return model, optim
+
+    def _config_optim(self, model, initial_lr):
+        optimizer_cls, use_lion_optim = self._get_optim_cls()
+
+        policy_config = self.train_config.optim_config
+        value_config = self.ppo_config.value_optim_config if self.ppo_config.value_optim_config else policy_config
+
+        no_decay_name_list = ["bias", "norm.weight"]
+
+        def get_param_groups(module, config, name_prefix):
+            current_betas = config.betas
+            current_weight_decay = config.weight_decay
+
+            if current_betas is None:
+                current_betas = (0.95, 0.98) if use_lion_optim else (0.9, 0.999)
+
+            if current_weight_decay is None:
+                current_weight_decay = 0.015 if use_lion_optim else 0.01
+
+            decay_params = []
+            no_decay_params = []
+
+            for name, param in module.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if any(nd in name for nd in no_decay_name_list):
+                    no_decay_params.append(param)
+                else:
+                    decay_params.append(param)
+
+            return [
+                {
+                    "params": decay_params,
+                    "weight_decay": current_weight_decay,
+                    "lr": config.initial_lr,
+                    "betas": current_betas,
+                    "name": f"{name_prefix}_decay"
+                },
+                {
+                    "params": no_decay_params,
+                    "weight_decay": 0.0,
+                    "lr": config.initial_lr,
+                    "betas": current_betas,
+                    "name": f"{name_prefix}_no_decay"
+                }
+            ]
+
+        optimizer_grouped_parameters = []
+        optimizer_grouped_parameters.extend(get_param_groups(model.policy_model, policy_config, "policy"))
+        optimizer_grouped_parameters.extend(get_param_groups(model.value_model, value_config, "value"))
+
+        default_betas = policy_config.betas if policy_config.betas else ((0.95, 0.98) if use_lion_optim else (0.9, 0.999))
+        default_weight_decay = policy_config.weight_decay if policy_config.weight_decay else (0.015 if use_lion_optim else 0.01)
+
+        return optimizer_cls(
+            optimizer_grouped_parameters,
+            lr=policy_config.initial_lr,
+            betas=default_betas,
+            weight_decay=default_weight_decay
+        )
+
+    def _init_lr_scheduler(self, initial_lr: float, optimizer) -> LRScheduler:
+        policy_config = self.train_config.optim_config
+        value_config = self.ppo_config.value_optim_config
+
+        if value_config is None:
+            return super()._init_lr_scheduler(initial_lr, optimizer)
+
+        schedulers = []
+
+        def create_scheduler(config, group_indices, need_log):
+            initial_lr = config.initial_lr
+            if config.enable_lr_scheduler:
+                warmup_iters = config.warmup_iters
+                min_lr = config.min_lr
+                max_lr = config.max_lr
+                cosine_annealing_period = config.cosine_annealing_period
+                cosine_annealing_period_mul = config.cosine_annealing_period_mul
+
+                return WarmupCosineAnnealingLRScheduler(
+                    optimizer=optimizer,
+                    warmup_iters=warmup_iters,
+                    initial_lr=initial_lr,
+                    min_lr=min_lr,
+                    max_lr=max_lr,
+                    cosine_annealing_period=cosine_annealing_period,
+                    cosine_annealing_period_mul=cosine_annealing_period_mul,
+                    param_group_indices=group_indices,
+                    need_log=TrainerTools().parallel.is_main_process and need_log
+                )
+            else:
+                return NoneLRScheduler(initial_lr)
+
+        schedulers.append(create_scheduler(policy_config, [0, 1], True))
+        schedulers.append(create_scheduler(value_config, [2, 3], False))
+
+        return CompositeLRScheduler(schedulers)
 
     def _init_ref_model(self):
         ref_model = self._new_model(self.train_config)

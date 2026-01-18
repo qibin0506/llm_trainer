@@ -103,8 +103,8 @@ class PPOTrainer(BaseTrainer):
         train_model = PolicyAndValueModelWrapper(policy_model, value_model)
 
         if self.train_config.init_state_dict:
-            policy_model.load_state_dict(self.train_config.init_state_dict)
-            value_model.base_model.load_state_dict(self.train_config.init_state_dict)
+            policy_model.load_state_dict(self.train_config.init_state_dict, strict=False)
+            value_model.base_model.load_state_dict(self.train_config.init_state_dict, strict=False)
             self.train_config.init_state_dict = None
 
         if self.train_config.ppo_config.value_model_checkpoint:

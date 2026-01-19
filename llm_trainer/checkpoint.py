@@ -19,7 +19,7 @@ def save_checkpoint(
 ):
     if isinstance(TrainerTools().parallel, DsParallel):
         from .ds_checkpoint import save_ds_checkpoint
-        save_ds_checkpoint(model)
+        save_ds_checkpoint(model, extra_module=extra_module)
     else:
         if TrainerTools().parallel.is_main_process:
             checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)
@@ -45,7 +45,7 @@ def load_checkpoint(
 ):
     if isinstance(TrainerTools().parallel, DsParallel):
         from .ds_checkpoint import load_ds_checkpoint
-        load_ds_checkpoint(model, load_module_only=load_module_only)
+        load_ds_checkpoint(model, load_module_only=load_module_only, extra_module=extra_module)
     else:
         checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)
 
@@ -54,10 +54,10 @@ def load_checkpoint(
             raw_model = model.module if isinstance(model, DDP) else model
             raw_model.load_state_dict(state_dict['model_state_dict'])
 
-            if optimizer:
+            if optimizer and 'optim_state_dict' in state_dict:
                 optimizer.load_state_dict(state_dict['optim_state_dict'])
 
-            if extra_module:
+            if extra_module and 'extra_module_state_dict' in state_dict:
                 extra_module.load_state_dict(state_dict['extra_module_state_dict'])
 
 

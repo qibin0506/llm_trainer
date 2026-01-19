@@ -239,6 +239,7 @@ class PPOConfig:
     kl_estimator: str = 'k1' # or k3
     missing_eos_penalty: Optional[float] = None
     normalize_rewards: bool = False
+    normalize_method: str = 'RunningMeanStd' # RunningMeanStd or BatchStd
     whiten_rewards: bool = False
     gen_max_seq_len: int
     gen_temperature: Optional[float] = None

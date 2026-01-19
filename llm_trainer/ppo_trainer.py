@@ -20,13 +20,15 @@ from .utils import (
     log_softmax,
     masked_whiten,
     disable_dropout_in_model,
-    calc_position_ids
+    calc_position_ids,
+    RunningMeanStd
 )
 from .partition_utils import unwrap_model_for_generation
 from .log import Logger
 from .checkpoint import (
     save_checkpoint,
     save_steps,
+    load_checkpoint
 )
 from .scheduler import (
     LRScheduler,
@@ -78,19 +80,25 @@ class PPOTrainer(BaseTrainer):
     ):
         self.ppo_config = train_config.ppo_config
 
+        if self.ppo_config.normalize_rewards:
+            if self.ppo_config.normalize_method == 'RunningMeanStd':
+                self.reward_normalizer = RunningMeanStd(shape=()).to(TrainerTools().parallel.device)
+            else:
+                self.reward_normalizer = None
+
+            if self.ppo_config.whiten_rewards:
+                self.ppo_config.whiten_rewards = False
+                if TrainerTools().parallel.is_main_process:
+                    Logger.std_log('WARN: ppo_config.normalize_rewards is enabled, ppo_config.whiten_rewards must be disabled.')
+
         super().__init__(
             train_config=train_config,
             eval_prompts=eval_prompts,
             gradient_accumulation_steps=self.ppo_config.gradient_accumulation_steps
         )
+
         self.reward_func = reward_func
-
         self.ref_model = self._init_ref_model()
-
-        if self.train_config.ppo_config.normalize_rewards and self.train_config.ppo_config.whiten_rewards:
-            self.train_config.ppo_config.whiten_rewards = False
-            if TrainerTools().parallel.is_main_process:
-                Logger.std_log('WARN: ppo_config.normalize_rewards is enabled, ppo_config.whiten_rewards must be disabled.')
 
     def _init_train_model_and_optim(self, initial_lr: float):
         policy_model = self._new_model(self.train_config)
@@ -261,6 +269,14 @@ class PPOTrainer(BaseTrainer):
         )
         return criterion, None
 
+    def _load_train_model_checkpoint(self):
+        load_checkpoint(
+            self.train_model,
+            optimizer=self.optimizer,
+            device=TrainerTools().parallel.device,
+            extra_module=self.reward_normalizer
+        )
+
     def _convert_train_args(self) -> Tuple[dict, dict, dict]:
         parallel_kwargs, data_loader_kwargs, sampler_kwargs = super()._convert_train_args()
         data_loader_kwargs.update({"collate_fn": lambda x: x})
@@ -385,12 +401,17 @@ class PPOTrainer(BaseTrainer):
                 env_rewards_tensor[~dones] -= ppo_config.missing_eos_penalty
 
             raw_reward_mean = env_rewards_tensor.mean()
-            if self.train_config.ppo_config.normalize_rewards:
-                batch_std = env_rewards_tensor.std()
-                if torch.isnan(batch_std) or batch_std < 1e-8:
-                    batch_std = 1.0
 
-                env_rewards_tensor = (env_rewards_tensor - raw_reward_mean) / batch_std
+            if self.train_config.ppo_config.normalize_rewards:
+                if self.reward_normalizer:
+                    self.reward_normalizer.update(env_rewards_tensor)
+                    env_rewards_tensor = self.reward_normalizer(env_rewards_tensor)
+                else:
+                    batch_std = env_rewards_tensor.std()
+                    if torch.isnan(batch_std) or batch_std < 1e-8:
+                        batch_std = 1.0
+
+                    env_rewards_tensor = (env_rewards_tensor - raw_reward_mean) / batch_std
 
             last_token_indices = completion_mask.sum(dim=1) - 1
             valid_indices_mask = last_token_indices >= 0
@@ -613,7 +634,11 @@ class PPOTrainer(BaseTrainer):
                         )
 
                         if (batch - last_ckpt_batch) >= self.train_config.eval_config.eval_batch_interval:
-                            save_checkpoint(model=self.train_model, optimizer=self.optimizer)
+                            save_checkpoint(
+                                model=self.train_model,
+                                optimizer=self.optimizer,
+                                extra_module=self.reward_normalizer
+                            )
                             save_steps(
                                 epoch=epoch,
                                 file_idx=file_idx,
@@ -643,7 +668,11 @@ class PPOTrainer(BaseTrainer):
             self.resume_file_idx = 0
             self.resume_batch_idx = 0
 
-            save_checkpoint(model=self.train_model, optimizer=self.optimizer)
+            save_checkpoint(
+                model=self.train_model,
+                optimizer=self.optimizer,
+                extra_module=self.reward_normalizer
+            )
             save_steps(
                 epoch=epoch + 1,
                 file_idx=0,

@@ -1,6 +1,5 @@
 import os
 from typing import Optional, Union
-import shutil
 import torch
 from torch import nn
 from torch.optim import Optimizer
@@ -15,7 +14,8 @@ DEFAULT_CHECKPOINT_NAME = "checkpoint.pth"
 
 def save_checkpoint(
         model: nn.Module,
-        optimizer: Optional[Optimizer] = None
+        optimizer: Optional[Optimizer] = None,
+        extra_module: Optional[nn.Module] = None
 ):
     if isinstance(TrainerTools().parallel, DsParallel):
         from .ds_checkpoint import save_ds_checkpoint
@@ -30,54 +30,18 @@ def save_checkpoint(
             if optimizer:
                 ckpt.update({'optim_state_dict': optimizer.state_dict()})
 
+            if extra_module:
+                ckpt.update({'extra_module_state_dict': extra_module.state_dict()})
+
             torch.save(ckpt, checkpoint_name)
-
-
-def save_best_checkpoint(
-        current_loss: float,
-        last_best_checkpoint_loss: Optional[float] = None
-) -> bool:
-    # 指定不保存最佳checkpoint
-    if os.environ.get('SAVE_BEST_CHECKPOINT', '1') != '1':
-        return False
-
-    need_replace = not last_best_checkpoint_loss or current_loss <= last_best_checkpoint_loss
-    if need_replace and TrainerTools().parallel.is_main_process:
-        try:
-            if isinstance(TrainerTools().parallel, DsParallel):
-                checkpoint_dir = os.environ.get('DIST_CHECKPOINT_DIR', 'checkpoint')
-
-                if checkpoint_dir.endswith('/'):
-                    best_checkpoint_dir = f'{checkpoint_dir[:-1]}_best'
-                else:
-                    best_checkpoint_dir = f'{checkpoint_dir}_best'
-
-                if not os.path.exists(best_checkpoint_dir):
-                    os.makedirs(best_checkpoint_dir)
-
-                if os.path.exists(checkpoint_dir):
-                    shutil.rmtree(best_checkpoint_dir)
-                    shutil.copytree(checkpoint_dir, best_checkpoint_dir)
-            else:
-                checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)
-                best_checkpoint_name = f'{checkpoint_name}_best'
-
-                if os.path.exists(checkpoint_name):
-                    if os.path.exists(best_checkpoint_name):
-                        os.remove(best_checkpoint_name)
-
-                    shutil.copy2(checkpoint_name, best_checkpoint_name)
-        except: pass
-
-    TrainerTools().parallel.wait('save best checkpoint')
-    return need_replace
 
 
 def load_checkpoint(
         model: nn.Module,
         optimizer: Optional[Optimizer] = None,
         device: Optional[Union[torch.device, str]] = None,
-        load_module_only: bool = False
+        load_module_only: bool = False,
+        extra_module: Optional[nn.Module] = None
 ):
     if isinstance(TrainerTools().parallel, DsParallel):
         from .ds_checkpoint import load_ds_checkpoint
@@ -93,16 +57,8 @@ def load_checkpoint(
             if optimizer:
                 optimizer.load_state_dict(state_dict['optim_state_dict'])
 
-
-def load_checkpoint_for_eval(
-        model: nn.Module,
-        device: Optional[Union[torch.device, str]] = None
-):
-    if isinstance(TrainerTools().parallel, DsParallel):
-        from .ds_checkpoint import load_ds_checkpoint_for_eval
-        load_ds_checkpoint_for_eval(model)
-    else:
-        load_checkpoint(model, None, device)
+            if extra_module:
+                extra_module.load_state_dict(state_dict['extra_module_state_dict'])
 
 
 def save_steps(

@@ -80,14 +80,8 @@ class BaseTrainer:
 
         self.criterion, self.kd_loss = self._init_loss()
 
-        load_checkpoint(
-            self.train_model,
-            optimizer=self.optimizer,
-            device=TrainerTools().parallel.device
-        )
-
-        steps_dict = load_steps()
-        self._apply_restore_ckpt(steps_dict)
+        self._load_train_model_checkpoint()
+        self._apply_restore_ckpt()
 
     def _new_model(self, train_config: TrainConfig):
         return LlmModel(train_config.model_config)
@@ -246,7 +240,15 @@ class BaseTrainer:
 
         return criterion, kd_loss
 
-    def _apply_restore_ckpt(self, steps_dict):
+    def _load_train_model_checkpoint(self):
+        load_checkpoint(
+            self.train_model,
+            optimizer=self.optimizer,
+            device=TrainerTools().parallel.device
+        )
+
+    def _apply_restore_ckpt(self):
+        steps_dict = load_steps()
         if steps_dict:
             self.resume_epoch = steps_dict.get('epoch', 0)
             self.resume_file_idx = steps_dict.get('file_idx', 0)

@@ -31,6 +31,29 @@ def autocast(device_type):
         return nullcontext()
 
 
+def is_bf16_supported():
+    if torch.cuda.is_available():
+        if hasattr(torch.cuda, 'is_bf16_supported'):
+            return torch.cuda.is_bf16_supported()
+        else:
+            try:
+                device_cap = torch.cuda.get_device_capability()
+                return device_cap[0] >= 8
+            except:
+                return False
+
+    if hasattr(torch, 'npu') and torch.npu.is_available():
+        return True
+
+    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        return False
+
+    return False
+
+
+def is_fp16_supported():
+    return torch.cuda.is_available() or (hasattr(torch, 'npu') and torch.npu.is_available())
+
 
 def create_doc_boundary_mask(
         input_ids: torch.Tensor,

@@ -39,6 +39,8 @@ from .checkpoint import (
 from .utils import (
     set_seed,
     autocast,
+    is_bf16_supported,
+    is_fp16_supported
 )
 
 from .log import Logger
@@ -171,22 +173,24 @@ class BaseTrainer:
             if ('zero_optimization' in self.parallel_kwargs
                     and 'offload_optimizer' in self.parallel_kwargs['zero_optimization']
                     and self.parallel_kwargs['zero_optimization']['offload_optimizer']['device'] == 'cpu'):
-                if self.train_config.optim_config.optim_type == 'lion':
-                    if version.parse(importlib.metadata.version("deepspeed")) >= version.parse('0.17.6'):
-                        optimizer = deepspeed.ops.lion.DeepSpeedCPULion
+                if torch.cuda.is_available():
+                    if self.train_config.optim_config.optim_type == 'lion':
+                        if version.parse(importlib.metadata.version("deepspeed")) >= version.parse('0.17.6'):
+                            optimizer = deepspeed.ops.lion.DeepSpeedCPULion
+                        else:
+                            optimizer = deepspeed.ops.adam.DeepSpeedCPUAdam
+                            use_lion_optim = False
+                            if TrainerTools().parallel.is_main_process:
+                                Logger.std_log(
+                                    'When set offload_optimizer, lion optim is unsupported, so set optim to adam!!!!!')
                     else:
                         optimizer = deepspeed.ops.adam.DeepSpeedCPUAdam
-                        use_lion_optim = False
-                        if TrainerTools().parallel.is_main_process:
-                            Logger.std_log(
-                                'When set offload_optimizer, lion optim is unsupported, so set optim to adam!!!!!')
-                else:
-                    optimizer = deepspeed.ops.adam.DeepSpeedCPUAdam
             else:
-                if self.train_config.optim_config.optim_type == 'lion':
-                    optimizer = deepspeed.ops.lion.FusedLion
-                else:
-                    optimizer = deepspeed.ops.adam.FusedAdam
+                if torch.cuda.is_available():
+                    if self.train_config.optim_config.optim_type == 'lion':
+                        optimizer = deepspeed.ops.lion.FusedLion
+                    else:
+                        optimizer = deepspeed.ops.adam.FusedAdam
 
         if not optimizer:
             if self.train_config.optim_config.optim_type == 'lion':
@@ -314,13 +318,14 @@ class BaseTrainer:
                 parallel_kwargs['zero_optimization'] = zero_optimization
 
             if (self.train_config.ds_config.bf16_config is not None
-                    and self.train_config.ds_config.bf16_config.enabled):
+                    and self.train_config.ds_config.bf16_config.enabled
+                    and is_bf16_supported()):
                 bf16_config = self.train_config.ds_config.bf16_config
                 bf16 = {
                     'enabled': bf16_config.enabled
                 }
                 parallel_kwargs['bf16'] = bf16
-            elif self.train_config.ds_config.fp16_config:
+            elif self.train_config.ds_config.fp16_config and is_fp16_supported():
                 fp16_config = self.train_config.ds_config.fp16_config
                 fp16 = {
                     'enabled': fp16_config.enabled,

@@ -11,9 +11,18 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 try:
     import deepspeed
-except: ...
+except ImportError:
+    deepspeed = None
 
 from .log import Logger
+
+
+def _get_optimal_backend():
+    if torch.cuda.is_available() and dist.is_nccl_available():
+        return 'nccl'
+    if hasattr(dist, 'is_hccl_available') and dist.is_hccl_available():
+        return 'hccl'
+    return 'gloo'
 
 
 class Parallel(ABC):
@@ -31,33 +40,56 @@ class Parallel(ABC):
     ):
         self._global_rank: int = int(os.environ.get('RANK', -1))
         self._local_rank: int = int(os.environ.get('LOCAL_RANK', -1))
+        self.dist_backend = _get_optimal_backend()
+
+        if self._global_rank == -1:
+            _use_parallel = False
+
         self._use_parallel: bool = _use_parallel and self._global_rank != -1
 
         self._sampler: Optional[DistributedSampler] = None
         self.model: Optional[nn.Module] = None
 
         try:
-            torch.set_float32_matmul_precision('high')
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
+            if torch.cuda.is_available():
+                torch.set_float32_matmul_precision('high')
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
         except:
             pass
 
         if self._use_parallel:
             if _init_process_group:
-                dist.init_process_group(backend='nccl')
+                dist.init_process_group(backend=self.dist_backend)
 
-            self.device: str = f'cuda:{self._local_rank}'
-            self.device_type: str = 'cuda'
-            torch.cuda.set_device(self.device)
+            if self.dist_backend == 'nccl':
+                self.device_type = 'cuda'
+                self.device = f'cuda:{self._local_rank}'
+                torch.cuda.set_device(self.device)
+            elif self.dist_backend == 'hccl':
+                self.device_type = 'npu'
+                self.device = f'npu:{self._local_rank}'
+                torch.npu.set_device(self.device)
+            else:
+                if torch.backends.mps.is_available():
+                    self.device_type = 'mps'
+                    self.device = 'mps'
+                elif torch.cuda.is_available():
+                    self.device_type = 'cuda'
+                    self.device = f'cuda:{self._local_rank}'
+                    torch.cuda.set_device(self.device)
+                else:
+                    self.device_type = 'cpu'
+                    self.device = 'cpu'
 
-            Logger.std_log(f'global_rank={self._global_rank}, local_rank={self._local_rank}, world_size={self.world_size}')
+            Logger.std_log(f'Backend={self.dist_backend}, global_rank={self._global_rank}, local_rank={self._local_rank}, world_size={self.world_size}, device={self.device}')
         else:
-            device = "cpu"
             if torch.cuda.is_available():
                 device = "cuda"
             elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
                 device = "mps"
+            else:
+                device = "cpu"
 
             self.device: str = device
             self.device_type: str = device
@@ -75,24 +107,10 @@ class Parallel(ABC):
             self,
             dataset: Dataset,
             data_loader_kwargs: dict,
-            sampler_kwargs: Optional[dict]=None
+            sampler_kwargs: Optional[dict] = None
     ) -> DataLoader:
-        """
-        :param dataset:
-        :param data_loader_kwargs
-                "batch_size" int,
-                "pin_memory" bool,
-                "collate_fn" collate_fn,
-                "num_workers" int
-                "shuffle" bool
-                "drop_last" bool
-        :param sampler_kwargs:
-                "shuffle" bool
-                "drop_last" bool
-        :return:
-        """
-
         if self._use_parallel:
+            sampler_kwargs = sampler_kwargs or {}
             self._sampler = DistributedSampler(dataset=dataset, **sampler_kwargs)
             return DataLoader(dataset=dataset, sampler=self._sampler, **data_loader_kwargs)
 
@@ -106,7 +124,14 @@ class Parallel(ABC):
 
     def synchronize(self):
         if self._use_parallel:
-            torch.cuda.synchronize(device=self.device)
+            if self.device_type == 'cuda':
+                torch.cuda.synchronize(device=self.device)
+            elif self.device_type == 'mps':
+                torch.mps.synchronize()
+            elif self.device_type == 'npu':
+                torch.npu.synchronize()
+            else:
+                pass
 
     def destroy(self):
         if self._use_parallel:
@@ -120,7 +145,6 @@ class Parallel(ABC):
     def is_main_process(self) -> bool:
         if self._use_parallel:
             return self._global_rank == 0
-
         return True
 
     @property
@@ -141,7 +165,13 @@ class Parallel(ABC):
 
 class DsParallel(Parallel):
     def __init__(self):
-        deepspeed.init_distributed(dist_backend='nccl')
+        self.detected_backend = _get_optimal_backend()
+
+        if deepspeed:
+            deepspeed.init_distributed(dist_backend=self.detected_backend)
+        else:
+            raise ImportError("DeepSpeed not installed.")
+
         super().__init__(_init_process_group=False)
 
     def process(
@@ -151,14 +181,7 @@ class DsParallel(Parallel):
             kwargs: Optional[dict] = None,
             save_instance: bool = True
     ) -> Tuple[nn.Module, torch.optim.Optimizer]:
-        """
-            :param model:
-            :param optimizer:
-            :param kwargs:
-                参考deepspeed配置
-            :param save_instance
-            :return:
-        """
+
         model, optim, _, _ = deepspeed.initialize(
             model=model,
             optimizer=optimizer,
@@ -190,8 +213,10 @@ class DdpParallel(Parallel):
         model.to(self.device)
 
         if self._use_parallel:
-            # self.model = DDP(module=model, broadcast_buffers=False, find_unused_parameters=True)
-            model = DDP(module=model, device_ids=[self._local_rank], output_device=self._local_rank)
+            if self.device_type == 'cuda':
+                model = DDP(module=model, device_ids=[self._local_rank], output_device=self._local_rank)
+            else:
+                model = DDP(module=model)
         else:
             model = model
 

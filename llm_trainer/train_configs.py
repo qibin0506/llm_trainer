@@ -168,7 +168,7 @@ class PretrainConfig:
     Args:
         gradient_accumulation_steps (`int`, *Optional*, default is 1):
             梯度累积步数，为0时不使用梯度累积
-            目前仅适用于pretrain\sft\dpo，不适用于ppo\grpo\gspo
+            目前仅适用于pretrain、sft、dpo，不适用于ppo、grpo、gspo
         kd_config: (`KDConfig`, *Optional*, default is None):
             知识蒸馏配置项，为None时不使用知识蒸馏
     """
@@ -186,7 +186,7 @@ class SFTConfig:
             指定是否mask prompt部分的token
         gradient_accumulation_steps (`int`, *Optional*, default is 1):
             梯度累积步数，为0时不使用梯度累积
-            目前仅适用于pretrain\sft\dpo，不适用于ppo\grpo\gspo
+            目前仅适用于pretrain、sft、dpo，不适用于ppo、grpo、gspo
         kd_config: (`KDConfig`, *Optional*, default is None):
             知识蒸馏配置项，为None时不使用知识蒸馏
         pixel_values_provider: (`Callable[[list[str]], torch.Tensor]`, *Optional*, default is None):
@@ -212,7 +212,7 @@ class DPOConfig:
             指定是否mask prompt部分的token
         gradient_accumulation_steps (`int`, *Optional*, default is 1):
             梯度累积步数，为0时不使用梯度累积
-            目前仅适用于pretrain\sft\dpo，不适用于ppo\grpo\gspo
+            目前仅适用于pretrain、sft、dpo，不适用于ppo、grpo、gspo
     """
     ref_model_checkpoint: Mapping[str, Any]
     mask_prompt: bool = True

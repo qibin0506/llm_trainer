@@ -53,7 +53,7 @@ def init_env():
 
 数据格式支持灵活配置，推荐使用 `.npy` 格式以获得最佳性能。
 
-*详细数据生成示例请参考 [example/create\_dataset.md](https://www.google.com/search?q=example/create_dataset.md)*。
+*详细数据生成示例请参考 [example/create\_dataset.md](https://github.com/qibin0506/llm_trainer/blob/master/example/create_dataset.md)*。
 
 ### 3. 开启训练
 

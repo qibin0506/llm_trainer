@@ -326,25 +326,19 @@ def _get_train_config(
 
 *   **`vis_log`**: 绘制训练日志曲线（Loss, Reward, Aux Loss 等）。
 
-    Bash
-
-    ```
+    ``` Bash
     vis_log ./log/log.txt
 
     ```
 *   **`vis_lr`**: 可视化学习率变化曲线。
 
-    Bash
-
-    ```
+    ``` Bash
     vis_lr ./log/lr.txt
 
     ```
 *   **`calc_intermediate_size`**: 辅助计算模型参数（如 FFN 的 intermediate size）。
 
-    Bash
-
-    ```
+    ``` Bash
     calc_intermediate_size 4096 # 输入 hidden_size
 
     ```

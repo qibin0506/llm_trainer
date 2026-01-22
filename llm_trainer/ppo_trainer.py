@@ -653,9 +653,15 @@ class PPOTrainer(BaseTrainer):
                     except Exception as e:
                         self._on_exception(e, epoch, batch)
 
-                # 一个文件训练结束后，清理内存
-                del train_data_loader
-                del dataset
+                try:
+                    # 一个文件训练结束后，清理内存
+                    del train_data_loader
+                    del dataset
+                    del data_iterator
+                    del batch_data
+                    del ppo_stats
+                except UnboundLocalError: ...
+
                 if hasattr(TrainerTools().parallel, '_sampler'):
                     TrainerTools().parallel._sampler = None
 

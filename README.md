@@ -108,6 +108,99 @@ trainer.train()
 
 ```
 
+## 💻 配置调用代码参考 (Configuration Code)
+
+以下代码展示了如何根据不同训练阶段（Pretrain, SFT, PPO 等）组装 `TrainConfig`。你可以参考此模板在项目中实现自己的配置逻辑。
+
+``` python
+from llm_trainer import train_configs, TrainerTools
+from llm_model import ModelConfig
+import torch
+import math
+
+def _get_train_config(
+        n_epochs: int,
+        real_batch_size: int,
+        file_dataset,
+        model_config: ModelConfig,
+        train_stage: str
+):
+    # 1. 加载断点或参考模型权重
+    init_state_dict = torch.load('./last_checkpoint.bin', weights_only=True) if os.path.exists('./last_checkpoint.bin') else None
+    ref_checkpoint = torch.load('./sft.bin', weights_only=True) if os.path.exists('./sft.bin') else None
+    
+    # 2. 基础配置
+    gradient_accumulation_steps = 3
+    eval_batch_interval = 10 if train_stage in ['grpo', 'ppo'] else 100
+
+    # 3. 学习率与 Scheduler 配置
+    enable_lr_scheduler = True
+    min_lr_ratio = 0.1
+    warmup_iters = -1
+    period = -1
+    
+    if train_stage == 'ppo':
+        initial_lr = 1e-5
+    elif train_stage == 'sft':
+        max_lr = 2e-5
+        initial_lr = 1e-7
+        # 自动计算 warmup 和 cosine 周期
+        warmup_iters, period = calc_lr_schedular_args(
+            epochs=n_epochs, all_data_size=86600, 
+            batch_size=real_batch_size, gradient_accumulation_steps=gradient_accumulation_steps
+        )
+    # ... 其他阶段配置
+
+    optim_config = train_configs.OptimConfig(
+        enable_lr_scheduler=enable_lr_scheduler,
+        initial_lr=initial_lr,
+        warmup_iters=warmup_iters,
+        max_lr=max_lr,
+        min_lr=max_lr * min_lr_ratio if max_lr > 0 else initial_lr * min_lr_ratio,
+        cosine_annealing_period=period
+    )
+
+    # 4. DeepSpeed 配置
+    ds_config = train_configs.DsConfig(
+        zero_config=train_configs.DsZero1Config() # 使用 Zero-1
+    )
+
+    # 5. 各阶段专属配置
+    sft_config = train_configs.SFTConfig(
+        mask_prompt=True,
+        gradient_accumulation_steps=gradient_accumulation_steps
+    ) if train_stage == 'sft' else None
+
+    ppo_config = train_configs.PPOConfig(
+        ppo_epochs=4,
+        ppo_batch_size=5,
+        gradient_accumulation_steps=10,
+        vf_coef=0.5,
+        kl_beta=0.01,
+        ref_model_checkpoint=ref_checkpoint,
+        gen_max_seq_len=2048,
+        # PPO 独立的 Value Model 优化器配置
+        value_optim_config=train_configs.OptimConfig(...)
+    ) if train_stage == 'ppo' else None
+    
+    # ... DPO, GRPO 配置类似
+
+    # 6. 返回最终 TrainConfig
+    return train_configs.TrainConfig(
+        n_epochs=n_epochs,
+        batch_size=real_batch_size,
+        model_config=model_config,
+        file_dataset=file_dataset,
+        dataset_block_size=model_config.max_position_embeddings,
+        optim_config=optim_config,
+        ds_config=ds_config,
+        sft_config=sft_config,
+        ppo_config=ppo_config,
+        # ... 其他 config
+    )
+
+```
+
 ***
 
 ## ⚙️ 训练参数详解

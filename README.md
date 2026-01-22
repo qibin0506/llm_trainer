@@ -10,6 +10,7 @@
 *   **灵活的并行策略**：内置 `smart_train` 脚本，自动识别环境并在 DeepSpeed (Zero 0/1/2/3)、DDP 和单机模式间切换。
 *   **丰富的 Loss 实现**：内置 Critical Token Loss、Aux Loss、Knowledge Distillation (KD) Loss 以及多种 RL Loss 实现。
 *   **实用工具箱**：包含 Tokenizer 封装、学习率可视化、Loss 曲线绘制、断点续训管理等工具。
+*   **配套模型框架**：[https://github.com/qibin0506/llm_model](https://github.com/qibin0506/llm_model)。
 
 ## 🛠️ 安装
 

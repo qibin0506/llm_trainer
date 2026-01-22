@@ -281,9 +281,33 @@ class DPOTrainer(BaseTrainer):
                     except Exception as e:
                         self._on_exception(e, epoch, batch)
 
-                # 一个文件训练结束后，清理内存
-                del train_data_loader
-                del dataset
+                try:
+                    # 一个文件训练结束后，清理内存
+                    del train_data_loader
+                    del dataset
+                    del data_iterator
+                    del batch_data
+                    del concat_inputs
+                    del concat_labels
+                    del concat_attention_masks
+                    del policy_outputs
+                    del loss
+                    del aux_loss
+                    del nll_loss
+                    del total_loss
+                    del ref_outputs
+                    del chosen_inputs
+                    del chosen_labels
+                    del rejected_inputs
+                    del rejected_labels
+                    del chosen_attention_masks
+                    del rejected_attention_masks
+                    del policy_chosen_logps
+                    del policy_rejected_logps
+                    del ref_chosen_logps
+                    del ref_rejected_logps
+                except UnboundLocalError: ...
+
                 if hasattr(TrainerTools().parallel, '_sampler'):
                     TrainerTools().parallel._sampler = None
 

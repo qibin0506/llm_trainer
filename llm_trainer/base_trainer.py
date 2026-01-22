@@ -683,9 +683,22 @@ class BaseTrainer:
                     except Exception as e:
                         self._on_exception(e, epoch, batch)
 
-                # 一个文件训练结束后，清理内存
-                del train_data_loader
-                del dataset
+                try:
+                    # 一个文件训练结束后，清理内存
+                    del train_data_loader
+                    del dataset
+                    del data_iterator
+                    del batch_data
+                    del inputs
+                    del labels
+                    del attention_mask
+                    del result
+                    del loss
+                    del total_loss
+                    del aux_loss
+                    del pixel_values
+                except UnboundLocalError: ...
+
                 if hasattr(TrainerTools().parallel, '_sampler'):
                     TrainerTools().parallel._sampler = None
 

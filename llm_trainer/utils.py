@@ -526,13 +526,13 @@ def _mask_prompt(labels):
     策略：
     1. <system>/<user> 到 </s> 之间：全部 Mask。
     2. </s> 后的 <assistant>：Mask
-    3. <assistant> 后的 <answer>：Mask
+    3. <assistant> 后的 <answer>：保留
     4. <assistant> 后的 <think>：保留
     例如：
     1. 原始: <system>system</s><user>user</s><assistant>content</s>
        mask: mask mask mask mask mask mask mask content</s>
     2. 原始: <system>system</s><user>user</s><assistant><answer>content</answer></s>
-       mask: mask mask mask mask mask mask mask mask content</answer></s>
+       mask: mask mask mask mask mask mask mask <answer> content</answer></s>
     3. 原始：<system>system</s><user>user</s><assistant><think>think</think><answer>content</answer></s>
        mask: mask mask mask mask mask mask mask <think>think</think><answer>content</answer></s>
     """
@@ -540,8 +540,6 @@ def _mask_prompt(labels):
     user_token_id = TrainerTools().tokenizer.user
     end_token_id = TrainerTools().tokenizer.end
     assistant_token_id = TrainerTools().tokenizer.assistant
-    answer_start_token_id = TrainerTools().tokenizer.answer_start
-    think_start_token_id = TrainerTools().tokenizer.think_start
     ignore_index = -100
 
     for batch, label in enumerate(labels):
@@ -562,14 +560,14 @@ def _mask_prompt(labels):
                 if next_idx < seq_len and label[next_idx] == assistant_token_id:
                     end_mask_index = next_idx
 
-                    after_assistant_idx = next_idx + 1
-                    if after_assistant_idx < seq_len:
-                        token_after = label[after_assistant_idx]
-
-                        if token_after == answer_start_token_id:
-                            end_mask_index = after_assistant_idx
-                        elif token_after == think_start_token_id:
-                            pass
+                    # after_assistant_idx = next_idx + 1
+                    # if after_assistant_idx < seq_len:
+                    #     token_after = label[after_assistant_idx]
+                    #
+                    #     if token_after == answer_start_token_id:
+                    #         end_mask_index = after_assistant_idx
+                    #     elif token_after == think_start_token_id:
+                    #         pass
 
                 labels[batch, start_index: end_mask_index + 1] = ignore_index
                 start_index = -1

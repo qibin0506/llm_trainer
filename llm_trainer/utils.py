@@ -536,46 +536,57 @@ def _mask_prompt(labels):
     3. 原始：<system>system</s><user>user</s><assistant><think>think</think><answer>content</answer></s>
        mask: mask mask mask mask mask mask mask <think>think</think><answer>content</answer></s>
     """
-    system_token_id = TrainerTools().tokenizer.system
-    user_token_id = TrainerTools().tokenizer.user
-    end_token_id = TrainerTools().tokenizer.end
-    assistant_token_id = TrainerTools().tokenizer.assistant
+    tokenizer = TrainerTools().tokenizer
+    system_id = tokenizer.system
+    user_id = tokenizer.user
+    end_id = tokenizer.end
+    assistant_id = tokenizer.assistant
     ignore_index = -100
 
-    for batch, label in enumerate(labels):
-        start_index = -1
-        seq_len = len(label)
+    for i in range(labels.shape[0]):
+        row = labels[i]
+        seq_len = len(row)
 
-        for index, token in enumerate(label):
-            if token == system_token_id or token == user_token_id:
-                if start_index != -1:
-                    labels[batch, start_index: index] = ignore_index
+        # 1. 找到所有 Prompt 开始 (system/user) 和结束 (end) 的位置
+        # 使用 view(-1) 确保是一维 Tensor
+        starts = torch.nonzero((row == system_id) | (row == user_id)).view(-1)
+        ends = torch.nonzero(row == end_id).view(-1)
 
-                start_index = index
+        if starts.numel() == 0:
+            continue
 
-            elif token == end_token_id and start_index != -1:
-                end_mask_index = index
-                next_idx = index + 1
+        # 2. 迭代处理每个 Prompt 区间
+        # 使用指针跳跃式处理，而不是逐个 token 扫描
+        start_idx_ptr = 0
+        while start_idx_ptr < len(starts):
+            # 获取当前 Prompt 的起始位置
+            s_pos = starts[start_idx_ptr].item()
 
-                if next_idx < seq_len and label[next_idx] == assistant_token_id:
-                    end_mask_index = next_idx
+            # 在 ends 中查找第一个大于 s_pos 的结束符位置
+            # searchsorted 返回的是插入位置，保证顺序
+            e_idx = torch.searchsorted(ends, s_pos, right=True).item()
 
-                    # after_assistant_idx = next_idx + 1
-                    # if after_assistant_idx < seq_len:
-                    #     token_after = label[after_assistant_idx]
-                    #
-                    #     if token_after == answer_start_token_id:
-                    #         end_mask_index = after_assistant_idx
-                    #     elif token_after == think_start_token_id:
-                    #         pass
+            if e_idx >= len(ends):
+                # 如果找不到结束符，说明句子被截断了 (Truncated)
+                # 按照原有逻辑，Mask 掉从 start 到最后的所有内容
+                row[s_pos:] = ignore_index
+                break
 
-                labels[batch, start_index: end_mask_index + 1] = ignore_index
-                start_index = -1
+            e_pos = ends[e_idx].item()
+            mask_end = e_pos
 
-        # 循环结束后，如果 start_index 仍然不是 -1，说明序列被截断了（Truncation）。
-        # 此时整个尾部都属于 Prompt（例如 User 说到一半被截断），必须全部 Mask。
-        if start_index != -1:
-            labels[batch, start_index:] = ignore_index
+            # 3. 检查 </s> 后面是否紧跟 <assistant>
+            # 如果是，Mask 范围需要延伸到 <assistant>
+            if e_pos + 1 < seq_len and row[e_pos + 1] == assistant_id:
+                mask_end = e_pos + 1
+
+            # 4. 执行 Mask 操作 (利用切片赋值，速度极快)
+            row[s_pos: mask_end + 1] = ignore_index
+
+            # 5. 寻找下一个 Prompt 开始位置
+            # 直接跳过当前 Mask 区域内的所有 start token (处理嵌套或连续 start 的情况)
+            next_s_idx = torch.searchsorted(starts, mask_end, right=True).item()
+            start_idx_ptr = next_s_idx
 
     return labels
 

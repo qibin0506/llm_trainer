@@ -110,6 +110,7 @@ class DataLoaderConfig:
 @dataclass(kw_only=True)
 class OptimConfig:
     optim_type: str = 'adam' # or 'lion'
+    auto_optimize_optimizer: bool = True
     enable_lr_scheduler: bool = False
     initial_lr: float
     weight_decay: Optional[float] = None

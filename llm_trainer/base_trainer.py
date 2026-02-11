@@ -168,7 +168,9 @@ class BaseTrainer:
         optimizer = None
         use_lion_optim = self.train_config.optim_config.optim_type == 'lion'
 
-        if isinstance(TrainerTools().parallel, DsParallel) and self.parallel_kwargs:
+        if (self.train_config.optim_config.auto_optimize_optimizer
+                and isinstance(TrainerTools().parallel, DsParallel)
+                and self.parallel_kwargs):
             import deepspeed
             if ('zero_optimization' in self.parallel_kwargs
                     and 'offload_optimizer' in self.parallel_kwargs['zero_optimization']

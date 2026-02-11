@@ -1,6 +1,5 @@
 import os
 from abc import ABC, abstractmethod
-import torch
 from .tokenizer import Tokenizer
 from .parallel import DsParallel, DdpParallel, NoneParallel
 from .log import Logger
@@ -10,13 +9,6 @@ parallel_types = {
     'ds': DsParallel,
     'ddp': DdpParallel,
     'none': NoneParallel
-}
-
-dtypes = {
-    'float': torch.float,
-    'float16': torch.float16,
-    'float32': torch.float32,
-    'float64': torch.float64
 }
 
 class TrainerTools:

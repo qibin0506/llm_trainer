@@ -55,13 +55,9 @@ class Parallel(ABC):
                 torch.set_float32_matmul_precision('high')
                 torch.backends.cuda.matmul.allow_tf32 = True
                 torch.backends.cudnn.allow_tf32 = True
-        except:
-            pass
+        except: ...
 
         if self._use_parallel:
-            if _init_process_group:
-                dist.init_process_group(backend=self.dist_backend)
-
             if self.dist_backend == 'nccl':
                 self.device_type = 'cuda'
                 self.device = f'cuda:{self._local_rank}'
@@ -81,6 +77,9 @@ class Parallel(ABC):
                 else:
                     self.device_type = 'cpu'
                     self.device = 'cpu'
+
+            if _init_process_group:
+                dist.init_process_group(backend=self.dist_backend)
 
             Logger.std_log(f'Backend={self.dist_backend}, global_rank={self._global_rank}, local_rank={self._local_rank}, world_size={self.world_size}, device={self.device}')
         else:
@@ -150,7 +149,9 @@ class Parallel(ABC):
     @property
     def world_size(self) -> int:
         if self._use_parallel:
-            return dist.get_world_size()
+            if dist.is_initialized():
+                return dist.get_world_size()
+            return int(os.environ.get('WORLD_SIZE', 1))
         return 1
 
     def wait(self, msg=None):
@@ -165,14 +166,12 @@ class Parallel(ABC):
 
 class DsParallel(Parallel):
     def __init__(self):
-        self.detected_backend = _get_optimal_backend()
+        super().__init__()
 
         if deepspeed:
-            deepspeed.init_distributed(dist_backend=self.detected_backend)
+            deepspeed.init_distributed(dist_backend=self.dist_backend)
         else:
             raise ImportError("DeepSpeed not installed.")
-
-        super().__init__(_init_process_group=False)
 
     def process(
             self,

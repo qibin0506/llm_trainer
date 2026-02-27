@@ -3,7 +3,6 @@ from typing import Optional, Union
 import torch
 from torch import nn
 from torch.optim import Optimizer
-from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 
 from .parallel import DsParallel
@@ -23,9 +22,7 @@ def save_checkpoint(
     else:
         if TrainerTools().parallel.is_main_process:
             checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)
-
-            raw_model = model if not isinstance(model, DDP) else model.module
-            ckpt = {'model_state_dict': raw_model.state_dict()}
+            ckpt = {'model_state_dict': model.state_dict()}
 
             if optimizer:
                 ckpt.update({'optim_state_dict': optimizer.state_dict()})
@@ -51,8 +48,7 @@ def load_checkpoint(
 
         if os.path.exists(checkpoint_name):
             state_dict = torch.load(checkpoint_name, weights_only=True, map_location=device)
-            raw_model = model.module if isinstance(model, DDP) else model
-            raw_model.load_state_dict(state_dict['model_state_dict'])
+            model.load_state_dict(state_dict['model_state_dict'])
 
             if optimizer and 'optim_state_dict' in state_dict:
                 optimizer.load_state_dict(state_dict['optim_state_dict'])

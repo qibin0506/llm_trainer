@@ -3,11 +3,10 @@ from contextlib import contextmanager
 import itertools
 from packaging import version
 from torch import nn
-from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 
 from .tools import TrainerTools
-from .parallel import DsParallel, DdpParallel
+from .parallel import DsParallel
 
 
 @contextmanager
@@ -38,8 +37,6 @@ def unwrap_model_for_generation(model: nn.Module):
                 _add_hooks(model)
         else:
             yield unwrap_model(model)
-    elif isinstance(TrainerTools().parallel, DdpParallel):
-        yield unwrap_model(model)
     else:
         yield model
 
@@ -51,8 +48,6 @@ def sync_model_params(_from: nn.Module, _to: Optional[nn.Module], mixup_alpha: f
     """
     if isinstance(TrainerTools().parallel, DsParallel):
         state_dict = _get_ds_model_params(_from, only_rank0=_to is None)
-    elif isinstance(_from, DDP):
-        state_dict = _from.module.state_dict()
     else:
         state_dict = _from.state_dict()
 
@@ -80,9 +75,6 @@ def unwrap_model(model) -> nn.Module:
         if isinstance(model, deepspeed.DeepSpeedEngine):
             return model.module
     except: ...
-
-    if isinstance(model, DDP):
-        return model.module
 
     return model
 
@@ -156,13 +148,6 @@ def _sync_ds_model_params(_from: nn.Module, _to: Optional[nn.Module], mixup_alph
                 _copy_params(origin_from, _to, mixup_alpha)
     else:
         _copy_params(origin_from, _to, mixup_alpha)
-
-
-def _sync_ddp_model_params(_from: nn.Module, _to: Optional[nn.Module], mixup_alpha: float = 1.0):
-    assert isinstance(_from, DDP)
-
-    origin_from = unwrap_model(_from)
-    _copy_params(origin_from, _to, mixup_alpha)
 
 
 def _add_hooks(model: nn.Module) -> None:

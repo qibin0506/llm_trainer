@@ -7,7 +7,6 @@ setup(
     scripts=[
         'scripts/smart_train',
         'scripts/ds_train',
-        'scripts/ddp_train',
         'scripts/py_train',
         'scripts/vis_lr',
         'scripts/vis_log',

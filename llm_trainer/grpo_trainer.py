@@ -44,7 +44,8 @@ class GRPOTrainer(BaseTrainer):
         self.grpo_config = train_config.grpo_config
         super().__init__(
             train_config=train_config,
-            eval_prompts=eval_prompts
+            eval_prompts=eval_prompts,
+            gradient_accumulation_steps=1
         )
 
         self.reward_func = reward_func
@@ -89,6 +90,11 @@ class GRPOTrainer(BaseTrainer):
 
     def _convert_train_args(self) -> Tuple[dict, dict, dict]:
         parallel_kwargs, data_loader_kwargs, sampler_kwargs = super()._convert_train_args()
+
+        if parallel_kwargs:
+            real_micro_batch_size = self.train_config.batch_size * self.grpo_config.group_size
+            parallel_kwargs['train_micro_batch_size_per_gpu'] = real_micro_batch_size
+
         data_loader_kwargs.update({"collate_fn": lambda x: x})
 
         return parallel_kwargs, data_loader_kwargs, sampler_kwargs
@@ -337,9 +343,16 @@ class GRPOTrainer(BaseTrainer):
                                     aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
 
                             total_loss = loss + aux_loss
-                            self._backward_loss(total_loss)
-                            self._apply_grad_clipping()
-                            self._apply_step()
+
+                            if self.is_ds:
+                                need_update = self.train_model.is_gradient_accumulation_boundary()
+                            else:
+                                need_update = True
+
+                            self._backward_and_step(total_loss, self.gradient_accumulation_steps)
+
+                            if need_update:
+                                self._update()
 
                             loss_accumulation = total_loss.detach().item()
                             aux_loss_accumulation = aux_loss.detach().item()
@@ -349,7 +362,6 @@ class GRPOTrainer(BaseTrainer):
                                     loss_accumulation,
                                     aux_loss_accumulation
                                 ],
-                                gradient_accumulation_steps=1,
                                 batches_accumulated=1
                             )
 

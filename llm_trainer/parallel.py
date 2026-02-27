@@ -7,7 +7,6 @@ from torch import nn
 import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from torch.nn.parallel import DistributedDataParallel as DDP
 
 try:
     import deepspeed
@@ -129,8 +128,7 @@ class Parallel(ABC):
                 torch.mps.synchronize()
             elif self.device_type == 'npu':
                 torch.npu.synchronize()
-            else:
-                pass
+            else: ...
 
     def destroy(self):
         if self._use_parallel:
@@ -196,33 +194,6 @@ class DsParallel(Parallel):
     def synchronize(self): ...
 
     def destroy(self): ...
-
-
-class DdpParallel(Parallel):
-    def __init__(self):
-        super().__init__()
-
-    def process(
-            self,
-            model: nn.Module,
-            optimizer: torch.optim.Optimizer,
-            kwargs: Optional[dict] = None,
-            save_instance: bool = True
-    ) -> Tuple[nn.Module, torch.optim.Optimizer]:
-        model.to(self.device)
-
-        if self._use_parallel:
-            if self.device_type == 'cuda':
-                model = DDP(module=model, device_ids=[self._local_rank], output_device=self._local_rank)
-            else:
-                model = DDP(module=model)
-        else:
-            model = model
-
-        if save_instance:
-            self.model = model
-
-        return model, optimizer
 
 
 class NoneParallel(Parallel):

@@ -98,13 +98,10 @@ class DataLoaderConfig:
                 data_loader num_workers config
             data_loader_shuffle (`bool`, *optional*, default is False):
                 是否需要shuffle数据
-            data_loader_drop_last (`bool`, default is False):
-                最后一个batch不满足batch_size时，是否丢弃
     """
     data_loader_pin_memory: bool = False
     data_loader_num_workers: int = 0
     data_loader_shuffle: bool = False
-    data_loader_drop_last: bool = True
 
 
 @dataclass(kw_only=True)
@@ -213,7 +210,6 @@ class DPOConfig:
             指定是否mask prompt部分的token
         gradient_accumulation_steps (`int`, *Optional*, default is 1):
             梯度累积步数，为0时不使用梯度累积
-            目前仅适用于pretrain、sft、dpo，不适用于ppo、grpo、gspo
     """
     ref_model_checkpoint: Mapping[str, Any]
     mask_prompt: bool = True

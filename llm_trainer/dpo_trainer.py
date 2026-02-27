@@ -75,6 +75,11 @@ class DPOTrainer(BaseTrainer):
     def _convert_train_args(self) -> Tuple[dict, dict, dict]:
         dpo_collate_fn = get_dpo_collate_fn(self.dpo_config.mask_prompt)
         parallel_kwargs, data_loader_kwargs, sampler_kwargs = super()._convert_train_args()
+
+        if parallel_kwargs:
+            real_micro_batch_size = self.train_config.batch_size * 2
+            parallel_kwargs['train_micro_batch_size_per_gpu'] = real_micro_batch_size
+
         data_loader_kwargs.update({"collate_fn": dpo_collate_fn})
 
         return parallel_kwargs, data_loader_kwargs, sampler_kwargs
@@ -117,9 +122,6 @@ class DPOTrainer(BaseTrainer):
         return logprobs_sums, logprobs_means
 
     def train(self):
-        # 梯度累积步数
-        gradient_accumulation_steps = max(1, self.gradient_accumulation_steps)
-
         loss_accumulation = 0.0
         aux_loss_accumulation = 0.0
         nll_loss_accumulation = 0.0
@@ -161,12 +163,6 @@ class DPOTrainer(BaseTrainer):
                 for batch, batch_data in enumerate(data_iterator):
                     batch = skip_batches + batch
 
-                    # 是否需要更新梯度
-                    if gradient_accumulation_steps > 1:
-                        need_update_grad = (batch + 1) % gradient_accumulation_steps == 0 or batch == batch_count_per_file - 1
-                    else:
-                        need_update_grad = True
-
                     try:
                         chosen_inputs: torch.Tensor = batch_data['chosen_inputs'].to(TrainerTools().parallel.device)
                         chosen_labels: torch.Tensor = batch_data['chosen_labels'].to(TrainerTools().parallel.device)
@@ -182,9 +178,6 @@ class DPOTrainer(BaseTrainer):
                         concat_inputs = torch.concat([chosen_inputs, rejected_inputs], dim=0)
                         concat_labels = torch.concat([chosen_labels, rejected_labels], dim=0)
                         concat_attention_masks = torch.concat([chosen_attention_masks, rejected_attention_masks], dim=0)
-
-                        if TrainerTools().parallel.parallel_train:
-                            self.train_model.require_backward_grad_sync = need_update_grad
 
                         with autocast(TrainerTools().parallel.device_type):
                             policy_outputs = self.train_model(concat_inputs, attention_mask=concat_attention_masks)
@@ -220,23 +213,17 @@ class DPOTrainer(BaseTrainer):
                             else:
                                 nll_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
 
-                        if gradient_accumulation_steps > 1:
-                            loss = loss / gradient_accumulation_steps
-                            aux_loss = aux_loss / gradient_accumulation_steps
-                            nll_loss = nll_loss / gradient_accumulation_steps
+                        total_loss_unscaled = loss + aux_loss + nll_loss
+                        need_update = self._need_update(batch, batch_count_per_file)
+                        self._backward_and_step(total_loss_unscaled, self.gradient_accumulation_steps)
 
-                        total_loss = loss + aux_loss + nll_loss
-                        self._backward_loss(total_loss)
-
-                        loss_accumulation += total_loss.detach().item()
+                        loss_accumulation += total_loss_unscaled.detach().item()
                         aux_loss_accumulation += aux_loss.detach().item()
                         nll_loss_accumulation += nll_loss.detach().item()
-
                         batches_accumulated += 1
 
-                        if need_update_grad:
-                            self._apply_grad_clipping()
-                            self._apply_step()
+                        if need_update:
+                            self._update()
 
                             avg_loss, avg_aux_loss, avg_nll_loss = self._avg_loss(
                                 losses=[
@@ -244,7 +231,6 @@ class DPOTrainer(BaseTrainer):
                                     aux_loss_accumulation,
                                     nll_loss_accumulation,
                                 ],
-                                gradient_accumulation_steps=gradient_accumulation_steps,
                                 batches_accumulated=batches_accumulated
                             )
 
@@ -294,7 +280,7 @@ class DPOTrainer(BaseTrainer):
                     del loss
                     del aux_loss
                     del nll_loss
-                    del total_loss
+                    del total_loss_unscaled
                     del ref_outputs
                     del chosen_inputs
                     del chosen_labels

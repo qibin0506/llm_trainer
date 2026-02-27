@@ -563,11 +563,17 @@ class BaseTrainer:
 
     def _update(self):
         self._apply_grad_clipping()
-        self._apply_step()
 
         overflow = False
-        if self.is_ds and hasattr(self.train_model, 'optimizer') and hasattr(self.train_model.optimizer, 'overflow'):
-            overflow = self.train_model.optimizer.overflow
+        if self.is_ds:
+            self._apply_step()
+            if hasattr(self.train_model, 'optimizer') and hasattr(self.train_model.optimizer, 'overflow'):
+                overflow = self.train_model.optimizer.overflow
+        else:
+            scale_before = self.scaler.get_scale()
+            self._apply_step()
+            scale_after = self.scaler.get_scale()
+            overflow = scale_after < scale_before
 
         if not overflow:
             self.lr_scheduler.step()

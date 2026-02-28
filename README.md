@@ -304,7 +304,7 @@ def _get_train_config(
 
 ### 5. 其他配置
 
-*   **DataLoaderConfig**: `data_loader_num_workers`, `data_loader_pin_memory`, `data_loader_shuffle` (是否打乱数据)。
+*   **DataLoaderConfig**: `num_workers`, `pin_memory`, `shuffle` (是否打乱数据)。
 *   **EvalConfig**: `eval_batch_interval` (每隔多少 Batch 评估一次), `max_seq_len` (评估生成长度)。
 *   **LossConfig**: `aux_loss_coef` (MoE 负载均衡 Loss 系数), `critical_tokens` (关键 Token ID 列表, 用于加权 Loss)。
 *   **KDConfig**: 知识蒸馏配置，需提供 `teacher_logits_provider`。

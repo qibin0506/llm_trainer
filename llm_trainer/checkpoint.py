@@ -88,7 +88,7 @@ def load_steps() -> Optional[dict]:
             except:
                 steps_dict = None
 
-    if steps_dict is not None and TrainerTools().parallel.world_size > 1:
+    if TrainerTools().parallel.world_size > 1:
         object_list = [steps_dict]
         dist.broadcast_object_list(object_list, src=0)
         steps_dict = object_list[0]

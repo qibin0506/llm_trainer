@@ -124,12 +124,19 @@ class DPOTrainer(BaseTrainer):
 
     def train(self):
         loss_accumulation = 0.0
+        dpo_loss_accumulation = 0.0
         aux_loss_accumulation = 0.0
         nll_loss_accumulation = 0.0
+        chosen_reward_accumulation = 0.0
+        rejected_reward_accumulation = 0.0
+        reward_margin_accumulation = 0.0
+        reward_accuracy_accumulation = 0.0
+
         batches_accumulated = 0
 
         aux_loss_coef = self.train_config.loss_config.aux_loss_coef
         nll_loss_coef = self.dpo_config.nll_loss_coef
+        beta = self.dpo_config.loss_beta
 
         for epoch in range(self.resume_epoch, self.train_config.n_epochs):
             self.train_model.train()
@@ -220,6 +227,12 @@ class DPOTrainer(BaseTrainer):
                             else:
                                 nll_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
 
+                            with torch.no_grad():
+                                chosen_rewards = beta * (policy_chosen_logps.detach() - ref_chosen_logps)
+                                rejected_rewards = beta * (policy_rejected_logps.detach() - ref_rejected_logps)
+                                reward_margin = chosen_rewards - rejected_rewards
+                                reward_accuracy = (chosen_rewards > rejected_rewards).float()
+
                         total_loss_unscaled = loss + aux_loss + nll_loss
 
                         is_last_step = (
@@ -231,18 +244,31 @@ class DPOTrainer(BaseTrainer):
                         self._backward_loss(total_loss_unscaled, self.gradient_accumulation_steps)
 
                         loss_accumulation += total_loss_unscaled.detach().item()
+                        dpo_loss_accumulation += loss.detach().item()
                         aux_loss_accumulation += aux_loss.detach().item()
                         nll_loss_accumulation += nll_loss.detach().item()
+
+                        chosen_reward_accumulation += chosen_rewards.mean().item()
+                        rejected_reward_accumulation += rejected_rewards.mean().item()
+                        reward_margin_accumulation += reward_margin.mean().item()
+                        reward_accuracy_accumulation += reward_accuracy.mean().item()
+
                         batches_accumulated += 1
 
                         if need_update_step:
                             self._update_step()
 
-                            avg_loss, avg_aux_loss, avg_nll_loss = self._avg_loss(
+                            avg_total_loss, avg_dpo_loss, avg_aux_loss, avg_nll_loss, \
+                            avg_chosen_reward, avg_rejected_reward, avg_reward_margin, avg_reward_accuracy = self._avg_loss(
                                 losses=[
                                     loss_accumulation,
+                                    dpo_loss_accumulation,
                                     aux_loss_accumulation,
                                     nll_loss_accumulation,
+                                    chosen_reward_accumulation,
+                                    rejected_reward_accumulation,
+                                    reward_margin_accumulation,
+                                    reward_accuracy_accumulation
                                 ],
                                 batches_accumulated=batches_accumulated
                             )
@@ -254,16 +280,25 @@ class DPOTrainer(BaseTrainer):
                                     'batch': f'{batch + 1}/{batch_count_per_file}',
                                 },
                                 values={
-                                    'loss': avg_loss,
+                                    'loss': avg_total_loss,
+                                    'dpo_loss': avg_dpo_loss,
                                     'moe_aux_loss': avg_aux_loss,
-                                    'nll_loss': avg_nll_loss
+                                    'nll_loss': avg_nll_loss,
+                                    'reward_chosen': avg_chosen_reward,
+                                    'reward_rejected': avg_rejected_reward,
+                                    'reward_margin': avg_reward_margin,
+                                    'reward_accuracy': avg_reward_accuracy
                                 }
                             )
 
-                            # reset to default
                             loss_accumulation = 0.0
+                            dpo_loss_accumulation = 0.0
                             aux_loss_accumulation = 0.0
                             nll_loss_accumulation = 0.0
+                            chosen_reward_accumulation = 0.0
+                            rejected_reward_accumulation = 0.0
+                            reward_margin_accumulation = 0.0
+                            reward_accuracy_accumulation = 0.0
                             batches_accumulated = 0
 
                             if (batch - last_ckpt_batch) >= self.train_config.eval_config.eval_batch_interval:
@@ -281,7 +316,6 @@ class DPOTrainer(BaseTrainer):
                         self._on_exception(e, epoch, batch)
 
                 try:
-                    # 一个文件训练结束后，清理内存
                     del train_data_loader
                     del dataset
                     del data_iterator
@@ -303,6 +337,10 @@ class DPOTrainer(BaseTrainer):
                     del policy_rejected_logps
                     del ref_chosen_logps
                     del ref_rejected_logps
+                    del chosen_rewards
+                    del rejected_rewards
+                    del reward_margin
+                    del reward_accuracy
                 except UnboundLocalError: ...
 
                 if hasattr(TrainerTools().parallel, '_sampler'):
@@ -329,4 +367,3 @@ class DPOTrainer(BaseTrainer):
             self._on_epoch_end(tag=f'epoch:{epoch}')
 
         TrainerTools().parallel.destroy()
-

@@ -7,7 +7,7 @@
 *   **全生命周期支持**：覆盖 Pretrain、SFT、DPO (Direct Preference Optimization)、PPO (Proximal Policy Optimization) 以及 GRPO (Group Relative Policy Optimization)。
 *   **多模态支持 (VLM)**：原生支持视觉语言模型训练，支持图片 Tag 处理与 Pixel Value 转换，可冻结 LLM 部分仅训练 Projector。
 *   **高效数据加载**：支持 `.jsonl`、`.pkl` 以及 **`.npy` (Memory Mapped)** 格式，极大降低海量数据训练时的内存占用。
-*   **灵活的并行策略**：内置 `smart_train` 脚本，自动识别环境并在 DeepSpeed (Zero 0/1/2/3)、DDP 和单机模式间切换。
+*   **灵活的并行策略**：内置 `smart_train` 脚本，自动识别环境并在 DeepSpeed (Zero 0/1/2/3) 和单机模式间切换。
 *   **丰富的 Loss 实现**：内置 Critical Token Loss、Aux Loss、Knowledge Distillation (KD) Loss 以及多种 RL Loss 实现。
 *   **实用工具箱**：包含 Tokenizer 封装、学习率可视化、Loss 曲线绘制、断点续训管理等工具。
 *   **配套模型框架**：[https://github.com/qibin0506/llm_model](https://github.com/qibin0506/llm_model)。
@@ -317,9 +317,8 @@ def _get_train_config(
 
 | **命令**            | **描述**                                                      | **示例**                            |
 | :---------------- | :---------------------------------------------------------- | :-------------------------------- |
-| **`smart_train`** | **推荐**。自动检测环境。优先使用 DeepSpeed，未安装则降级为 DDP，单卡则使用 Python 原生运行。 | `smart_train train_pretrain.py`   |
+| **`smart_train`** | **推荐**。自动检测环境。优先使用 DeepSpeed，未安装则降级为 Python 原生运行。 | `smart_train train_pretrain.py`   |
 | **`ds_train`**    | 强制使用 DeepSpeed 启动。                                          | `ds_train train_sft.py --arg1 v1` |
-| **`ddp_train`**   | 强制使用 DDP (torchrun) 启动。                                     | `ddp_train train_ppo.py`          |
 
 ## 📊 可视化与其他工具
 

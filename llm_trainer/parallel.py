@@ -194,10 +194,6 @@ class DsParallel(Parallel):
             config_params=kwargs
         )
 
-        first_key = list(model.module.state_dict().keys())[0]
-        first_weight = model.module.state_dict()[first_key]
-        print(f"------------>>>>>Rank {dist.get_rank()} [{first_key}] sum: {first_weight.sum()}")
-
         if save_instance:
             self.model = model
 

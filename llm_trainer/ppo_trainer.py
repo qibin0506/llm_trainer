@@ -522,7 +522,7 @@ class PPOTrainer(BaseTrainer):
                     )
 
                     aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
-                    if policy_output.get('aux_loss') is not None and self.train_config.loss_config.aux_loss_coef:
+                    if policy_output['aux_loss'] is not None and self.train_config.loss_config.aux_loss_coef:
                         aux_loss = self.train_config.loss_config.aux_loss_coef * policy_output['aux_loss']
 
                 total_loss_unscaled = loss + aux_loss

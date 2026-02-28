@@ -362,13 +362,13 @@ class BaseTrainer:
         dataloader_args = self.train_config.data_loader_config
         data_loader_kwargs = {
             "batch_size": self.train_config.batch_size,
-            "pin_memory": dataloader_args.data_loader_pin_memory,
-            "num_workers": dataloader_args.data_loader_num_workers,
-            "shuffle": dataloader_args.data_loader_shuffle,
+            "pin_memory": dataloader_args.pin_memory,
+            "num_workers": dataloader_args.num_workers,
+            "shuffle": dataloader_args.shuffle,
             "drop_last": True,
         }
         sampler_kwargs = {
-            "shuffle": dataloader_args.data_loader_shuffle,
+            "shuffle": dataloader_args.shuffle,
             "drop_last": True,
         }
 
@@ -446,12 +446,12 @@ class BaseTrainer:
             self.scaler.update()
             self.optimizer.zero_grad(set_to_none=True)
 
-    def _need_update_step(self, batch, batch_count_per_file):
+    def _need_update_step(self, batches_accumulated, is_last_step=False):
         if self.is_ds:
             return self.train_model.is_gradient_accumulation_boundary()
 
         if self.gradient_accumulation_steps > 1:
-            return (batch + 1) % self.gradient_accumulation_steps == 0 or batch == batch_count_per_file - 1
+            return (batches_accumulated + 1) % self.gradient_accumulation_steps == 0 or is_last_step
 
         return True
 
@@ -601,6 +601,8 @@ class BaseTrainer:
                 last_ckpt_batch = 0
                 batch_count_per_file = len(train_data_loader)
 
+                effective_stop = None
+
                 TrainerTools().parallel.on_epoch_start(epoch)
                 self._on_file_start(epoch, file_path)
 
@@ -612,8 +614,8 @@ class BaseTrainer:
 
                 data_iterator = iter(train_data_loader)
 
-                if skip_batches > 0:
-                    data_iterator = islice(data_iterator, skip_batches, None)
+                if skip_batches > 0 or effective_stop is not None:
+                    data_iterator = islice(data_iterator, skip_batches, effective_stop)
                     last_ckpt_batch = skip_batches
 
                 for batch, batch_data in enumerate(data_iterator):
@@ -636,23 +638,21 @@ class BaseTrainer:
 
                             # calc loss
                             loss = self._calc_loss(inputs, attention_mask, result['logits'], labels)
-                            if result['aux_loss'] and self.train_config.loss_config.aux_loss_coef:
+                            if result['aux_loss'] is not None and self.train_config.loss_config.aux_loss_coef:
                                 aux_loss = self.train_config.loss_config.aux_loss_coef * result['aux_loss']
                             else:
                                 aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
 
                         total_loss_unscaled = loss + aux_loss
 
-                        actual_acc_steps = self.gradient_accumulation_steps
-                        if not self.is_ds and batch_count_per_file % self.gradient_accumulation_steps != 0:
-                            remainder = batch_count_per_file % self.gradient_accumulation_steps
-                            last_full_boundary = batch_count_per_file - remainder
+                        is_last_step = (
+                            epoch == self.train_config.n_epochs - 1
+                            and file_idx == file_count - 1
+                            and batch == batch_count_per_file - 1
+                        )
 
-                            if batch >= last_full_boundary:
-                                actual_acc_steps = remainder
-
-                        need_update_step = self._need_update_step(batch, batch_count_per_file)
-                        self._backward_loss(total_loss_unscaled, actual_acc_steps)
+                        need_update_step = self._need_update_step(batches_accumulated, is_last_step)
+                        self._backward_loss(total_loss_unscaled, self.gradient_accumulation_steps)
 
                         loss_accumulation += total_loss_unscaled.detach().item()
                         aux_loss_accumulation += aux_loss.detach().item()

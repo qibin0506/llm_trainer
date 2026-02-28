@@ -147,6 +147,8 @@ class DPOTrainer(BaseTrainer):
                 last_ckpt_batch = 0
                 batch_count_per_file = len(train_data_loader)
 
+                effective_stop = None
+
                 TrainerTools().parallel.on_epoch_start(epoch)
                 self._on_file_start(epoch, file_path)
 
@@ -157,8 +159,8 @@ class DPOTrainer(BaseTrainer):
                         Logger.std_log(f"Fast forwarding {skip_batches} batches in {file_path}...")
 
                 data_iterator = iter(train_data_loader)
-                if skip_batches > 0:
-                    data_iterator = islice(data_iterator, skip_batches, None)
+                if skip_batches > 0 or effective_stop is not None:
+                    data_iterator = islice(data_iterator, skip_batches, effective_stop)
                     last_ckpt_batch = skip_batches
 
                 for batch, batch_data in enumerate(data_iterator):
@@ -216,16 +218,13 @@ class DPOTrainer(BaseTrainer):
 
                         total_loss_unscaled = loss + aux_loss + nll_loss
 
-                        actual_acc_steps = self.gradient_accumulation_steps
-                        if not self.is_ds and batch_count_per_file % self.gradient_accumulation_steps != 0:
-                            remainder = batch_count_per_file % self.gradient_accumulation_steps
-                            last_full_boundary = batch_count_per_file - remainder
-
-                            if batch >= last_full_boundary:
-                                actual_acc_steps = remainder
-
-                        need_update_step = self._need_update_step(batch, batch_count_per_file)
-                        self._backward_loss(total_loss_unscaled, actual_acc_steps)
+                        is_last_step = (
+                            epoch == self.train_config.n_epochs - 1 and
+                            file_idx == file_count - 1 and
+                            batch == batch_count_per_file - 1
+                        )
+                        need_update_step = self._need_update_step(batches_accumulated, is_last_step)
+                        self._backward_loss(total_loss_unscaled, self.gradient_accumulation_steps)
 
                         loss_accumulation += total_loss_unscaled.detach().item()
                         aux_loss_accumulation += aux_loss.detach().item()

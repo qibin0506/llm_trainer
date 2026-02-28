@@ -9,8 +9,9 @@ from .tools import TrainerTools
 import numpy as np
 from typing import Union, List, Optional, Tuple
 
+default_seed = 42
 
-def set_seed(seed=42):
+def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)

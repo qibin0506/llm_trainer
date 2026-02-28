@@ -145,6 +145,14 @@ class Parallel(ABC):
         return True
 
     @property
+    def local_rank(self) -> int:
+        return self._local_rank
+
+    @property
+    def global_rank(self) -> int:
+        return self._global_rank
+
+    @property
     def world_size(self) -> int:
         if self._use_parallel:
             if dist.is_initialized():
@@ -185,6 +193,10 @@ class DsParallel(Parallel):
             dist_init_required=False,
             config_params=kwargs
         )
+
+        first_key = list(model.module.state_dict().keys())[0]
+        first_weight = model.module.state_dict()[first_key]
+        print(f"------------>>>>>Rank {dist.get_rank()} [{first_key}] sum: {first_weight.sum()}")
 
         if save_instance:
             self.model = model

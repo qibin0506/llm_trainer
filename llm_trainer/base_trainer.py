@@ -37,6 +37,7 @@ from .checkpoint import (
 )
 
 from .utils import (
+    default_seed,
     set_seed,
     autocast,
     is_bf16_supported,
@@ -54,7 +55,7 @@ class BaseTrainer:
             kd_config: Optional[KDConfig] = None,
             gradient_accumulation_steps: int = 1
     ):
-        set_seed()
+        set_seed(default_seed)
 
         self.is_ds = isinstance(TrainerTools().parallel, DsParallel)
         self.train_config: TrainConfig = train_config
@@ -85,6 +86,8 @@ class BaseTrainer:
 
         self._load_train_model_checkpoint()
         self._apply_restore_ckpt()
+
+        set_seed(default_seed + TrainerTools().parallel.global_rank)
 
     def _new_model(self, train_config: TrainConfig):
         return LlmModel(train_config.model_config)

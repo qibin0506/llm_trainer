@@ -154,8 +154,6 @@ class DPOTrainer(BaseTrainer):
                 last_ckpt_batch = 0
                 batch_count_per_file = len(train_data_loader)
 
-                effective_stop = None
-
                 TrainerTools().parallel.on_epoch_start(epoch)
                 self._on_file_start(epoch, file_path)
 
@@ -166,8 +164,8 @@ class DPOTrainer(BaseTrainer):
                         Logger.std_log(f"Fast forwarding {skip_batches} batches in {file_path}...")
 
                 data_iterator = iter(train_data_loader)
-                if skip_batches > 0 or effective_stop is not None:
-                    data_iterator = islice(data_iterator, skip_batches, effective_stop)
+                if skip_batches > 0:
+                    data_iterator = islice(data_iterator, skip_batches, None)
                     last_ckpt_batch = skip_batches
 
                 for batch, batch_data in enumerate(data_iterator):

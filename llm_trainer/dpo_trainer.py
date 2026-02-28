@@ -183,12 +183,16 @@ class DPOTrainer(BaseTrainer):
                         concat_attention_masks = torch.concat([chosen_attention_masks, rejected_attention_masks], dim=0)
 
                         with autocast(TrainerTools().parallel.device_type):
-                            policy_outputs = self.train_model(concat_inputs, attention_mask=concat_attention_masks)
-                            policy_logprobs_sums, policy_logprobs_means = self._logprobs(policy_outputs['logits'], concat_labels)
-
                             with torch.no_grad():
                                 ref_outputs = self.ref_model(concat_inputs, attention_mask=concat_attention_masks)
                                 ref_logprobs_sums, _ = self._logprobs(ref_outputs['logits'], concat_labels)
+                                del ref_outputs
+
+                            policy_outputs = self.train_model(concat_inputs, attention_mask=concat_attention_masks)
+                            policy_logprobs_sums, policy_logprobs_means = self._logprobs(policy_outputs['logits'], concat_labels)
+
+                            raw_aux_loss = policy_outputs.get('aux_loss', None)
+                            del policy_outputs
 
                             policy_chosen_logps = policy_logprobs_sums[:chosen_inputs.shape[0]]
                             policy_rejected_logps = policy_logprobs_sums[chosen_inputs.shape[0]:]
@@ -206,8 +210,8 @@ class DPOTrainer(BaseTrainer):
                                 ref_rejected_logps
                             )
 
-                            if aux_loss_coef and policy_outputs['aux_loss'] is not None:
-                                aux_loss = aux_loss_coef * policy_outputs['aux_loss']
+                            if aux_loss_coef and raw_aux_loss is not None:
+                                aux_loss = aux_loss_coef * raw_aux_loss
                             else:
                                 aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
 
@@ -285,12 +289,10 @@ class DPOTrainer(BaseTrainer):
                     del concat_inputs
                     del concat_labels
                     del concat_attention_masks
-                    del policy_outputs
                     del loss
                     del aux_loss
                     del nll_loss
                     del total_loss_unscaled
-                    del ref_outputs
                     del chosen_inputs
                     del chosen_labels
                     del rejected_inputs

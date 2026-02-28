@@ -206,8 +206,8 @@ class DPOTrainer(BaseTrainer):
                                 ref_rejected_logps
                             )
 
-                            if aux_loss_coef and policy_outputs.get('aux_loss'):
-                                aux_loss = aux_loss_coef * policy_outputs.get('aux_loss')
+                            if aux_loss_coef and policy_outputs['aux_loss'] is not None:
+                                aux_loss = aux_loss_coef * policy_outputs['aux_loss']
                             else:
                                 aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
 

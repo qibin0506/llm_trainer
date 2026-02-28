@@ -77,6 +77,7 @@ class DPOTrainer(BaseTrainer):
         parallel_kwargs, data_loader_kwargs, sampler_kwargs = super()._convert_train_args()
 
         if parallel_kwargs:
+            # 因为chosen和inject会concat到一块进行forward，所以实际batch_size要*2
             real_micro_batch_size = self.train_config.batch_size * 2
             parallel_kwargs['train_micro_batch_size_per_gpu'] = real_micro_batch_size
 
@@ -214,16 +215,25 @@ class DPOTrainer(BaseTrainer):
                                 nll_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
 
                         total_loss_unscaled = loss + aux_loss + nll_loss
-                        need_update = self._need_update(batch, batch_count_per_file)
-                        self._backward_and_step(total_loss_unscaled, self.gradient_accumulation_steps)
+
+                        actual_acc_steps = self.gradient_accumulation_steps
+                        if not self.is_ds and batch_count_per_file % self.gradient_accumulation_steps != 0:
+                            remainder = batch_count_per_file % self.gradient_accumulation_steps
+                            last_full_boundary = batch_count_per_file - remainder
+
+                            if batch >= last_full_boundary:
+                                actual_acc_steps = remainder
+
+                        need_update_step = self._need_update_step(batch, batch_count_per_file)
+                        self._backward_loss(total_loss_unscaled, actual_acc_steps)
 
                         loss_accumulation += total_loss_unscaled.detach().item()
                         aux_loss_accumulation += aux_loss.detach().item()
                         nll_loss_accumulation += nll_loss.detach().item()
                         batches_accumulated += 1
 
-                        if need_update:
-                            self._update()
+                        if need_update_step:
+                            self._update_step()
 
                             avg_loss, avg_aux_loss, avg_nll_loss = self._avg_loss(
                                 losses=[

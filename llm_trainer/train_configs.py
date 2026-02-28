@@ -247,8 +247,10 @@ class PPOConfig:
 
 @dataclass(kw_only=True)
 class GRPOConfig:
-    grpo_steps: int = 1
+    grpo_epochs: int
+    grpo_batch_size: int
     group_size: int = 12
+    gradient_accumulation_steps: int = 1
     mixup_alpha: float = 1.0
     loss_beta: float = 0.0 # or 0.04 for grpo
     loss_clip_eps: float = 3e-4

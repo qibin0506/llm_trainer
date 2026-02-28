@@ -98,9 +98,8 @@ class PPOTrainer(BaseTrainer):
         )
 
         ppo_batch_size = self.ppo_config.ppo_batch_size
-        required_mini_batch_count = ppo_batch_size * self.gradient_accumulation_steps
-
-        assert train_config.batch_size % required_mini_batch_count == 0, 'batch_size % (ppo_batch_size * gradient_accumulation_steps) must be zero!'
+        assert train_config.batch_size % (ppo_batch_size * self.gradient_accumulation_steps) == 0,\
+            'batch_size % (ppo_batch_size * gradient_accumulation_steps) must be zero!'
 
         self.reward_func = reward_func
         self.ref_model = self._init_ref_model()
@@ -208,13 +207,10 @@ class PPOTrainer(BaseTrainer):
         policy_config = self.train_config.optim_config
         value_config = self.ppo_config.value_optim_config
 
-        if value_config is None:
-            return super()._init_lr_scheduler(initial_lr, optimizer)
-
         schedulers = []
 
         def create_scheduler(config, group_indices, need_log):
-            initial_lr = config.initial_lr
+            real_initial_lr = initial_lr if config is None else config.initial_lr
             if config.enable_lr_scheduler:
                 warmup_iters = config.warmup_iters
                 min_lr = config.min_lr
@@ -225,7 +221,7 @@ class PPOTrainer(BaseTrainer):
                 return WarmupCosineAnnealingLRScheduler(
                     optimizer=optimizer,
                     warmup_iters=warmup_iters,
-                    initial_lr=initial_lr,
+                    initial_lr=real_initial_lr,
                     min_lr=min_lr,
                     max_lr=max_lr,
                     cosine_annealing_period=cosine_annealing_period,
@@ -234,7 +230,7 @@ class PPOTrainer(BaseTrainer):
                     need_log=TrainerTools().parallel.is_main_process and need_log
                 )
             else:
-                return NoneLRScheduler(initial_lr)
+                return NoneLRScheduler(real_initial_lr)
 
         schedulers.append(create_scheduler(policy_config, [0, 1], True))
         schedulers.append(create_scheduler(value_config, [2, 3], False))
@@ -479,9 +475,7 @@ class PPOTrainer(BaseTrainer):
             "value_loss": 0.0, "approx_kl": 0.0, "clip_frac": 0.0
         }
 
-        grad_acc_steps = max(1, self.gradient_accumulation_steps)
         ppo_batch_size = ppo_config.ppo_batch_size
-        num_micro_batches = (batch_size + ppo_batch_size - 1) // ppo_batch_size
         total_micro_batches_processed = 0
 
         for ppo_epoch in range(ppo_config.ppo_epochs):
@@ -534,12 +528,12 @@ class PPOTrainer(BaseTrainer):
                 total_loss_unscaled = loss + aux_loss
 
                 if self.is_ds:
-                    need_update = self.train_model.is_gradient_accumulation_boundary()
+                    need_update_step = self.train_model.is_gradient_accumulation_boundary()
                 else:
                     micro_batch_idx = i // ppo_batch_size
-                    need_update = ((micro_batch_idx + 1) % grad_acc_steps == 0)
+                    need_update_step = ((micro_batch_idx + 1) % self.gradient_accumulation_steps == 0)
 
-                self._backward_and_step(total_loss_unscaled, grad_acc_steps)
+                self._backward_loss(total_loss_unscaled, self.gradient_accumulation_steps)
 
                 ppo_stats["loss"] += total_loss_unscaled.detach().item()
                 ppo_stats["moe_aux_loss"] += aux_loss.detach().item()
@@ -549,8 +543,8 @@ class PPOTrainer(BaseTrainer):
                 ppo_stats["clip_frac"] += clip_frac.detach().item()
                 total_micro_batches_processed += 1
 
-                if need_update:
-                    self._update()
+                if need_update_step:
+                    self._update_step()
 
         if total_micro_batches_processed > 0:
             for key in ppo_stats:

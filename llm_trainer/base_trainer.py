@@ -425,7 +425,7 @@ class BaseTrainer:
         ce_loss = self.criterion(logits, labels)
         return (1 - self.kd_config.kd_coef) * ce_loss + self.kd_config.kd_coef * loss
 
-    def _backward_and_step(self, total_loss_unscaled, gradient_accumulation_steps):
+    def _backward_loss(self, total_loss_unscaled, gradient_accumulation_steps):
         if isinstance(TrainerTools().parallel, DsParallel):
             self.train_model.backward(total_loss_unscaled)
             self.train_model.step()
@@ -445,6 +445,34 @@ class BaseTrainer:
             self.scaler.step(self.optimizer)
             self.scaler.update()
             self.optimizer.zero_grad(set_to_none=True)
+
+    def _need_update_step(self, batch, batch_count_per_file):
+        if self.is_ds:
+            return self.train_model.is_gradient_accumulation_boundary()
+
+        if self.gradient_accumulation_steps > 1:
+            return (batch + 1) % self.gradient_accumulation_steps == 0 or batch == batch_count_per_file - 1
+
+        return True
+
+    def _update_step(self):
+        self._apply_grad_clipping()
+        overflow = False
+
+        if self.is_ds:
+            self._apply_step()
+            if hasattr(self.train_model, 'optimizer') and hasattr(self.train_model.optimizer, 'overflow'):
+                overflow = self.train_model.optimizer.overflow
+        else:
+            scale_before = self.scaler.get_scale()
+            self._apply_step()
+            scale_after = self.scaler.get_scale()
+            overflow = scale_after < scale_before
+
+        if not overflow:
+            self.lr_scheduler.step()
+
+        TrainerTools().parallel.synchronize()
 
     def _get_eval_data(self) -> Optional[str]:
         if len(self.eval_prompts) == 0:
@@ -551,35 +579,6 @@ class BaseTrainer:
     def _get_pixel_values(self, batch_data):
         return None
 
-    def _need_update(self, batch, batch_count_per_file):
-        # 是否需要更新
-        if self.is_ds:
-            return self.train_model.is_gradient_accumulation_boundary()
-
-        if self.gradient_accumulation_steps > 1:
-            return (batch + 1) % self.gradient_accumulation_steps == 0 or batch == batch_count_per_file - 1
-
-        return True
-
-    def _update(self):
-        self._apply_grad_clipping()
-
-        overflow = False
-        if self.is_ds:
-            self._apply_step()
-            if hasattr(self.train_model, 'optimizer') and hasattr(self.train_model.optimizer, 'overflow'):
-                overflow = self.train_model.optimizer.overflow
-        else:
-            scale_before = self.scaler.get_scale()
-            self._apply_step()
-            scale_after = self.scaler.get_scale()
-            overflow = scale_after < scale_before
-
-        if not overflow:
-            self.lr_scheduler.step()
-
-        TrainerTools().parallel.synchronize()
-
     def train(self):
         # 梯度累积步数
         loss_accumulation = 0.0
@@ -643,15 +642,24 @@ class BaseTrainer:
                                 aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
 
                         total_loss_unscaled = loss + aux_loss
-                        need_update = self._need_update(batch, batch_count_per_file)
-                        self._backward_and_step(total_loss_unscaled, self.gradient_accumulation_steps)
+
+                        actual_acc_steps = self.gradient_accumulation_steps
+                        if not self.is_ds and batch_count_per_file % self.gradient_accumulation_steps != 0:
+                            remainder = batch_count_per_file % self.gradient_accumulation_steps
+                            last_full_boundary = batch_count_per_file - remainder
+
+                            if batch >= last_full_boundary:
+                                actual_acc_steps = remainder
+
+                        need_update_step = self._need_update_step(batch, batch_count_per_file)
+                        self._backward_loss(total_loss_unscaled, actual_acc_steps)
 
                         loss_accumulation += total_loss_unscaled.detach().item()
                         aux_loss_accumulation += aux_loss.detach().item()
                         batches_accumulated += 1
 
-                        if need_update:
-                            self._update()
+                        if need_update_step:
+                            self._update_step()
 
                             avg_loss, avg_aux_loss = self._avg_loss(
                                 losses=[

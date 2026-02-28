@@ -1,6 +1,7 @@
 from typing import Tuple, List, Callable, Optional
 import gc
 import torch
+import torch.distributed as dist
 from torch.utils.data import Dataset
 import torch.nn.functional as F
 from itertools import islice
@@ -45,8 +46,13 @@ class GRPOTrainer(BaseTrainer):
         super().__init__(
             train_config=train_config,
             eval_prompts=eval_prompts,
-            gradient_accumulation_steps=1
+            gradient_accumulation_steps=self.grpo_config.gradient_accumulation_steps
         )
+
+        grpo_batch_size = self.grpo_config.grpo_batch_size
+        total_generated_seqs = train_config.batch_size * self.grpo_config.group_size
+        assert total_generated_seqs % (grpo_batch_size * self.gradient_accumulation_steps) == 0, \
+            '(batch_size * group_size) % (grpo_batch_size * gradient_accumulation_steps) must be zero!'
 
         self.reward_func = reward_func
         self.ref_model = self._init_ref_model()
@@ -92,8 +98,7 @@ class GRPOTrainer(BaseTrainer):
         parallel_kwargs, data_loader_kwargs, sampler_kwargs = super()._convert_train_args()
 
         if parallel_kwargs:
-            real_micro_batch_size = self.train_config.batch_size * self.grpo_config.group_size
-            parallel_kwargs['train_micro_batch_size_per_gpu'] = real_micro_batch_size
+            parallel_kwargs['train_micro_batch_size_per_gpu'] = self.grpo_config.grpo_batch_size
 
         data_loader_kwargs.update({"collate_fn": lambda x: x})
 
@@ -218,18 +223,29 @@ class GRPOTrainer(BaseTrainer):
         repeated_prompts = [p for p in prompts for _ in range(group_size)]
         repeated_answers = [a for a in answers for _ in range(group_size)]
 
+        # [batch*group_size]
+        rewards = torch.tensor(
+            self.reward_func(repeated_prompts, completion_ids, repeated_answers),
+            dtype=torch.float32,
+            device=TrainerTools().parallel.device
+        )
+
+        advantages = self._compute_group_relative_advantages(rewards)
+
         return {
-            'input_ids': input_ids,
-            'attention_mask': attention_mask,
-            'completion_mask': completion_mask,
-            'old_log_probs': old_log_probs,
-            'ref_log_probs': ref_log_probs,
-            'completion_ids': completion_ids,
-            'repeated_prompts': repeated_prompts,
-            'repeated_answers': repeated_answers,
+            'input_ids': input_ids.detach(),
+            'attention_mask': attention_mask.detach(),
+            'completion_mask': completion_mask.detach(),
+            'old_log_probs': old_log_probs.detach(),
+            'ref_log_probs': ref_log_probs.detach() if ref_log_probs is not None else None,
+            'completion_ids': completion_ids.detach(),
+            'advantages': advantages.detach(),
+            'rewards': rewards.detach(),
         }
 
-    def _maximize_grpo_objective(self, rollout_data):
+    def _grpo_learning_phase(self, rollout_data: dict):
+        grpo_config = self.train_config.grpo_config
+        grpo_batch_size = grpo_config.grpo_batch_size
         device = TrainerTools().parallel.device
 
         input_ids = rollout_data['input_ids']
@@ -238,47 +254,80 @@ class GRPOTrainer(BaseTrainer):
         old_log_probs = rollout_data['old_log_probs']
         ref_log_probs = rollout_data['ref_log_probs']
         completion_ids = rollout_data['completion_ids']
-        repeated_prompts = rollout_data['repeated_prompts']
-        repeated_answers = rollout_data['repeated_answers']
+        advantages = rollout_data['advantages']
 
+        total_samples = input_ids.shape[0]
         prompt_len = input_ids.shape[1] - completion_ids.shape[1]
 
-        # [batch*group_size]
-        rewards = torch.tensor(
-            self.reward_func(repeated_prompts, completion_ids, repeated_answers),
-            dtype=torch.float32,
-            device=device
-        )
+        grpo_stats = {
+            "loss": 0.0,
+            "moe_aux_loss": 0.0,
+            "rewards": rollout_data['rewards'].mean().item()
+        }
 
-        # [batch*group_size, 1]
-        advantages = self._compute_group_relative_advantages(rewards)
+        total_micro_batches_processed = 0
 
-        # Compute current log probabilities
-        log_probs, aux_loss = self._compute_log_probs(self.train_model, input_ids, attention_mask)
+        for grpo_epoch in range(grpo_config.grpo_epochs):
+            indices = torch.randperm(total_samples, device=device)
 
-        pad_len = prompt_len - 1
-        if pad_len > 0:
-            padded_completion_mask = F.pad(completion_mask, (pad_len, 0), 'constant', 0)
-        else:
-            padded_completion_mask = completion_mask
+            for i in range(0, total_samples, grpo_batch_size):
+                mini_batch_indices = indices[i:i + grpo_batch_size]
 
-        assert padded_completion_mask.shape == log_probs.shape, \
-            f"Shape mismatch! Padded completion mask: {padded_completion_mask.shape}, Log probs: {log_probs.shape}"
+                mb_input_ids = input_ids[mini_batch_indices]
+                mb_attention_mask = attention_mask[mini_batch_indices]
+                mb_completion_mask = completion_mask[mini_batch_indices]
+                mb_old_log_probs = old_log_probs[mini_batch_indices]
+                mb_ref_log_probs = ref_log_probs[mini_batch_indices] if ref_log_probs is not None else None
+                mb_completion_ids = completion_ids[mini_batch_indices]
+                mb_advantages = advantages[mini_batch_indices]
 
-        loss = self.criterion(
-            log_probs=log_probs,
-            old_log_probs=old_log_probs,
-            ref_log_probs=ref_log_probs,
-            completion_mask=padded_completion_mask,
-            advantages=advantages,
-            completion_len=completion_ids.shape[1]
-        )
+                with autocast(TrainerTools().parallel.device_type):
+                    log_probs, aux_loss = self._compute_log_probs(self.train_model, mb_input_ids, mb_attention_mask)
 
-        return loss, aux_loss, rewards
+                    pad_len = prompt_len - 1
+                    if pad_len > 0:
+                        padded_completion_mask = F.pad(mb_completion_mask, (pad_len, 0), 'constant', 0)
+                    else:
+                        padded_completion_mask = mb_completion_mask
+
+                    loss = self.criterion(
+                        log_probs=log_probs,
+                        old_log_probs=mb_old_log_probs,
+                        ref_log_probs=mb_ref_log_probs,
+                        completion_mask=padded_completion_mask,
+                        advantages=mb_advantages,
+                        completion_len=mb_completion_ids.shape[1]
+                    )
+
+                    if aux_loss is not None and self.train_config.loss_config.aux_loss_coef:
+                        aux_loss = self.train_config.loss_config.aux_loss_coef * aux_loss
+                    else:
+                        aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
+
+                total_loss_unscaled = loss + aux_loss
+
+                if self.is_ds:
+                    need_update_step = self.train_model.is_gradient_accumulation_boundary()
+                else:
+                    micro_batch_idx = i // grpo_batch_size
+                    need_update_step = ((micro_batch_idx + 1) % self.gradient_accumulation_steps == 0)
+
+                self._backward_loss(total_loss_unscaled, self.gradient_accumulation_steps)
+
+                grpo_stats["loss"] += total_loss_unscaled.detach().item()
+                grpo_stats["moe_aux_loss"] += aux_loss.detach().item()
+                total_micro_batches_processed += 1
+
+                if need_update_step:
+                    self._update_step()
+
+        if total_micro_batches_processed > 0:
+            grpo_stats["loss"] /= total_micro_batches_processed
+            grpo_stats["moe_aux_loss"] /= total_micro_batches_processed
+
+        return grpo_stats
 
     def train(self):
-        aux_loss_coef = self.train_config.loss_config.aux_loss_coef
-
         for epoch in range(self.resume_epoch, self.train_config.n_epochs):
             if self.ref_model:
                 sync_model_params(
@@ -334,62 +383,45 @@ class GRPOTrainer(BaseTrainer):
                         if TrainerTools().parallel.is_main_process:
                             Logger.std_log(f'start train for batch {batch + 1}/{batch_count_per_file}')
 
-                        for grpo_step in range(self.grpo_config.grpo_steps):
-                            with autocast(TrainerTools().parallel.device_type):
-                                loss, aux_loss, rewards = self._maximize_grpo_objective(rollout_data)
-                                if aux_loss_coef and aux_loss is not None:
-                                    aux_loss = aux_loss_coef * aux_loss
-                                else:
-                                    aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
+                        grpo_stats = self._grpo_learning_phase(rollout_data)
 
-                            total_loss = loss + aux_loss
+                        stats_tensor = torch.tensor([
+                            grpo_stats['loss'],
+                            grpo_stats['moe_aux_loss'],
+                            grpo_stats['rewards']
+                        ], device=TrainerTools().parallel.device)
 
-                            if self.is_ds:
-                                need_update = self.train_model.is_gradient_accumulation_boundary()
-                            else:
-                                need_update = True
+                        if TrainerTools().parallel.parallel_train:
+                            dist.all_reduce(stats_tensor, op=dist.ReduceOp.AVG)
 
-                            self._backward_and_step(total_loss, self.gradient_accumulation_steps)
+                        avg_loss = stats_tensor[0].item()
+                        avg_moe_aux_loss = stats_tensor[1].item()
+                        avg_rewards = stats_tensor[2].item()
 
-                            if need_update:
-                                self._update()
+                        self._log(
+                            keys={
+                                'epoch': epoch,
+                                'file': f'{file_idx + 1}/{file_count}',
+                                'batch': f'{batch + 1}/{batch_count_per_file}',
+                            },
+                            values={
+                                'loss': avg_loss,
+                                'moe_aux_loss': avg_moe_aux_loss,
+                                'rewards': avg_rewards,
+                            }
+                        )
 
-                            loss_accumulation = total_loss.detach().item()
-                            aux_loss_accumulation = aux_loss.detach().item()
-
-                            avg_loss, avg_aux_loss = self._avg_loss(
-                                losses=[
-                                    loss_accumulation,
-                                    aux_loss_accumulation
-                                ],
-                                batches_accumulated=1
+                        if (batch - last_ckpt_batch) >= self.train_config.eval_config.eval_batch_interval:
+                            save_checkpoint(model=self.train_model, optimizer=self.optimizer)
+                            save_steps(
+                                epoch=epoch,
+                                file_idx=file_idx,
+                                batch_idx=batch + 1,
+                                lr_scheduler=self.lr_scheduler
                             )
 
-                            self._log(
-                                keys={
-                                    'epoch': epoch,
-                                    'file': f'{file_idx + 1}/{file_count}',
-                                    'batch': f'{batch + 1}/{batch_count_per_file}',
-                                    'grpo_step': grpo_step
-                                },
-                                values={
-                                    'loss': avg_loss,
-                                    'moe_aux_loss': avg_aux_loss,
-                                    'rewards': (rewards.sum() / rewards.size(0)).item(),
-                                }
-                            )
-
-                            if (batch - last_ckpt_batch) >= self.train_config.eval_config.eval_batch_interval:
-                                save_checkpoint(model=self.train_model, optimizer=self.optimizer)
-                                save_steps(
-                                    epoch=epoch,
-                                    file_idx=file_idx,
-                                    batch_idx=batch + 1,
-                                    lr_scheduler=self.lr_scheduler
-                                )
-
-                                last_ckpt_batch = batch
-                                self._on_batch_end(tag=f'epoch:{epoch}/batch:{batch}')
+                            last_ckpt_batch = batch
+                            self._on_batch_end(tag=f'epoch:{epoch}/batch:{batch}')
                     except Exception as e:
                         self._on_exception(e, epoch, batch)
 
@@ -400,10 +432,6 @@ class GRPOTrainer(BaseTrainer):
                     del data_iterator
                     del rollout_data
                     del batch_data
-                    del loss
-                    del aux_loss
-                    del total_loss
-                    del rewards
                 except UnboundLocalError: ...
 
                 if hasattr(TrainerTools().parallel, '_sampler'):

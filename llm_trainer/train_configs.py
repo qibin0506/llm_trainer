@@ -89,22 +89,9 @@ class DsConfig:
 
 @dataclass(kw_only=True)
 class DataLoaderConfig:
-    """
-        data loader配置项
-        Args:
-            data_loader_pin_memory (`bool`, *optional*, default is None):
-                data_loader pin_memory config
-            data_loader_num_workers (`int`, *optional*, default is 0):
-                data_loader num_workers config
-            data_loader_shuffle (`bool`, *optional*, default is False):
-                是否需要shuffle数据
-            data_loader_drop_last (`bool`, default is False):
-                最后一个batch不满足batch_size时，是否丢弃
-    """
-    data_loader_pin_memory: bool = False
-    data_loader_num_workers: int = 0
-    data_loader_shuffle: bool = False
-    data_loader_drop_last: bool = True
+    pin_memory: bool = False
+    num_workers: int = 0
+    shuffle: bool = False
 
 
 @dataclass(kw_only=True)
@@ -168,7 +155,7 @@ class PretrainConfig:
 
     Args:
         gradient_accumulation_steps (`int`, *Optional*, default is 1):
-            梯度累积步数，为0时不使用梯度累积
+            梯度累积步数
             目前仅适用于pretrain、sft、dpo，不适用于ppo、grpo、gspo
         kd_config: (`KDConfig`, *Optional*, default is None):
             知识蒸馏配置项，为None时不使用知识蒸馏
@@ -186,7 +173,7 @@ class SFTConfig:
         mask_prompt (`bool`)
             指定是否mask prompt部分的token
         gradient_accumulation_steps (`int`, *Optional*, default is 1):
-            梯度累积步数，为0时不使用梯度累积
+            梯度累积步数
             目前仅适用于pretrain、sft、dpo，不适用于ppo、grpo、gspo
         kd_config: (`KDConfig`, *Optional*, default is None):
             知识蒸馏配置项，为None时不使用知识蒸馏
@@ -212,8 +199,7 @@ class DPOConfig:
         mask_prompt (`bool`)
             指定是否mask prompt部分的token
         gradient_accumulation_steps (`int`, *Optional*, default is 1):
-            梯度累积步数，为0时不使用梯度累积
-            目前仅适用于pretrain、sft、dpo，不适用于ppo、grpo、gspo
+            梯度累积步数
     """
     ref_model_checkpoint: Mapping[str, Any]
     mask_prompt: bool = True
@@ -251,8 +237,10 @@ class PPOConfig:
 
 @dataclass(kw_only=True)
 class GRPOConfig:
-    grpo_steps: int = 1
+    grpo_epochs: int
+    grpo_batch_size: int
     group_size: int = 12
+    gradient_accumulation_steps: int = 1
     mixup_alpha: float = 1.0
     loss_beta: float = 0.0 # or 0.04 for grpo
     loss_clip_eps: float = 3e-4

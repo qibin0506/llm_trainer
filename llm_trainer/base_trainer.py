@@ -37,6 +37,7 @@ from .checkpoint import (
 )
 
 from .utils import (
+    default_seed,
     set_seed,
     autocast,
     is_bf16_supported,
@@ -54,8 +55,9 @@ class BaseTrainer:
             kd_config: Optional[KDConfig] = None,
             gradient_accumulation_steps: int = 1
     ):
-        set_seed()
+        set_seed(default_seed)
 
+        self.is_ds = isinstance(TrainerTools().parallel, DsParallel)
         self.train_config: TrainConfig = train_config
         self.eval_prompts = eval_prompts
         self.eval_idx = -1
@@ -65,7 +67,7 @@ class BaseTrainer:
         self.resume_batch_idx = 0
 
         self.kd_config = kd_config
-        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.gradient_accumulation_steps = max(1, gradient_accumulation_steps)
 
         self.logger = Logger('log.txt')
 
@@ -84,6 +86,8 @@ class BaseTrainer:
 
         self._load_train_model_checkpoint()
         self._apply_restore_ckpt()
+
+        set_seed(default_seed + TrainerTools().parallel.global_rank)
 
     def _new_model(self, train_config: TrainConfig):
         return LlmModel(train_config.model_config)
@@ -125,7 +129,7 @@ class BaseTrainer:
         optimizer_cls, use_lion_optim = self._get_optim_cls()
 
         betas = self.train_config.optim_config.betas
-        weight_decay = self.train_config.optim_config.betas
+        weight_decay = self.train_config.optim_config.weight_decay
 
         if betas is None:
             betas = (0.95, 0.98) if use_lion_optim else (0.9, 0.999)
@@ -269,7 +273,7 @@ class BaseTrainer:
         parallel_kwargs: Optional[Dict[str, Any]] = None
         if isinstance(TrainerTools().parallel, DsParallel) and self.train_config.ds_config:
             parallel_kwargs = {
-                'gradient_accumulation_steps': 1,
+                'gradient_accumulation_steps': self.gradient_accumulation_steps,
                 'gradient_clipping': self.train_config.ds_config.gradient_clipping,
                 'train_micro_batch_size_per_gpu': self.train_config.batch_size
             }
@@ -361,14 +365,14 @@ class BaseTrainer:
         dataloader_args = self.train_config.data_loader_config
         data_loader_kwargs = {
             "batch_size": self.train_config.batch_size,
-            "pin_memory": dataloader_args.data_loader_pin_memory,
-            "num_workers": dataloader_args.data_loader_num_workers,
-            "shuffle": dataloader_args.data_loader_shuffle,
-            "drop_last": dataloader_args.data_loader_drop_last,
+            "pin_memory": dataloader_args.pin_memory,
+            "num_workers": dataloader_args.num_workers,
+            "shuffle": dataloader_args.shuffle,
+            "drop_last": True,
         }
         sampler_kwargs = {
-            "shuffle": dataloader_args.data_loader_shuffle,
-            "drop_last": dataloader_args.data_loader_drop_last,
+            "shuffle": dataloader_args.shuffle,
+            "drop_last": True,
         }
 
         return parallel_kwargs, data_loader_kwargs, sampler_kwargs
@@ -424,29 +428,52 @@ class BaseTrainer:
         ce_loss = self.criterion(logits, labels)
         return (1 - self.kd_config.kd_coef) * ce_loss + self.kd_config.kd_coef * loss
 
-    def _backward_loss(self, loss):
+    def _backward_loss(self, total_loss_unscaled, gradient_accumulation_steps):
         if isinstance(TrainerTools().parallel, DsParallel):
-            self.train_model.backward(loss)
+            self.train_model.backward(total_loss_unscaled)
+            self.train_model.step()
         else:
-            self.scaler.scale(loss).backward()
+            total_loss_scaled = total_loss_unscaled / gradient_accumulation_steps
+            self.scaler.scale(total_loss_scaled).backward()
 
     def _apply_grad_clipping(self):
-        # ds模式已经集成gradient_clipping
         if not isinstance(TrainerTools().parallel, DsParallel) and self.lr_scheduler.can_clip_grad():
-            # clip grad
             self.scaler.unscale_(self.optimizer)
 
             trainable_params = filter(lambda p: p.requires_grad, self.train_model.parameters())
             torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
 
     def _apply_step(self):
-        self.lr_scheduler.step()
-        if isinstance(TrainerTools().parallel, DsParallel):
-            self.train_model.step()
-        else:
+        if not isinstance(TrainerTools().parallel, DsParallel):
             self.scaler.step(self.optimizer)
             self.scaler.update()
             self.optimizer.zero_grad(set_to_none=True)
+
+    def _need_update_step(self, batches_accumulated, is_last_step=False):
+        if self.is_ds:
+            return self.train_model.is_gradient_accumulation_boundary()
+
+        if self.gradient_accumulation_steps > 1:
+            return (batches_accumulated + 1) % self.gradient_accumulation_steps == 0 or is_last_step
+
+        return True
+
+    def _update_step(self):
+        self._apply_grad_clipping()
+        overflow = False
+
+        if self.is_ds:
+            self._apply_step()
+            if hasattr(self.train_model, 'optimizer') and hasattr(self.train_model.optimizer, 'overflow'):
+                overflow = self.train_model.optimizer.overflow
+        else:
+            scale_before = self.scaler.get_scale()
+            self._apply_step()
+            scale_after = self.scaler.get_scale()
+            overflow = scale_after < scale_before
+
+        if not overflow:
+            self.lr_scheduler.step()
 
         TrainerTools().parallel.synchronize()
 
@@ -538,16 +565,15 @@ class BaseTrainer:
     def _avg_loss(
             self,
             losses: List[float],
-            gradient_accumulation_steps,
             batches_accumulated
     ) -> List[float]:
-        loss_tensors = [
-            torch.tensor(loss * gradient_accumulation_steps / batches_accumulated,
-                         device=TrainerTools().parallel.device)
+        loss_tensors =[
+            torch.tensor(loss / batches_accumulated, device=TrainerTools().parallel.device)
             for loss in losses
         ]
 
         stacked_losses = torch.stack(loss_tensors)
+        # 跨卡同步平均
         if TrainerTools().parallel.parallel_train:
             dist.all_reduce(stacked_losses, dist.ReduceOp.AVG)
 
@@ -558,8 +584,6 @@ class BaseTrainer:
 
     def train(self):
         # 梯度累积步数
-        gradient_accumulation_steps = max(1, self.gradient_accumulation_steps)
-
         loss_accumulation = 0.0
         aux_loss_accumulation = 0.0
         batches_accumulated = 0
@@ -580,6 +604,8 @@ class BaseTrainer:
                 last_ckpt_batch = 0
                 batch_count_per_file = len(train_data_loader)
 
+                effective_stop = None
+
                 TrainerTools().parallel.on_epoch_start(epoch)
                 self._on_file_start(epoch, file_path)
 
@@ -591,18 +617,12 @@ class BaseTrainer:
 
                 data_iterator = iter(train_data_loader)
 
-                if skip_batches > 0:
-                    data_iterator = islice(data_iterator, skip_batches, None)
+                if skip_batches > 0 or effective_stop is not None:
+                    data_iterator = islice(data_iterator, skip_batches, effective_stop)
                     last_ckpt_batch = skip_batches
 
                 for batch, batch_data in enumerate(data_iterator):
                     batch = skip_batches + batch
-
-                    # 是否需要更新梯度
-                    if gradient_accumulation_steps > 1:
-                        need_update_grad = (batch + 1) % gradient_accumulation_steps == 0 or batch == batch_count_per_file - 1
-                    else:
-                        need_update_grad = True
 
                     inputs = batch_data['inputs']
                     labels = batch_data['labels']
@@ -611,9 +631,6 @@ class BaseTrainer:
                         inputs, labels = inputs.to(TrainerTools().parallel.device), labels.to(TrainerTools().parallel.device)
                         attention_mask = inputs != TrainerTools().tokenizer.pad
                         pixel_values = self._get_pixel_values(batch_data)
-
-                        if TrainerTools().parallel.parallel_train:
-                            self.train_model.require_backward_grad_sync = need_update_grad
 
                         with autocast(TrainerTools().parallel.device_type):
                             result = self.train_model(
@@ -624,33 +641,34 @@ class BaseTrainer:
 
                             # calc loss
                             loss = self._calc_loss(inputs, attention_mask, result['logits'], labels)
-                            if result['aux_loss'] and self.train_config.loss_config.aux_loss_coef:
+                            if result['aux_loss'] is not None and self.train_config.loss_config.aux_loss_coef:
                                 aux_loss = self.train_config.loss_config.aux_loss_coef * result['aux_loss']
                             else:
                                 aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
 
-                        if gradient_accumulation_steps > 1:
-                            loss = loss / gradient_accumulation_steps
-                            aux_loss = aux_loss / gradient_accumulation_steps
+                        total_loss_unscaled = loss + aux_loss
 
-                        total_loss = loss + aux_loss
-                        self._backward_loss(total_loss)
+                        is_last_step = (
+                            epoch == self.train_config.n_epochs - 1
+                            and file_idx == file_count - 1
+                            and batch == batch_count_per_file - 1
+                        )
 
-                        loss_accumulation += total_loss.detach().item()
+                        need_update_step = self._need_update_step(batches_accumulated, is_last_step)
+                        self._backward_loss(total_loss_unscaled, self.gradient_accumulation_steps)
+
+                        loss_accumulation += total_loss_unscaled.detach().item()
                         aux_loss_accumulation += aux_loss.detach().item()
-
                         batches_accumulated += 1
 
-                        if need_update_grad:
-                            self._apply_grad_clipping()
-                            self._apply_step()
+                        if need_update_step:
+                            self._update_step()
 
                             avg_loss, avg_aux_loss = self._avg_loss(
                                 losses=[
                                     loss_accumulation,
                                     aux_loss_accumulation
                                 ],
-                                gradient_accumulation_steps=gradient_accumulation_steps,
                                 batches_accumulated=batches_accumulated
                             )
 
@@ -696,7 +714,7 @@ class BaseTrainer:
                     del attention_mask
                     del result
                     del loss
-                    del total_loss
+                    del total_loss_unscaled
                     del aux_loss
                     del pixel_values
                 except UnboundLocalError: ...

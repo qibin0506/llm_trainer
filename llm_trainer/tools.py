@@ -1,13 +1,12 @@
 import os
 from abc import ABC, abstractmethod
 from .tokenizer import Tokenizer
-from .parallel import DsParallel, DdpParallel, NoneParallel
+from .parallel import DsParallel, NoneParallel
 from .log import Logger
 
 
 parallel_types = {
     'ds': DsParallel,
-    'ddp': DdpParallel,
     'none': NoneParallel
 }
 

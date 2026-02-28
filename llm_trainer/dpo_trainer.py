@@ -75,6 +75,12 @@ class DPOTrainer(BaseTrainer):
     def _convert_train_args(self) -> Tuple[dict, dict, dict]:
         dpo_collate_fn = get_dpo_collate_fn(self.dpo_config.mask_prompt)
         parallel_kwargs, data_loader_kwargs, sampler_kwargs = super()._convert_train_args()
+
+        if parallel_kwargs:
+            # 因为chosen和inject会concat到一块进行forward，所以实际batch_size要*2
+            real_micro_batch_size = self.train_config.batch_size * 2
+            parallel_kwargs['train_micro_batch_size_per_gpu'] = real_micro_batch_size
+
         data_loader_kwargs.update({"collate_fn": dpo_collate_fn})
 
         return parallel_kwargs, data_loader_kwargs, sampler_kwargs
@@ -117,16 +123,20 @@ class DPOTrainer(BaseTrainer):
         return logprobs_sums, logprobs_means
 
     def train(self):
-        # 梯度累积步数
-        gradient_accumulation_steps = max(1, self.gradient_accumulation_steps)
-
         loss_accumulation = 0.0
+        dpo_loss_accumulation = 0.0
         aux_loss_accumulation = 0.0
         nll_loss_accumulation = 0.0
+        chosen_reward_accumulation = 0.0
+        rejected_reward_accumulation = 0.0
+        reward_margin_accumulation = 0.0
+        reward_accuracy_accumulation = 0.0
+
         batches_accumulated = 0
 
         aux_loss_coef = self.train_config.loss_config.aux_loss_coef
         nll_loss_coef = self.dpo_config.nll_loss_coef
+        beta = self.dpo_config.loss_beta
 
         for epoch in range(self.resume_epoch, self.train_config.n_epochs):
             self.train_model.train()
@@ -144,6 +154,8 @@ class DPOTrainer(BaseTrainer):
                 last_ckpt_batch = 0
                 batch_count_per_file = len(train_data_loader)
 
+                effective_stop = None
+
                 TrainerTools().parallel.on_epoch_start(epoch)
                 self._on_file_start(epoch, file_path)
 
@@ -154,18 +166,12 @@ class DPOTrainer(BaseTrainer):
                         Logger.std_log(f"Fast forwarding {skip_batches} batches in {file_path}...")
 
                 data_iterator = iter(train_data_loader)
-                if skip_batches > 0:
-                    data_iterator = islice(data_iterator, skip_batches, None)
+                if skip_batches > 0 or effective_stop is not None:
+                    data_iterator = islice(data_iterator, skip_batches, effective_stop)
                     last_ckpt_batch = skip_batches
 
                 for batch, batch_data in enumerate(data_iterator):
                     batch = skip_batches + batch
-
-                    # 是否需要更新梯度
-                    if gradient_accumulation_steps > 1:
-                        need_update_grad = (batch + 1) % gradient_accumulation_steps == 0 or batch == batch_count_per_file - 1
-                    else:
-                        need_update_grad = True
 
                     try:
                         chosen_inputs: torch.Tensor = batch_data['chosen_inputs'].to(TrainerTools().parallel.device)
@@ -183,16 +189,17 @@ class DPOTrainer(BaseTrainer):
                         concat_labels = torch.concat([chosen_labels, rejected_labels], dim=0)
                         concat_attention_masks = torch.concat([chosen_attention_masks, rejected_attention_masks], dim=0)
 
-                        if TrainerTools().parallel.parallel_train:
-                            self.train_model.require_backward_grad_sync = need_update_grad
-
                         with autocast(TrainerTools().parallel.device_type):
-                            policy_outputs = self.train_model(concat_inputs, attention_mask=concat_attention_masks)
-                            policy_logprobs_sums, policy_logprobs_means = self._logprobs(policy_outputs['logits'], concat_labels)
-
                             with torch.no_grad():
                                 ref_outputs = self.ref_model(concat_inputs, attention_mask=concat_attention_masks)
                                 ref_logprobs_sums, _ = self._logprobs(ref_outputs['logits'], concat_labels)
+                                del ref_outputs
+
+                            policy_outputs = self.train_model(concat_inputs, attention_mask=concat_attention_masks)
+                            policy_logprobs_sums, policy_logprobs_means = self._logprobs(policy_outputs['logits'], concat_labels)
+
+                            raw_aux_loss = policy_outputs.get('aux_loss', None)
+                            del policy_outputs
 
                             policy_chosen_logps = policy_logprobs_sums[:chosen_inputs.shape[0]]
                             policy_rejected_logps = policy_logprobs_sums[chosen_inputs.shape[0]:]
@@ -210,8 +217,8 @@ class DPOTrainer(BaseTrainer):
                                 ref_rejected_logps
                             )
 
-                            if aux_loss_coef and policy_outputs.get('aux_loss'):
-                                aux_loss = aux_loss_coef * policy_outputs.get('aux_loss')
+                            if aux_loss_coef and raw_aux_loss is not None:
+                                aux_loss = aux_loss_coef * raw_aux_loss
                             else:
                                 aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
 
@@ -220,31 +227,49 @@ class DPOTrainer(BaseTrainer):
                             else:
                                 nll_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
 
-                        if gradient_accumulation_steps > 1:
-                            loss = loss / gradient_accumulation_steps
-                            aux_loss = aux_loss / gradient_accumulation_steps
-                            nll_loss = nll_loss / gradient_accumulation_steps
+                            with torch.no_grad():
+                                chosen_rewards = beta * (policy_chosen_logps.detach() - ref_chosen_logps)
+                                rejected_rewards = beta * (policy_rejected_logps.detach() - ref_rejected_logps)
+                                reward_margin = chosen_rewards - rejected_rewards
+                                reward_accuracy = (chosen_rewards > rejected_rewards).float()
 
-                        total_loss = loss + aux_loss + nll_loss
-                        self._backward_loss(total_loss)
+                        total_loss_unscaled = loss + aux_loss + nll_loss
 
-                        loss_accumulation += total_loss.detach().item()
+                        is_last_step = (
+                            epoch == self.train_config.n_epochs - 1 and
+                            file_idx == file_count - 1 and
+                            batch == batch_count_per_file - 1
+                        )
+                        need_update_step = self._need_update_step(batches_accumulated, is_last_step)
+                        self._backward_loss(total_loss_unscaled, self.gradient_accumulation_steps)
+
+                        loss_accumulation += total_loss_unscaled.detach().item()
+                        dpo_loss_accumulation += loss.detach().item()
                         aux_loss_accumulation += aux_loss.detach().item()
                         nll_loss_accumulation += nll_loss.detach().item()
 
+                        chosen_reward_accumulation += chosen_rewards.mean().item()
+                        rejected_reward_accumulation += rejected_rewards.mean().item()
+                        reward_margin_accumulation += reward_margin.mean().item()
+                        reward_accuracy_accumulation += reward_accuracy.mean().item()
+
                         batches_accumulated += 1
 
-                        if need_update_grad:
-                            self._apply_grad_clipping()
-                            self._apply_step()
+                        if need_update_step:
+                            self._update_step()
 
-                            avg_loss, avg_aux_loss, avg_nll_loss = self._avg_loss(
+                            avg_total_loss, avg_dpo_loss, avg_aux_loss, avg_nll_loss, \
+                            avg_chosen_reward, avg_rejected_reward, avg_reward_margin, avg_reward_accuracy = self._avg_loss(
                                 losses=[
                                     loss_accumulation,
+                                    dpo_loss_accumulation,
                                     aux_loss_accumulation,
                                     nll_loss_accumulation,
+                                    chosen_reward_accumulation,
+                                    rejected_reward_accumulation,
+                                    reward_margin_accumulation,
+                                    reward_accuracy_accumulation
                                 ],
-                                gradient_accumulation_steps=gradient_accumulation_steps,
                                 batches_accumulated=batches_accumulated
                             )
 
@@ -255,16 +280,25 @@ class DPOTrainer(BaseTrainer):
                                     'batch': f'{batch + 1}/{batch_count_per_file}',
                                 },
                                 values={
-                                    'loss': avg_loss,
+                                    'loss': avg_total_loss,
+                                    'dpo_loss': avg_dpo_loss,
                                     'moe_aux_loss': avg_aux_loss,
-                                    'nll_loss': avg_nll_loss
+                                    'nll_loss': avg_nll_loss,
+                                    'reward_chosen': avg_chosen_reward,
+                                    'reward_rejected': avg_rejected_reward,
+                                    'reward_margin': avg_reward_margin,
+                                    'reward_accuracy': avg_reward_accuracy
                                 }
                             )
 
-                            # reset to default
                             loss_accumulation = 0.0
+                            dpo_loss_accumulation = 0.0
                             aux_loss_accumulation = 0.0
                             nll_loss_accumulation = 0.0
+                            chosen_reward_accumulation = 0.0
+                            rejected_reward_accumulation = 0.0
+                            reward_margin_accumulation = 0.0
+                            reward_accuracy_accumulation = 0.0
                             batches_accumulated = 0
 
                             if (batch - last_ckpt_batch) >= self.train_config.eval_config.eval_batch_interval:
@@ -282,7 +316,6 @@ class DPOTrainer(BaseTrainer):
                         self._on_exception(e, epoch, batch)
 
                 try:
-                    # 一个文件训练结束后，清理内存
                     del train_data_loader
                     del dataset
                     del data_iterator
@@ -290,12 +323,10 @@ class DPOTrainer(BaseTrainer):
                     del concat_inputs
                     del concat_labels
                     del concat_attention_masks
-                    del policy_outputs
                     del loss
                     del aux_loss
                     del nll_loss
-                    del total_loss
-                    del ref_outputs
+                    del total_loss_unscaled
                     del chosen_inputs
                     del chosen_labels
                     del rejected_inputs
@@ -306,6 +337,10 @@ class DPOTrainer(BaseTrainer):
                     del policy_rejected_logps
                     del ref_chosen_logps
                     del ref_rejected_logps
+                    del chosen_rewards
+                    del rejected_rewards
+                    del reward_margin
+                    del reward_accuracy
                 except UnboundLocalError: ...
 
                 if hasattr(TrainerTools().parallel, '_sampler'):
@@ -332,4 +367,3 @@ class DPOTrainer(BaseTrainer):
             self._on_epoch_end(tag=f'epoch:{epoch}')
 
         TrainerTools().parallel.destroy()
-

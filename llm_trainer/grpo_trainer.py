@@ -213,12 +213,13 @@ class GRPOTrainer(BaseTrainer):
             input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
             attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
 
-            old_log_probs, _ = self._compute_log_probs(generate_model, input_ids, attention_mask)
+            with autocast(TrainerTools().parallel.device_type):
+                old_log_probs, _ = self._compute_log_probs(generate_model, input_ids, attention_mask)
 
-            if self.ref_model:
-                ref_log_probs, _ = self._compute_log_probs(self.ref_model, input_ids, attention_mask)
-            else:
-                ref_log_probs = None
+                if self.ref_model:
+                    ref_log_probs, _ = self._compute_log_probs(self.ref_model, input_ids, attention_mask)
+                else:
+                    ref_log_probs = None
 
         repeated_prompts = [p for p in prompts for _ in range(group_size)]
         repeated_answers = [a for a in answers for _ in range(group_size)]
@@ -262,6 +263,7 @@ class GRPOTrainer(BaseTrainer):
         grpo_stats = {
             "loss": 0.0,
             "moe_aux_loss": 0.0,
+            "approx_kl": 0.0,
             "rewards": rollout_data['rewards'].mean().item()
         }
 
@@ -304,6 +306,14 @@ class GRPOTrainer(BaseTrainer):
                     else:
                         aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
 
+                    with torch.no_grad():
+                        if mb_ref_log_probs is not None:
+                            log_ratio = mb_ref_log_probs - log_probs
+                            approx_kl = (torch.exp(log_ratio) - log_ratio - 1)
+                            approx_kl = (approx_kl * padded_completion_mask).sum() / padded_completion_mask.sum().clamp(min=1.0)
+                        else:
+                            approx_kl = torch.tensor(0.0, device=loss.device)
+
                 total_loss_unscaled = loss + aux_loss
 
                 if self.is_ds:
@@ -316,6 +326,7 @@ class GRPOTrainer(BaseTrainer):
 
                 grpo_stats["loss"] += total_loss_unscaled.detach().item()
                 grpo_stats["moe_aux_loss"] += aux_loss.detach().item()
+                grpo_stats["approx_kl"] += approx_kl.detach().item()
                 total_micro_batches_processed += 1
 
                 if need_update_step:
@@ -324,6 +335,7 @@ class GRPOTrainer(BaseTrainer):
         if total_micro_batches_processed > 0:
             grpo_stats["loss"] /= total_micro_batches_processed
             grpo_stats["moe_aux_loss"] /= total_micro_batches_processed
+            grpo_stats["approx_kl"] /= total_micro_batches_processed
 
         return grpo_stats
 
@@ -388,7 +400,8 @@ class GRPOTrainer(BaseTrainer):
                         stats_tensor = torch.tensor([
                             grpo_stats['loss'],
                             grpo_stats['moe_aux_loss'],
-                            grpo_stats['rewards']
+                            grpo_stats['rewards'],
+                            grpo_stats['approx_kl']
                         ], device=TrainerTools().parallel.device)
 
                         if TrainerTools().parallel.parallel_train:
@@ -397,6 +410,7 @@ class GRPOTrainer(BaseTrainer):
                         avg_loss = stats_tensor[0].item()
                         avg_moe_aux_loss = stats_tensor[1].item()
                         avg_rewards = stats_tensor[2].item()
+                        avg_kl = stats_tensor[3].item()
 
                         self._log(
                             keys={
@@ -407,7 +421,8 @@ class GRPOTrainer(BaseTrainer):
                             values={
                                 'loss': avg_loss,
                                 'moe_aux_loss': avg_moe_aux_loss,
-                                'rewards': avg_rewards,
+                                'approx_kl': avg_kl,
+                                'rewards': avg_rewards
                             }
                         )
 

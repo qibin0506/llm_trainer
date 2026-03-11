@@ -47,7 +47,7 @@ def _top_k_warper(logits: torch.Tensor, k: int, device: Union[str, torch.device,
     topk_logits, _ = torch.topk(logits, k=k)
     # []
     min_val: torch.Tensor = topk_logits[:, -1]
-    logits = torch.where(logits < min_val.unsqueeze(-1), torch.tensor(-torch.inf).to(device), logits)
+    logits = torch.where(logits < min_val.unsqueeze(-1), torch.full_like(logits, -float("inf")), logits)
     return logits
 
 
@@ -133,7 +133,8 @@ def _generate(
     if isinstance(model, VlmModel):
         tokens, _ = batch_repeat_image_tok(tokens, tokens_per_image)
 
-    attention_mask = torch.ones_like(tokens, device=device, dtype=torch.long)
+    pad_token_id = TrainerTools().tokenizer.pad
+    attention_mask = (tokens != pad_token_id).to(device=device, dtype=torch.long)
 
     kv_cache: Optional[KVCache] = None
     if use_kv_cache:

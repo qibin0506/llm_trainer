@@ -1,5 +1,6 @@
-from typing import Tuple, List, Optional
+from typing import Tuple, List
 import gc
+import math
 import torch
 from torch.utils.data import Dataset
 from itertools import islice
@@ -119,14 +120,16 @@ class DPOTrainer(BaseTrainer):
         # Apply the mask to set log-probs of padding tokens to 0
         logprobs_sums = (per_token_logps * loss_masks).sum(-1)
         logprobs_means = (per_token_logps * loss_masks).sum(-1) / loss_masks.sum(-1).clamp(min=1.0)
+        mask_sums = loss_masks.sum(-1)
 
-        return logprobs_sums, logprobs_means
+        return logprobs_sums, logprobs_means, mask_sums
 
     def train(self):
         loss_accumulation = 0.0
         dpo_loss_accumulation = 0.0
         aux_loss_accumulation = 0.0
         nll_loss_accumulation = 0.0
+        ce_loss_accumulation = 0.0
         chosen_reward_accumulation = 0.0
         rejected_reward_accumulation = 0.0
         reward_margin_accumulation = 0.0
@@ -194,7 +197,7 @@ class DPOTrainer(BaseTrainer):
                                 del ref_outputs
 
                             policy_outputs = self.train_model(concat_inputs, attention_mask=concat_attention_masks)
-                            policy_logprobs_sums, policy_logprobs_means = self._logprobs(policy_outputs['logits'], concat_labels)
+                            policy_logprobs_sums, policy_logprobs_means, policy_mask_sums = self._logprobs(policy_outputs['logits'], concat_labels)
 
                             raw_aux_loss = policy_outputs.get('aux_loss', None)
                             del policy_outputs
@@ -206,6 +209,10 @@ class DPOTrainer(BaseTrainer):
                             ref_rejected_logps = ref_logprobs_sums[chosen_inputs.shape[0]:]
 
                             nll_loss = -policy_logprobs_means[:chosen_inputs.shape[0]].mean()
+
+                            chosen_logprobs_sums = policy_logprobs_sums[:chosen_inputs.shape[0]]
+                            chosen_mask_sums = policy_mask_sums[:chosen_inputs.shape[0]]
+                            ce_loss = -(chosen_logprobs_sums.sum() / chosen_mask_sums.sum().clamp(min=1.0))
 
                             # calc loss
                             loss = self.criterion(
@@ -245,6 +252,7 @@ class DPOTrainer(BaseTrainer):
                         dpo_loss_accumulation += loss.detach().item()
                         aux_loss_accumulation += aux_loss.detach().item()
                         nll_loss_accumulation += nll_loss.detach().item()
+                        ce_loss_accumulation += ce_loss.detach().item()
 
                         chosen_reward_accumulation += chosen_rewards.mean().item()
                         rejected_reward_accumulation += rejected_rewards.mean().item()
@@ -256,13 +264,16 @@ class DPOTrainer(BaseTrainer):
                         if need_update_step:
                             self._update_step()
 
-                            avg_total_loss, avg_dpo_loss, avg_aux_loss, avg_nll_loss, \
-                            avg_chosen_reward, avg_rejected_reward, avg_reward_margin, avg_reward_accuracy = self._avg_loss(
+                            avg_total_loss, avg_dpo_loss, \
+                            avg_aux_loss, avg_nll_loss, avg_ce_loss, \
+                            avg_chosen_reward, avg_rejected_reward, \
+                            avg_reward_margin, avg_reward_accuracy = self._avg_loss(
                                 losses=[
                                     loss_accumulation,
                                     dpo_loss_accumulation,
                                     aux_loss_accumulation,
                                     nll_loss_accumulation,
+                                    ce_loss_accumulation,
                                     chosen_reward_accumulation,
                                     rejected_reward_accumulation,
                                     reward_margin_accumulation,
@@ -270,6 +281,11 @@ class DPOTrainer(BaseTrainer):
                                 ],
                                 batches_accumulated=batches_accumulated
                             )
+
+                            try:
+                                perplexity = math.exp(avg_ce_loss) if avg_ce_loss < 20 else float('inf')
+                            except OverflowError:
+                                perplexity = float('inf')
 
                             self._log(
                                 keys={
@@ -282,6 +298,7 @@ class DPOTrainer(BaseTrainer):
                                     'dpo_loss': avg_dpo_loss,
                                     'moe_aux_loss': avg_aux_loss,
                                     'nll_loss': avg_nll_loss,
+                                    'perplexity': round(perplexity, 4) if avg_ce_loss > 0 else float('inf'),
                                     'reward_chosen': avg_chosen_reward,
                                     'reward_rejected': avg_rejected_reward,
                                     'reward_margin': avg_reward_margin,
@@ -293,6 +310,7 @@ class DPOTrainer(BaseTrainer):
                             dpo_loss_accumulation = 0.0
                             aux_loss_accumulation = 0.0
                             nll_loss_accumulation = 0.0
+                            ce_loss_accumulation = 0.0
                             chosen_reward_accumulation = 0.0
                             rejected_reward_accumulation = 0.0
                             reward_margin_accumulation = 0.0

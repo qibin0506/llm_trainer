@@ -1,6 +1,7 @@
 from typing import Optional, Tuple, List, Dict, Any
 import copy
 import gc
+import math
 import importlib.metadata
 from packaging import version
 from itertools import islice
@@ -414,19 +415,15 @@ class BaseTrainer:
 
     def _calc_loss(self, inputs, attention_mask, logits, labels):
         # calc loss
+        ce_loss = self.criterion(logits, labels)
         if not self.kd_loss or self.kd_config.kd_coef == 0.0:
             # 不用计算kd_loss
-            return self.criterion(logits, labels)
+            return ce_loss, ce_loss
 
         teacher_logits = self.kd_config.teacher_logits_provider(inputs, attention_mask)
         loss = self.kd_loss(logits, teacher_logits, labels)
 
-        if self.kd_config.kd_coef == 1.0:
-            # 不用计算ce loss
-            return loss
-
-        ce_loss = self.criterion(logits, labels)
-        return (1 - self.kd_config.kd_coef) * ce_loss + self.kd_config.kd_coef * loss
+        return (1 - self.kd_config.kd_coef) * ce_loss + self.kd_config.kd_coef * loss, ce_loss
 
     def _backward_loss(self, total_loss_unscaled, gradient_accumulation_steps):
         if isinstance(TrainerTools().parallel, DsParallel):
@@ -586,6 +583,7 @@ class BaseTrainer:
         # 梯度累积步数
         loss_accumulation = 0.0
         aux_loss_accumulation = 0.0
+        ce_loss_accumulation = 0.0
         batches_accumulated = 0
 
         for epoch in range(self.resume_epoch, self.train_config.n_epochs):
@@ -638,7 +636,7 @@ class BaseTrainer:
                             )
 
                             # calc loss
-                            loss = self._calc_loss(inputs, attention_mask, result['logits'], labels)
+                            loss, ce_loss = self._calc_loss(inputs, attention_mask, result['logits'], labels)
                             if result['aux_loss'] is not None and self.train_config.loss_config.aux_loss_coef:
                                 aux_loss = self.train_config.loss_config.aux_loss_coef * result['aux_loss']
                             else:
@@ -657,18 +655,25 @@ class BaseTrainer:
 
                         loss_accumulation += total_loss_unscaled.detach().item()
                         aux_loss_accumulation += aux_loss.detach().item()
+                        ce_loss_accumulation += ce_loss.detach().item()
                         batches_accumulated += 1
 
                         if need_update_step:
                             self._update_step()
 
-                            avg_loss, avg_aux_loss = self._avg_loss(
+                            avg_loss, avg_aux_loss, avg_ce_loss = self._avg_loss(
                                 losses=[
                                     loss_accumulation,
-                                    aux_loss_accumulation
+                                    aux_loss_accumulation,
+                                    ce_loss_accumulation
                                 ],
                                 batches_accumulated=batches_accumulated
                             )
+
+                            try:
+                                perplexity = math.exp(avg_ce_loss) if avg_ce_loss < 20 else float('inf')
+                            except OverflowError:
+                                perplexity = float('inf')
 
                             self._log(
                                 keys={
@@ -678,13 +683,15 @@ class BaseTrainer:
                                 },
                                 values={
                                     'loss': avg_loss,
-                                    'moe_aux_loss': avg_aux_loss
+                                    'moe_aux_loss': avg_aux_loss,
+                                    'perplexity': round(perplexity, 4)
                                 }
                             )
 
                             # reset to default
                             loss_accumulation = 0.0
                             aux_loss_accumulation = 0.0
+                            ce_loss_accumulation = 0.0
                             batches_accumulated = 0
 
                             if (batch - last_ckpt_batch) >= self.train_config.eval_config.eval_batch_interval:

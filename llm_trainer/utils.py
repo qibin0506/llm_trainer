@@ -252,7 +252,7 @@ def get_sft_collate_fn(mask_prompt: bool):
         image_tags = []
         for item in batch_data:
             batch_train_data.append(item['inputs'])
-            image_tags.append(item['image_tag'])
+            image_tags.append(item.get('image_tag'))
 
         # [[x,x,x], [y,y,y]]
         inputs = pad_sequence(batch_train_data, batch_first=True, padding_value=TrainerTools().tokenizer.pad)

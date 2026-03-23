@@ -9,23 +9,22 @@ from itertools import islice
 from .base_trainer import BaseTrainer
 from .train_configs import TrainConfig
 from .dataset import RLDataset
-from .loss import GRPOLoss
+from .loss import GRPOLoss, LMLoss
 from .tools import TrainerTools
 from .generate_utils import batch_generate
 from .log import Logger
 from .utils import (
     autocast,
     left_pad_sequence,
+    get_sft_collate_fn,
     log_softmax,
     disable_dropout_in_model,
     calc_position_ids
 )
-
 from .partition_utils import (
     sync_model_params,
     unwrap_model_for_generation
 )
-
 from .checkpoint import (
     save_checkpoint,
     save_steps,
@@ -34,12 +33,14 @@ from .checkpoint import (
 class GRPOTrainer(BaseTrainer):
     """
         reward_func(prompt_ids, complete_ids, answer_ids) -> scores
+        ptx_builder(prompt_ids, answer_ids) -> sft_ids
     """
     def __init__(
             self,
             *,
             train_config: TrainConfig,
             reward_func: Callable[[List[torch.Tensor], torch.Tensor, List[Optional[torch.Tensor]]], List[float]],
+            ptx_builder: Optional[Callable[[List[torch.Tensor], List[torch.Tensor]], List[torch.Tensor]]] = None,
             eval_prompts: List[str]
     ):
         self.grpo_config = train_config.grpo_config
@@ -55,7 +56,12 @@ class GRPOTrainer(BaseTrainer):
             '(batch_size * group_size) % (grpo_batch_size * gradient_accumulation_steps) must be zero!'
 
         self.reward_func = reward_func
+        self.ptx_builder = ptx_builder
         self.ref_model = self._init_ref_model()
+
+        if self.grpo_config.ptx_coef > 0.0:
+            assert self.ptx_builder is not None
+            self.ptx_criterion = self._init_ptx_loss()
 
     def _init_ref_model(self):
         # beta == 0，不需要ref_model
@@ -93,6 +99,21 @@ class GRPOTrainer(BaseTrainer):
         )
 
         return criterion, None
+
+    def _init_ptx_loss(self):
+        critical_tokens: Optional[List[int]] = None
+        critical_alpha: float = 1.0
+        if self.train_config.loss_config.critical_tokens:
+            critical_tokens = self.train_config.loss_config.critical_tokens
+            critical_alpha = self.train_config.loss_config.critical_alpha
+
+        criterion = LMLoss(
+            critical_tokens=critical_tokens,
+            critical_alpha=critical_alpha,
+            vocab_size=TrainerTools().tokenizer.vocab_size
+        )
+
+        return criterion
 
     def _convert_train_args(self) -> Tuple[dict, dict, dict]:
         parallel_kwargs, data_loader_kwargs, sampler_kwargs = super()._convert_train_args()
@@ -205,6 +226,14 @@ class GRPOTrainer(BaseTrainer):
         answers = [item["answer"] for item in batch_data]
         group_size = self.grpo_config.group_size
 
+        # for PTX
+        if self.grpo_config.ptx_coef > 0.0 and self.ptx_builder is not None:
+            ptx_data = self.ptx_builder(prompts, answers)
+            ptx_data = [{'inputs': t} if t is not None else None for t in ptx_data]
+        else:
+            ptx_data = []
+        # end
+
         # 使用no_grad替换inference_mode
         # 修复问题：Inference tensors cannot be saved for backward. To work around you can make a clone to get a normal
         with torch.no_grad():
@@ -223,10 +252,14 @@ class GRPOTrainer(BaseTrainer):
 
         repeated_prompts = [p for p in prompts for _ in range(group_size)]
         repeated_answers = [a for a in answers for _ in range(group_size)]
+        if len(ptx_data) > 0:
+            repeated_ptx_data = [d for d in ptx_data for _ in range(group_size)]
+        else:
+            repeated_ptx_data = []
 
         # [batch*group_size]
         rewards = torch.tensor(
-            self.reward_func(repeated_prompts, completion_ids, repeated_answers),
+            self.reward_func(repeated_prompts, completion_ids.cpu(), repeated_answers),
             dtype=torch.float32,
             device=TrainerTools().parallel.device
         )
@@ -242,6 +275,7 @@ class GRPOTrainer(BaseTrainer):
             'completion_ids': completion_ids.detach(),
             'advantages': advantages.detach(),
             'rewards': rewards.detach(),
+            'ptx_data': repeated_ptx_data,
         }
 
     def _grpo_learning_phase(self, rollout_data: dict):
@@ -256,6 +290,7 @@ class GRPOTrainer(BaseTrainer):
         ref_log_probs = rollout_data['ref_log_probs']
         completion_ids = rollout_data['completion_ids']
         advantages = rollout_data['advantages']
+        ptx_data = rollout_data['ptx_data']
 
         total_samples = input_ids.shape[0]
         prompt_len = input_ids.shape[1] - completion_ids.shape[1]
@@ -263,11 +298,14 @@ class GRPOTrainer(BaseTrainer):
         grpo_stats = {
             "loss": 0.0,
             "moe_aux_loss": 0.0,
+            "ptx_loss": 0.0,
+            "ptx_aux_loss": 0.0,
             "approx_kl": 0.0,
-            "rewards": rollout_data['rewards'].mean().item()
+            "rewards": rollout_data['rewards'].mean().item(),
         }
 
         total_micro_batches_processed = 0
+        has_ptx = grpo_config.ptx_coef > 0.0 and self.ptx_builder is not None and len(ptx_data) > 0
 
         for grpo_epoch in range(grpo_config.grpo_epochs):
             indices = torch.randperm(total_samples, device=device)
@@ -306,6 +344,29 @@ class GRPOTrainer(BaseTrainer):
                     else:
                         aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
 
+                    # ptx
+                    ptx_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
+                    ptx_aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
+                    if has_ptx:
+                        mb_ptx_data = [ptx_data[idx] for idx in mini_batch_indices if ptx_data[idx] is not None]
+                        if len(mb_ptx_data) > 0:
+                            pxt_collate_fn = get_sft_collate_fn(mask_prompt=True)
+                            px_fn_result = pxt_collate_fn(mb_ptx_data)
+                            mb_ptx_inputs = px_fn_result['inputs'].to(TrainerTools().parallel.device)
+                            mb_ptx_labels = px_fn_result['labels'].to(TrainerTools().parallel.device)
+
+                            mb_ptx_attention_mask = (mb_ptx_inputs != TrainerTools().tokenizer.pad)
+                            ptx_output = self.train_model(
+                                mb_ptx_inputs,
+                                attention_mask=mb_ptx_attention_mask,
+                            )
+                            ptx_logits = ptx_output['logits']
+                            ptx_loss = self.ptx_criterion(ptx_logits, mb_ptx_labels)
+
+                            if ptx_output['aux_loss'] is not None and self.train_config.loss_config.aux_loss_coef:
+                                ptx_aux_loss = self.train_config.loss_config.aux_loss_coef * ptx_output['aux_loss']
+                    # end
+
                     with torch.no_grad():
                         if mb_ref_log_probs is not None:
                             log_ratio = mb_ref_log_probs - log_probs
@@ -314,7 +375,8 @@ class GRPOTrainer(BaseTrainer):
                         else:
                             approx_kl = torch.tensor(0.0, device=loss.device)
 
-                total_loss_unscaled = loss + aux_loss
+                grpo_loss_unscaled = loss + aux_loss
+                ptx_loss_unscaled = grpo_config.ptx_coef * (ptx_loss + ptx_aux_loss)
 
                 if self.is_ds:
                     need_update_step = self.train_model.is_gradient_accumulation_boundary()
@@ -322,10 +384,16 @@ class GRPOTrainer(BaseTrainer):
                     micro_batch_idx = i // grpo_batch_size
                     need_update_step = ((micro_batch_idx + 1) % self.gradient_accumulation_steps == 0)
 
-                self._backward_loss(total_loss_unscaled, self.gradient_accumulation_steps)
+                if has_ptx:
+                    self._backward_loss(grpo_loss_unscaled, self.gradient_accumulation_steps, step=False)
+                    self._backward_loss(ptx_loss_unscaled, self.gradient_accumulation_steps, step=True)
+                else:
+                    self._backward_loss(grpo_loss_unscaled, self.gradient_accumulation_steps)
 
-                grpo_stats["loss"] += total_loss_unscaled.detach().item()
+                grpo_stats["loss"] += (grpo_loss_unscaled + ptx_loss_unscaled).detach().item()
                 grpo_stats["moe_aux_loss"] += aux_loss.detach().item()
+                grpo_stats["ptx_loss"] += ptx_loss.detach().item()
+                grpo_stats["ptx_aux_loss"] += ptx_aux_loss.detach().item()
                 grpo_stats["approx_kl"] += approx_kl.detach().item()
                 total_micro_batches_processed += 1
 
@@ -335,6 +403,8 @@ class GRPOTrainer(BaseTrainer):
         if total_micro_batches_processed > 0:
             grpo_stats["loss"] /= total_micro_batches_processed
             grpo_stats["moe_aux_loss"] /= total_micro_batches_processed
+            grpo_stats["ptx_loss"] /= total_micro_batches_processed
+            grpo_stats["ptx_aux_loss"] /= total_micro_batches_processed
             grpo_stats["approx_kl"] /= total_micro_batches_processed
 
         return grpo_stats
@@ -400,6 +470,8 @@ class GRPOTrainer(BaseTrainer):
                         stats_tensor = torch.tensor([
                             grpo_stats['loss'],
                             grpo_stats['moe_aux_loss'],
+                            grpo_stats["ptx_loss"],
+                            grpo_stats["ptx_aux_loss"],
                             grpo_stats['rewards'],
                             grpo_stats['approx_kl']
                         ], device=TrainerTools().parallel.device)
@@ -409,8 +481,10 @@ class GRPOTrainer(BaseTrainer):
 
                         avg_loss = stats_tensor[0].item()
                         avg_moe_aux_loss = stats_tensor[1].item()
-                        avg_rewards = stats_tensor[2].item()
-                        avg_kl = stats_tensor[3].item()
+                        avg_ptx_loss = stats_tensor[2].item()
+                        avg_ptx_aux_loss = stats_tensor[3].item()
+                        avg_rewards = stats_tensor[4].item()
+                        avg_kl = stats_tensor[5].item()
 
                         self._log(
                             keys={
@@ -421,6 +495,8 @@ class GRPOTrainer(BaseTrainer):
                             values={
                                 'loss': avg_loss,
                                 'moe_aux_loss': avg_moe_aux_loss,
+                                'ptx_loss': avg_ptx_loss,
+                                'ptx_aux_loss': avg_ptx_aux_loss,
                                 'approx_kl': avg_kl,
                                 'rewards': avg_rewards
                             }

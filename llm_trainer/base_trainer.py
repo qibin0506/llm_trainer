@@ -425,10 +425,11 @@ class BaseTrainer:
 
         return (1 - self.kd_config.kd_coef) * ce_loss + self.kd_config.kd_coef * loss, ce_loss
 
-    def _backward_loss(self, total_loss_unscaled, gradient_accumulation_steps):
+    def _backward_loss(self, total_loss_unscaled, gradient_accumulation_steps, step = True):
         if isinstance(TrainerTools().parallel, DsParallel):
             self.train_model.backward(total_loss_unscaled)
-            self.train_model.step()
+            if step:
+                self.train_model.step()
         else:
             total_loss_scaled = total_loss_unscaled / gradient_accumulation_steps
             self.scaler.scale(total_loss_scaled).backward()

@@ -224,6 +224,7 @@ class PPOConfig:
     vf_coef: float = 0.5
     kl_beta: float = 0.02
     kl_estimator: str = 'k1' # or k3
+    ptx_coef: float = 0.0
     missing_eos_penalty: Optional[float] = None
     normalize_rewards: bool = False
     normalize_method: str = 'RunningMeanStd' # RunningMeanStd or BatchStd
@@ -248,6 +249,7 @@ class GRPOConfig:
     loss_delta: Optional[float] = None
     loss_importance_sampling_level: str = 'seq' # token or seq
     loss_type: str = 'grpo' # grpo or bnpo or dr_grpo
+    ptx_coef: float = 0.0
     gen_max_seq_len: int
     gen_temperature: Optional[float] = None
     gen_k: Optional[int] = None

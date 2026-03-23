@@ -14,17 +14,19 @@ from .dataset import RLDataset
 from .loss import PPOLoss
 from .tools import TrainerTools
 from .generate_utils import batch_generate
+from .partition_utils import unwrap_model_for_generation
+from .log import Logger
+from .loss import LMLoss
 from .utils import (
     autocast,
     left_pad_sequence,
+    get_sft_collate_fn,
     log_softmax,
     masked_whiten,
     disable_dropout_in_model,
     calc_position_ids,
     RunningMeanStd
 )
-from .partition_utils import unwrap_model_for_generation
-from .log import Logger
 from .checkpoint import (
     save_checkpoint,
     save_steps,
@@ -62,13 +64,20 @@ class PolicyAndValueModelWrapper(nn.Module):
         self.policy_model = policy_model
         self.value_model = value_model
 
-    def forward(self, *args, **kwargs):
+    def forward(self, *args, forward_type='both', **kwargs):
+        if forward_type == 'policy':
+            return self.policy_model(*args, **kwargs), None
+
+        if forward_type == 'value':
+            return None, self.value_model(*args, **kwargs)
+
         return self.policy_model(*args, **kwargs), self.value_model(*args, **kwargs)
 
 
 class PPOTrainer(BaseTrainer):
     """
     reward_func(prompt_ids, complete_ids, answer_ids) -> scores
+    ptx_builder(prompt_ids, answer_ids) -> sft_ids
     """
 
     def __init__(
@@ -76,6 +85,7 @@ class PPOTrainer(BaseTrainer):
             *,
             train_config: TrainConfig,
             reward_func: Callable[[List[torch.Tensor], torch.Tensor, List[Optional[torch.Tensor]]], List[float]],
+            ptx_builder: Optional[Callable[[List[torch.Tensor], List[torch.Tensor]], List[torch.Tensor]]] = None,
             eval_prompts: List[str]
     ):
         self.ppo_config = train_config.ppo_config
@@ -102,7 +112,12 @@ class PPOTrainer(BaseTrainer):
             'batch_size % (ppo_batch_size * gradient_accumulation_steps) must be zero!'
 
         self.reward_func = reward_func
+        self.ptx_builder = ptx_builder
         self.ref_model = self._init_ref_model()
+
+        if self.ppo_config.ptx_coef > 0.0:
+            assert self.ptx_builder is not None
+            self.ptx_criterion = self._init_ptx_loss()
 
     def _init_train_model_and_optim(self, initial_lr: float):
         policy_model = self._new_model(self.train_config)
@@ -270,6 +285,21 @@ class PPOTrainer(BaseTrainer):
         )
         return criterion, None
 
+    def _init_ptx_loss(self):
+        critical_tokens: Optional[List[int]] = None
+        critical_alpha: float = 1.0
+        if self.train_config.loss_config.critical_tokens:
+            critical_tokens = self.train_config.loss_config.critical_tokens
+            critical_alpha = self.train_config.loss_config.critical_alpha
+
+        criterion = LMLoss(
+            critical_tokens=critical_tokens,
+            critical_alpha=critical_alpha,
+            vocab_size=TrainerTools().tokenizer.vocab_size
+        )
+
+        return criterion
+
     def _load_train_model_checkpoint(self):
         load_checkpoint(
             self.train_model,
@@ -334,6 +364,14 @@ class PPOTrainer(BaseTrainer):
         prompts = [item["prompt"] for item in batch_data]
         answers = [item["answer"] for item in batch_data]
 
+        # for PTX
+        if ppo_config.ptx_coef > 0.0 and self.ptx_builder is not None:
+            ptx_data = self.ptx_builder(prompts, answers)
+            ptx_data = [{'inputs': t} if t is not None else None for t in ptx_data]
+        else:
+            ptx_data = []
+        # end
+
         prompt_ids = left_pad_sequence(prompts, padding_value=pad_token_id)
         prompt_ids = prompt_ids.to(device)
         prompt_masks = (prompt_ids != pad_token_id)
@@ -397,7 +435,7 @@ class PPOTrainer(BaseTrainer):
                 rewards += kl_rewards * completion_mask
 
             env_rewards_tensor = torch.tensor(
-                self.reward_func(prompts, completion_ids, answers),
+                self.reward_func(prompts, completion_ids.cpu(), answers),
                 dtype=torch.float32,
                 device=device
             )
@@ -435,6 +473,7 @@ class PPOTrainer(BaseTrainer):
             'rewards': rewards.detach(),
             'env_rewards': raw_reward_mean.detach(),
             'dones': dones.detach(),
+            'ptx_data': ptx_data,
         }
 
     def _ppo_learning_phase(self, rollout_data: dict):
@@ -446,6 +485,7 @@ class PPOTrainer(BaseTrainer):
         old_values: torch.Tensor = rollout_data['values']
         rewards: torch.Tensor = rollout_data['rewards']
         dones: torch.Tensor = rollout_data['dones']
+        ptx_data = rollout_data['ptx_data']
 
         prompt_len = prompt_ids.shape[1]
         batch_size = prompt_ids.shape[0]
@@ -472,11 +512,13 @@ class PPOTrainer(BaseTrainer):
 
         ppo_stats = {
             "loss": 0.0, "moe_aux_loss": 0.0, "actor_loss": 0.0,
-            "value_loss": 0.0, "approx_kl": 0.0, "clip_frac": 0.0
+            "value_loss": 0.0, 'ptx_loss': 0.0, 'ptx_aux_loss': 0.0,
+            "approx_kl": 0.0, "clip_frac": 0.0,
         }
 
         ppo_batch_size = ppo_config.ppo_batch_size
         total_micro_batches_processed = 0
+        has_ptx = ppo_config.ptx_coef > 0.0 and self.ptx_builder is not None and len(ptx_data) > 0
 
         for ppo_epoch in range(ppo_config.ppo_epochs):
             indices = torch.randperm(batch_size, device=TrainerTools().parallel.device)
@@ -525,7 +567,31 @@ class PPOTrainer(BaseTrainer):
                     if policy_output['aux_loss'] is not None and self.train_config.loss_config.aux_loss_coef:
                         aux_loss = self.train_config.loss_config.aux_loss_coef * policy_output['aux_loss']
 
-                total_loss_unscaled = loss + aux_loss
+                    # ptx
+                    ptx_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
+                    ptx_aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
+                    if has_ptx:
+                        mb_ptx_data = [ptx_data[idx] for idx in mini_batch_indices if ptx_data[idx] is not None]
+                        if len(mb_ptx_data) > 0:
+                            pxt_collate_fn = get_sft_collate_fn(mask_prompt=True)
+                            px_fn_result = pxt_collate_fn(mb_ptx_data)
+                            mb_ptx_inputs = px_fn_result['inputs'].to(TrainerTools().parallel.device)
+                            mb_ptx_labels = px_fn_result['labels'].to(TrainerTools().parallel.device)
+
+                            mb_ptx_attention_mask = (mb_ptx_inputs != TrainerTools().tokenizer.pad)
+                            ptx_policy_output, _ = self.train_model(
+                                mb_ptx_inputs,
+                                forward_type='policy',
+                                attention_mask=mb_ptx_attention_mask,
+                            )
+                            ptx_logits = ptx_policy_output['logits']
+                            ptx_loss = self.ptx_criterion(ptx_logits, mb_ptx_labels)
+
+                            if ptx_policy_output['aux_loss'] is not None and self.train_config.loss_config.aux_loss_coef:
+                                ptx_aux_loss = self.train_config.loss_config.aux_loss_coef * ptx_policy_output['aux_loss']
+                    # end
+                ppo_loss_unscaled = loss + aux_loss
+                ptx_loss_unscaled = ppo_config.ptx_coef * (ptx_loss + ptx_aux_loss)
 
                 if self.is_ds:
                     need_update_step = self.train_model.is_gradient_accumulation_boundary()
@@ -533,12 +599,18 @@ class PPOTrainer(BaseTrainer):
                     micro_batch_idx = i // ppo_batch_size
                     need_update_step = ((micro_batch_idx + 1) % self.gradient_accumulation_steps == 0)
 
-                self._backward_loss(total_loss_unscaled, self.gradient_accumulation_steps)
+                if has_ptx:
+                    self._backward_loss(ppo_loss_unscaled, self.gradient_accumulation_steps, step=False)
+                    self._backward_loss(ptx_loss_unscaled, self.gradient_accumulation_steps, step=True)
+                else:
+                    self._backward_loss(ppo_loss_unscaled, self.gradient_accumulation_steps)
 
-                ppo_stats["loss"] += total_loss_unscaled.detach().item()
+                ppo_stats["loss"] += (ppo_loss_unscaled + ptx_loss_unscaled).detach().item()
                 ppo_stats["moe_aux_loss"] += aux_loss.detach().item()
                 ppo_stats["actor_loss"] += actor_loss.detach().item()
                 ppo_stats["value_loss"] += value_loss.detach().item()
+                ppo_stats["ptx_loss"] += ptx_loss.detach().item()
+                ppo_stats["ptx_aux_loss"] += ptx_aux_loss.detach().item()
                 ppo_stats["approx_kl"] += approx_kl.detach().item()
                 ppo_stats["clip_frac"] += clip_frac.detach().item()
                 total_micro_batches_processed += 1
@@ -596,6 +668,8 @@ class PPOTrainer(BaseTrainer):
                             ppo_stats['moe_aux_loss'],
                             ppo_stats['actor_loss'],
                             ppo_stats['value_loss'],
+                            ppo_stats["ptx_loss"],
+                            ppo_stats["ptx_aux_loss"],
                             ppo_stats['approx_kl'],
                             ppo_stats['clip_frac'],
                             rollout_data['env_rewards'].item()
@@ -608,9 +682,11 @@ class PPOTrainer(BaseTrainer):
                         ppo_stats['moe_aux_loss'] = stats_tensor[1].item()
                         ppo_stats['actor_loss'] = stats_tensor[2].item()
                         ppo_stats['value_loss'] = stats_tensor[3].item()
-                        ppo_stats['approx_kl'] = stats_tensor[4].item()
-                        ppo_stats['clip_frac'] = stats_tensor[5].item()
-                        reward_value = stats_tensor[6].item()
+                        ppo_stats["ptx_loss"] = stats_tensor[4].item()
+                        ppo_stats['ptx_aux_loss'] = stats_tensor[5].item()
+                        ppo_stats['approx_kl'] = stats_tensor[6].item()
+                        ppo_stats['clip_frac'] = stats_tensor[7].item()
+                        reward_value = stats_tensor[8].item()
 
                         self._log(
                             keys={
@@ -623,6 +699,8 @@ class PPOTrainer(BaseTrainer):
                                 'moe_aux_loss': ppo_stats['moe_aux_loss'],
                                 'actor_loss': ppo_stats['actor_loss'],
                                 'value_loss': ppo_stats['value_loss'],
+                                'ptx_loss': ppo_stats["ptx_loss"],
+                                'ptx_aux_loss': ppo_stats["ptx_aux_loss"],
                                 'approx_kl': ppo_stats['approx_kl'],
                                 'clip_frac': ppo_stats['clip_frac'],
                                 'rewards': reward_value

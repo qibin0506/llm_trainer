@@ -305,6 +305,7 @@ class GRPOTrainer(BaseTrainer):
         }
 
         total_micro_batches_processed = 0
+        has_ptx = grpo_config.ptx_coef > 0.0 and self.ptx_builder is not None and len(ptx_data) > 0
 
         for grpo_epoch in range(grpo_config.grpo_epochs):
             indices = torch.randperm(total_samples, device=device)
@@ -346,7 +347,7 @@ class GRPOTrainer(BaseTrainer):
                     # ptx
                     ptx_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
                     ptx_aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
-                    if grpo_config.ptx_coef > 0.0 and self.ptx_builder is not None and len(ptx_data) > 0:
+                    if has_ptx:
                         mb_ptx_data = [ptx_data[idx] for idx in mini_batch_indices if ptx_data[idx] is not None]
                         if len(mb_ptx_data) > 0:
                             pxt_collate_fn = get_sft_collate_fn(mask_prompt=True)
@@ -374,7 +375,8 @@ class GRPOTrainer(BaseTrainer):
                         else:
                             approx_kl = torch.tensor(0.0, device=loss.device)
 
-                total_loss_unscaled = loss + aux_loss + grpo_config.ptx_coef * (ptx_loss + ptx_aux_loss)
+                grpo_loss_unscaled = loss + aux_loss
+                ptx_loss_unscaled = grpo_config.ptx_coef * (ptx_loss + ptx_aux_loss)
 
                 if self.is_ds:
                     need_update_step = self.train_model.is_gradient_accumulation_boundary()
@@ -382,9 +384,13 @@ class GRPOTrainer(BaseTrainer):
                     micro_batch_idx = i // grpo_batch_size
                     need_update_step = ((micro_batch_idx + 1) % self.gradient_accumulation_steps == 0)
 
-                self._backward_loss(total_loss_unscaled, self.gradient_accumulation_steps)
+                if has_ptx:
+                    self._backward_loss(grpo_loss_unscaled, self.gradient_accumulation_steps, step=False)
+                    self._backward_loss(ptx_loss_unscaled, self.gradient_accumulation_steps, step=True)
+                else:
+                    self._backward_loss(grpo_loss_unscaled, self.gradient_accumulation_steps)
 
-                grpo_stats["loss"] += total_loss_unscaled.detach().item()
+                grpo_stats["loss"] += (grpo_loss_unscaled + ptx_loss_unscaled).detach().item()
                 grpo_stats["moe_aux_loss"] += aux_loss.detach().item()
                 grpo_stats["ptx_loss"] += ptx_loss.detach().item()
                 grpo_stats["ptx_aux_loss"] += ptx_aux_loss.detach().item()

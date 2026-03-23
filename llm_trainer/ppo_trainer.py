@@ -512,11 +512,13 @@ class PPOTrainer(BaseTrainer):
 
         ppo_stats = {
             "loss": 0.0, "moe_aux_loss": 0.0, "actor_loss": 0.0,
-            "value_loss": 0.0, 'ptx_loss': 0.0, "approx_kl": 0.0, "clip_frac": 0.0,
+            "value_loss": 0.0, 'ptx_loss': 0.0, 'ptx_aux_loss': 0.0,
+            "approx_kl": 0.0, "clip_frac": 0.0,
         }
 
         ppo_batch_size = ppo_config.ppo_batch_size
         total_micro_batches_processed = 0
+        has_ptx = ppo_config.ptx_coef > 0.0 and self.ptx_builder is not None and len(ptx_data) > 0
 
         for ppo_epoch in range(ppo_config.ppo_epochs):
             indices = torch.randperm(batch_size, device=TrainerTools().parallel.device)
@@ -568,7 +570,7 @@ class PPOTrainer(BaseTrainer):
                     # ptx
                     ptx_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
                     ptx_aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
-                    if ppo_config.ptx_coef > 0.0 and self.ptx_builder is not None and len(ptx_data) > 0:
+                    if has_ptx:
                         mb_ptx_data = [ptx_data[idx] for idx in mini_batch_indices if ptx_data[idx] is not None]
                         if len(mb_ptx_data) > 0:
                             pxt_collate_fn = get_sft_collate_fn(mask_prompt=True)
@@ -588,8 +590,8 @@ class PPOTrainer(BaseTrainer):
                             if ptx_policy_output['aux_loss'] is not None and self.train_config.loss_config.aux_loss_coef:
                                 ptx_aux_loss = self.train_config.loss_config.aux_loss_coef * ptx_policy_output['aux_loss']
                     # end
-
-                total_loss_unscaled = loss + aux_loss + ppo_config.ptx_coef * (ptx_loss + ptx_aux_loss)
+                ppo_loss_unscaled = loss + aux_loss
+                ptx_loss_unscaled = ppo_config.ptx_coef * (ptx_loss + ptx_aux_loss)
 
                 if self.is_ds:
                     need_update_step = self.train_model.is_gradient_accumulation_boundary()
@@ -597,9 +599,13 @@ class PPOTrainer(BaseTrainer):
                     micro_batch_idx = i // ppo_batch_size
                     need_update_step = ((micro_batch_idx + 1) % self.gradient_accumulation_steps == 0)
 
-                self._backward_loss(total_loss_unscaled, self.gradient_accumulation_steps)
+                if has_ptx:
+                    self._backward_loss(ppo_loss_unscaled, self.gradient_accumulation_steps, step=False)
+                    self._backward_loss(ptx_loss_unscaled, self.gradient_accumulation_steps, step=True)
+                else:
+                    self._backward_loss(ppo_loss_unscaled, self.gradient_accumulation_steps)
 
-                ppo_stats["loss"] += total_loss_unscaled.detach().item()
+                ppo_stats["loss"] += (ppo_loss_unscaled + ptx_loss_unscaled).detach().item()
                 ppo_stats["moe_aux_loss"] += aux_loss.detach().item()
                 ppo_stats["actor_loss"] += actor_loss.detach().item()
                 ppo_stats["value_loss"] += value_loss.detach().item()

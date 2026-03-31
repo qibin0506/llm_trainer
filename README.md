@@ -46,7 +46,8 @@ def init_env():
     os.environ['DIST_CHECKPOINT_DIR'] = 'ckpt_dir'
     # 常用配置
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    os.environ['CKPT_MAX_TO_KEEP'] = '2' # 最多保留几个ckpt
+    # 最多保留几个ckpt
+    os.environ['CKPT_MAX_TO_KEEP'] = '2'
 
 ```
 

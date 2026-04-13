@@ -521,25 +521,26 @@ class BaseTrainer:
             return torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
 
     def _eval(self, tag: str):
+        eval_prompt = self._get_eval_data()
+        if eval_prompt is None:
+            return
+
         with unwrap_model_for_generation(self.train_model) as eval_model:
             if TrainerTools().parallel.is_main_process:
-                eval_prompt = self._get_eval_data()
+                eval_model = self._check_eval_model(eval_model)
+                eval_model.eval()
 
-                if eval_prompt:
-                    eval_model = self._check_eval_model(eval_model)
-                    eval_model.eval()
+                eval_pixel_values, tokens_per_image = self._get_eval_pixel_values_and_tokens_count(self.eval_idx)
+                submit_gen_task(
+                    eval_model,
+                    self.train_config,
+                    tag=tag,
+                    prompt=eval_prompt,
+                    pixel_values=eval_pixel_values,
+                    tokens_per_image=tokens_per_image
+                )
 
-                    eval_pixel_values, tokens_per_image = self._get_eval_pixel_values_and_tokens_count(self.eval_idx)
-                    submit_gen_task(
-                        eval_model,
-                        self.train_config,
-                        tag=tag,
-                        prompt=eval_prompt,
-                        pixel_values=eval_pixel_values,
-                        tokens_per_image=tokens_per_image
-                    )
-
-                    eval_model.train()
+                eval_model.train()
 
         TrainerTools().parallel.wait('eval')
 

@@ -9,7 +9,8 @@ from .parallel import DsParallel
 from .scheduler import LRScheduler
 from .tools import TrainerTools
 
-DEFAULT_CHECKPOINT_NAME = "checkpoint.pth"
+_DEFAULT_MODEL_NAME = "model.pth"
+_DEFAULT_STEPS_NAME = 'steps.pt'
 
 def save_checkpoint(
         model: nn.Module,
@@ -21,7 +22,9 @@ def save_checkpoint(
         save_ds_checkpoint(model, extra_module=extra_module)
     else:
         if TrainerTools().parallel.is_main_process:
-            checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)
+            ckpt_dir = _get_ckpt_dir()
+            checkpoint_path = os.path.join(ckpt_dir, _DEFAULT_MODEL_NAME)
+
             ckpt = {'model_state_dict': model.state_dict()}
 
             if optimizer:
@@ -30,7 +33,7 @@ def save_checkpoint(
             if extra_module:
                 ckpt.update({'extra_module_state_dict': extra_module.state_dict()})
 
-            torch.save(ckpt, checkpoint_name)
+            torch.save(ckpt, checkpoint_path)
 
 
 def load_checkpoint(
@@ -44,10 +47,11 @@ def load_checkpoint(
         from .ds_checkpoint import load_ds_checkpoint
         load_ds_checkpoint(model, load_module_only=load_module_only, extra_module=extra_module)
     else:
-        checkpoint_name = os.environ.get('CHECKPOINT_NAME', DEFAULT_CHECKPOINT_NAME)
+        ckpt_dir = _get_ckpt_dir()
+        checkpoint_path = os.path.join(ckpt_dir, _DEFAULT_MODEL_NAME)
 
-        if os.path.exists(checkpoint_name):
-            state_dict = torch.load(checkpoint_name, weights_only=True, map_location=device)
+        if os.path.exists(checkpoint_path):
+            state_dict = torch.load(checkpoint_path, weights_only=True, map_location=device)
             model.load_state_dict(state_dict['model_state_dict'])
 
             if optimizer and 'optim_state_dict' in state_dict:
@@ -64,7 +68,9 @@ def save_steps(
     lr_scheduler: Optional[LRScheduler] = None
 ):
     if TrainerTools().parallel.is_main_process:
-        steps_checkpoint_name = f"{os.environ.get('LOG_DIR', './')}steps.pt"
+        ckpt_dir = _get_ckpt_dir()
+        steps_checkpoint_path = os.path.join(ckpt_dir, _DEFAULT_STEPS_NAME)
+
         ckpt = {
             'epoch': epoch,
             'file_idx': file_idx,
@@ -74,17 +80,19 @@ def save_steps(
         if lr_scheduler:
             ckpt.update(lr_scheduler.get_ckpt_dict())
 
-        torch.save(ckpt, steps_checkpoint_name)
+        torch.save(ckpt, steps_checkpoint_path)
 
 
 def load_steps() -> Optional[dict]:
     steps_dict = None
 
     if TrainerTools().parallel.is_main_process:
-        steps_checkpoint_name = f"{os.environ.get('LOG_DIR', './')}steps.pt"
-        if os.path.exists(steps_checkpoint_name):
+        ckpt_dir = _get_ckpt_dir()
+        steps_checkpoint_path = os.path.join(ckpt_dir, _DEFAULT_STEPS_NAME)
+
+        if os.path.exists(steps_checkpoint_path):
             try:
-                steps_dict = torch.load(steps_checkpoint_name, weights_only=True)
+                steps_dict = torch.load(steps_checkpoint_path, weights_only=True)
             except:
                 steps_dict = None
 
@@ -95,3 +103,10 @@ def load_steps() -> Optional[dict]:
         TrainerTools().parallel.wait('broadcast steps_dict')
 
     return steps_dict
+
+
+def _get_ckpt_dir():
+    ckpt_dir = os.environ.get('CHECKPOINT_DIR', './checkpoints')
+    if TrainerTools().parallel.is_main_process:
+        os.makedirs(ckpt_dir, exist_ok=True)
+    return ckpt_dir

@@ -42,8 +42,8 @@ def init_env():
     os.environ['TOKEN_DIR'] = './tokens/'
     # 日志与 Checkpoint 目录
     os.environ['LOG_DIR'] = './log/'
-    # DeepSpeed Checkpoint 目录
-    os.environ['DIST_CHECKPOINT_DIR'] = 'ckpt_dir'
+    # Checkpoint 目录
+    os.environ['CHECKPOINT_DIR'] = 'ckpt_dir'
     # 常用配置
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     # 最多保留几个ckpt

@@ -82,7 +82,7 @@ def empty_cache():
         torch.npu.empty_cache()
     elif hasattr(torch, 'mlu') and torch.mlu.is_available():
         torch.mlu.empty_cache()
-    elif torch.mps.is_available():
+    elif hasattr(torch.backends, 'mps') and torch.mps.is_available():
         torch.mps.empty_cache()
 
 

@@ -197,7 +197,7 @@ class BaseTrainer:
             if ('zero_optimization' in self.parallel_kwargs
                     and 'offload_optimizer' in self.parallel_kwargs['zero_optimization']
                     and self.parallel_kwargs['zero_optimization']['offload_optimizer']['device'] == 'cpu'):
-                if TrainerTools().parallel.device_type != 'cpu':
+                if torch.cuda.is_available():
                     if self.train_config.optim_config.optim_type == 'lion':
                         if version.parse(importlib.metadata.version("deepspeed")) >= version.parse('0.17.6'):
                             optimizer = deepspeed.ops.lion.DeepSpeedCPULion
@@ -210,7 +210,7 @@ class BaseTrainer:
                     else:
                         optimizer = deepspeed.ops.adam.DeepSpeedCPUAdam
             else:
-                if TrainerTools().parallel.device_type != 'cpu':
+                if torch.cuda.is_available():
                     if self.train_config.optim_config.optim_type == 'lion':
                         optimizer = deepspeed.ops.lion.FusedLion
                     else:

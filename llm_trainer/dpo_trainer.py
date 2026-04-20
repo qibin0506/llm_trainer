@@ -14,7 +14,8 @@ from .utils import (
     autocast,
     get_dpo_collate_fn,
     log_softmax,
-    disable_dropout_in_model
+    disable_dropout_in_model,
+    empty_cache
 )
 
 from .checkpoint import (
@@ -363,7 +364,7 @@ class DPOTrainer(BaseTrainer):
                     TrainerTools().parallel._sampler = None
 
                 gc.collect()
-                torch.cuda.empty_cache()
+                empty_cache()
 
             # end epoch
 

@@ -19,7 +19,8 @@ from .utils import (
     get_sft_collate_fn,
     log_softmax,
     disable_dropout_in_model,
-    calc_position_ids
+    calc_position_ids,
+    empty_cache
 )
 from .partition_utils import (
     sync_model_params,
@@ -459,7 +460,7 @@ class GRPOTrainer(BaseTrainer):
                         rollout_data = self._generate_rollout_data(generate_model, batch_data)
                     # end generate
 
-                    torch.cuda.empty_cache()
+                    empty_cache()
 
                     try:
                         if TrainerTools().parallel.is_main_process:
@@ -529,7 +530,7 @@ class GRPOTrainer(BaseTrainer):
                     TrainerTools().parallel._sampler = None
 
                 gc.collect()
-                torch.cuda.empty_cache()
+                empty_cache()
 
             # end epoch
 

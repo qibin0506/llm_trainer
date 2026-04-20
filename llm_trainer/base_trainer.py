@@ -42,7 +42,8 @@ from .utils import (
     set_seed,
     autocast,
     is_bf16_supported,
-    is_fp16_supported
+    is_fp16_supported,
+    empty_cache
 )
 
 from .log import Logger
@@ -74,7 +75,7 @@ class BaseTrainer:
 
         self.parallel_kwargs, self.data_loader_kwargs, self.sampler_kwargs = self._convert_train_args()
         # initialize a GradScaler. If enabled=False scaler is a no-op
-        self.scaler = torch.GradScaler(enabled=TrainerTools().use_amp)
+        self._init_scaler()
 
         # 注意：学习率要根据GPU的数量进行倍增：
         # 在训练的过程中，损失梯度决定下降的方向，学习率决定下降的步长。如果有两块gpu，前进的综合步长为：平均学习率*2
@@ -89,6 +90,21 @@ class BaseTrainer:
         self._apply_restore_ckpt()
 
         set_seed(default_seed + TrainerTools().parallel.global_rank)
+
+    def _init_scaler(self):
+        device_type = TrainerTools().parallel.device_type
+
+        try:
+            self.scaler = torch.amp.GradScaler(device=device_type, enabled=TrainerTools().use_amp)
+        except (AttributeError, TypeError, ValueError):
+            if device_type == 'mlu' and hasattr(torch, 'mlu') and hasattr(torch.mlu, 'amp'):
+                self.scaler = torch.mlu.amp.GradScaler(enabled=TrainerTools().use_amp)
+            elif device_type == 'npu' and hasattr(torch, 'npu') and hasattr(torch.npu, 'amp'):
+                self.scaler = torch.npu.amp.GradScaler(enabled=TrainerTools().use_amp)
+            elif device_type == 'mps' or device_type == 'cpu':
+                self.scaler = torch.cuda.amp.GradScaler(enabled=False)
+            else:
+                self.scaler = torch.cuda.amp.GradScaler(enabled=TrainerTools().use_amp)
 
     def _new_model(self, train_config: TrainConfig):
         return LlmModel(train_config.model_config)
@@ -175,12 +191,13 @@ class BaseTrainer:
 
         if (self.train_config.optim_config.auto_optimize_optimizer
                 and isinstance(TrainerTools().parallel, DsParallel)
-                and self.parallel_kwargs):
+                and self.parallel_kwargs
+        ):
             import deepspeed
             if ('zero_optimization' in self.parallel_kwargs
                     and 'offload_optimizer' in self.parallel_kwargs['zero_optimization']
                     and self.parallel_kwargs['zero_optimization']['offload_optimizer']['device'] == 'cpu'):
-                if torch.cuda.is_available():
+                if TrainerTools().parallel.device_type != 'cpu':
                     if self.train_config.optim_config.optim_type == 'lion':
                         if version.parse(importlib.metadata.version("deepspeed")) >= version.parse('0.17.6'):
                             optimizer = deepspeed.ops.lion.DeepSpeedCPULion
@@ -193,7 +210,7 @@ class BaseTrainer:
                     else:
                         optimizer = deepspeed.ops.adam.DeepSpeedCPUAdam
             else:
-                if torch.cuda.is_available():
+                if TrainerTools().parallel.device_type != 'cpu':
                     if self.train_config.optim_config.optim_type == 'lion':
                         optimizer = deepspeed.ops.lion.FusedLion
                     else:
@@ -512,14 +529,6 @@ class BaseTrainer:
 
         raise e
 
-    def _get_model_dtype(self):
-        if isinstance(TrainerTools().parallel, DsParallel):
-            import deepspeed
-            assert isinstance(self.train_model, deepspeed.DeepSpeedEngine)
-            return self.train_model.get_data_types()[0]
-        else:
-            return torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
-
     def _eval(self, tag: str):
         eval_prompt = self._get_eval_data()
         if eval_prompt is None:
@@ -730,7 +739,7 @@ class BaseTrainer:
                     TrainerTools().parallel._sampler = None
 
                 gc.collect()
-                torch.cuda.empty_cache()
+                empty_cache()
 
             # end epoch
 

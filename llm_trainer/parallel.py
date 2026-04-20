@@ -19,8 +19,13 @@ from .log import Logger
 def _get_optimal_backend():
     if torch.cuda.is_available() and dist.is_nccl_available():
         return 'nccl'
+
+    if hasattr(torch, 'mlu') and torch.mlu.is_available() and hasattr(dist, 'is_cncl_available') and dist.is_cncl_available():
+        return 'cncl'
+
     if hasattr(dist, 'is_hccl_available') and dist.is_hccl_available():
         return 'hccl'
+
     return 'gloo'
 
 
@@ -61,18 +66,22 @@ class Parallel(ABC):
                 self.device_type = 'cuda'
                 self.device = f'cuda:{self._local_rank}'
                 torch.cuda.set_device(self.device)
+            elif self.dist_backend == 'cncl':
+                self.device_type = 'mlu'
+                self.device = f'mlu:{self._local_rank}'
+                torch.mlu.set_device(self.device)
             elif self.dist_backend == 'hccl':
                 self.device_type = 'npu'
                 self.device = f'npu:{self._local_rank}'
                 torch.npu.set_device(self.device)
             else:
-                if torch.backends.mps.is_available():
-                    self.device_type = 'mps'
-                    self.device = 'mps'
-                elif torch.cuda.is_available():
+                if torch.cuda.is_available():
                     self.device_type = 'cuda'
                     self.device = f'cuda:{self._local_rank}'
                     torch.cuda.set_device(self.device)
+                elif torch.backends.mps.is_available():
+                    self.device_type = 'mps'
+                    self.device = 'mps'
                 else:
                     self.device_type = 'cpu'
                     self.device = 'cpu'
@@ -124,10 +133,12 @@ class Parallel(ABC):
         if self._use_parallel:
             if self.device_type == 'cuda':
                 torch.cuda.synchronize(device=self.device)
-            elif self.device_type == 'mps':
-                torch.mps.synchronize()
             elif self.device_type == 'npu':
                 torch.npu.synchronize()
+            elif self.device_type == 'mlu':
+                torch.mlu.synchronize()
+            elif self.device_type == 'mps':
+                torch.mps.synchronize()
             else: ...
 
     def destroy(self):

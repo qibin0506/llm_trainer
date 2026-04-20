@@ -18,7 +18,7 @@ class TrainerTools:
             self.parallel = self._new_parallel()
 
             self.tokenizer = Tokenizer()
-            self.use_amp = 'cuda' in self.parallel.device and not isinstance(self.parallel, DsParallel)
+            self.use_amp = (self.parallel.device_type != 'cpu') and not isinstance(self.parallel, DsParallel)
 
             Logger.std_log(f'word_size={self.parallel.world_size}, use_amp={self.use_amp}')
 

@@ -25,7 +25,8 @@ from .utils import (
     masked_whiten,
     disable_dropout_in_model,
     calc_position_ids,
-    RunningMeanStd
+    RunningMeanStd,
+    empty_cache
 )
 from .checkpoint import (
     save_checkpoint,
@@ -658,7 +659,7 @@ class PPOTrainer(BaseTrainer):
                     batch = skip_batches + batch
 
                     rollout_data = self._generate_rollout_data(batch_data)
-                    torch.cuda.empty_cache()
+                    empty_cache()
 
                     try:
                         ppo_stats = self._ppo_learning_phase(rollout_data)
@@ -740,7 +741,7 @@ class PPOTrainer(BaseTrainer):
                     TrainerTools().parallel._sampler = None
 
                 gc.collect()
-                torch.cuda.empty_cache()
+                empty_cache()
 
             # end epoch
 

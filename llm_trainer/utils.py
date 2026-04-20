@@ -18,10 +18,14 @@ def set_seed(seed):
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
+    if hasattr(torch, 'mlu') and torch.mlu.is_available():
+        torch.mlu.manual_seed(seed)
+        torch.mlu.manual_seed_all(seed)
+
 
 def autocast(device_type):
     if TrainerTools().use_amp:
-        dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+        dtype = torch.bfloat16 if is_bf16_supported() else torch.float16
         return torch.autocast(
             device_type=device_type,
             dtype=dtype,
@@ -46,14 +50,40 @@ def is_bf16_supported():
     if hasattr(torch, 'npu') and torch.npu.is_available():
         return True
 
+    if hasattr(torch, 'mlu') and torch.mlu.is_available():
+        return True
+
     if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-        return False
+        return True
 
     return False
 
 
 def is_fp16_supported():
-    return torch.cuda.is_available() or (hasattr(torch, 'npu') and torch.npu.is_available())
+    if torch.cuda.is_available():
+        return True
+
+    if hasattr(torch, 'npu') and torch.npu.is_available():
+        return True
+
+    if hasattr(torch, 'mlu') and torch.mlu.is_available():
+        return True
+
+    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        return True
+
+    return False
+
+
+def empty_cache():
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif hasattr(torch, 'npu') and torch.npu.is_available():
+        torch.npu.empty_cache()
+    elif hasattr(torch, 'mlu') and torch.mlu.is_available():
+        torch.mlu.empty_cache()
+    elif torch.mps.is_available():
+        torch.mps.empty_cache()
 
 
 def create_doc_boundary_mask(

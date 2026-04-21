@@ -91,6 +91,11 @@ class BaseTrainer:
 
         set_seed(default_seed + TrainerTools().parallel.global_rank)
 
+        if TrainerTools().parallel.is_main_process:
+            print(f'parallel_kwargs={self.parallel_kwargs}')
+            print(f'data_loader_kwargs={self.data_loader_kwargs}')
+            print(f'sampler_kwargs={self.sampler_kwargs}')
+
     def _init_scaler(self):
         device_type = TrainerTools().parallel.device_type
 
@@ -343,7 +348,8 @@ class BaseTrainer:
 
             if (self.train_config.ds_config.bf16_config is not None
                     and self.train_config.ds_config.bf16_config.enabled
-                    and is_bf16_supported()):
+                    and is_bf16_supported()
+            ):
                 bf16_config = self.train_config.ds_config.bf16_config
                 bf16 = {
                     'enabled': bf16_config.enabled

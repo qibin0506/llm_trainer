@@ -18,14 +18,27 @@ def set_seed(seed):
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    if hasattr(torch, 'mlu') and torch.mlu.is_available():
+    device_type = TrainerTools().parallel.device_type
+
+    if device_type == 'mlu':
         torch.mlu.manual_seed(seed)
         torch.mlu.manual_seed_all(seed)
+    elif device_type == 'npu':
+        torch.npu.manual_seed(seed)
+        torch.npu.manual_seed_all(seed)
+    elif device_type == 'mps':
+        torch.mps.manual_seed(seed)
 
 
 def autocast(device_type):
     if TrainerTools().use_amp:
-        dtype = torch.bfloat16 if is_bf16_supported() else torch.float16
+        if is_bf16_supported():
+            dtype = torch.bfloat16
+        elif is_fp16_supported():
+            dtype = torch.float16
+        else:
+            dtype = torch.float32
+
         return torch.autocast(
             device_type=device_type,
             dtype=dtype,
@@ -37,7 +50,9 @@ def autocast(device_type):
 
 
 def is_bf16_supported():
-    if torch.cuda.is_available():
+    device_type = TrainerTools().parallel.device_type
+
+    if device_type == 'cuda':
         if hasattr(torch.cuda, 'is_bf16_supported'):
             return torch.cuda.is_bf16_supported()
         else:
@@ -47,43 +62,51 @@ def is_bf16_supported():
             except:
                 return False
 
-    if hasattr(torch, 'npu') and torch.npu.is_available():
+    if device_type == 'mlu':
+        if hasattr(torch.mlu, 'is_bf16_supported'):
+            return torch.mlu.is_bf16_supported()
+        return False
+
+    if device_type == 'npu':
         return True
 
-    if hasattr(torch, 'mlu') and torch.mlu.is_available():
-        return True
-
-    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-        return True
+    if device_type == 'mps':
+        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            return True
 
     return False
 
 
 def is_fp16_supported():
-    if torch.cuda.is_available():
+    device_type = TrainerTools().parallel.device_type
+
+    if device_type == 'cuda':
         return True
 
-    if hasattr(torch, 'npu') and torch.npu.is_available():
+    if device_type == 'mlu':
         return True
 
-    if hasattr(torch, 'mlu') and torch.mlu.is_available():
+    if device_type == 'npu':
         return True
 
-    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-        return True
+    if device_type == 'mps':
+        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            return True
 
     return False
 
 
 def empty_cache():
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    elif hasattr(torch, 'npu') and torch.npu.is_available():
+    device_type = TrainerTools().parallel.device_type
+
+    if device_type == 'npu' and hasattr(torch, 'npu') and torch.npu.is_available():
         torch.npu.empty_cache()
-    elif hasattr(torch, 'mlu') and torch.mlu.is_available():
+    elif device_type == 'mlu' and hasattr(torch, 'mlu') and torch.mlu.is_available():
         torch.mlu.empty_cache()
-    elif hasattr(torch.backends, 'mps') and torch.mps.is_available():
+    elif device_type == 'mps' and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
         torch.mps.empty_cache()
+    elif device_type == 'cuda' and torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def create_doc_boundary_mask(

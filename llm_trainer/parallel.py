@@ -17,6 +17,10 @@ from .log import Logger
 
 
 def _get_optimal_backend():
+    user_backend = os.environ.get('USER_BACKEND', '')
+    if user_backend != '':
+        return user_backend
+
     if hasattr(torch, 'mlu') and torch.mlu.is_available() and hasattr(dist, 'is_cncl_available') and dist.is_cncl_available():
         return 'cncl'
 
@@ -75,11 +79,20 @@ class Parallel(ABC):
                 self.device = f'npu:{self._local_rank}'
                 torch.npu.set_device(self.device)
             else:
-                if torch.cuda.is_available():
+                # gloo
+                if hasattr(torch, 'mlu') and torch.mlu.is_available():
+                    self.device_type = 'mlu'
+                    self.device = f'mlu:{self._local_rank}'
+                    torch.mlu.set_device(self.device)
+                elif hasattr(torch, 'npu') and torch.npu.is_available():
+                    self.device_type = 'npu'
+                    self.device = f'npu:{self._local_rank}'
+                    torch.npu.set_device(self.device)
+                elif torch.cuda.is_available():
                     self.device_type = 'cuda'
                     self.device = f'cuda:{self._local_rank}'
                     torch.cuda.set_device(self.device)
-                elif torch.backends.mps.is_available():
+                elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
                     self.device_type = 'mps'
                     self.device = 'mps'
                 else:
@@ -88,18 +101,24 @@ class Parallel(ABC):
 
             if _init_process_group:
                 dist.init_process_group(backend=self.dist_backend)
-
-            Logger.std_log(f'Backend={self.dist_backend}, global_rank={self._global_rank}, local_rank={self._local_rank}, world_size={self.world_size}, device={self.device}')
         else:
-            if torch.cuda.is_available():
-                device = "cuda"
+            if hasattr(torch, 'mlu') and torch.mlu.is_available():
+                self.device_type = 'mlu'
+                self.device = "mlu"
+            elif hasattr(torch, 'npu') and torch.npu.is_available():
+                self.device_type = 'npu'
+                self.device = "npu"
+            elif torch.cuda.is_available():
+                self.device_type = 'cuda'
+                self.device = "cuda"
             elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                device = "mps"
+                self.device_type = 'mps'
+                self.device = "mps"
             else:
-                device = "cpu"
+                self.device_type = 'cpu'
+                self.device = "cpu"
 
-            self.device: str = device
-            self.device_type: str = device
+        Logger.std_log(f'backend={self.dist_backend}, global_rank={self._global_rank}, local_rank={self._local_rank}, world_size={self.world_size}, device_type={self.device_type}, device={self.device}')
 
     @abstractmethod
     def process(

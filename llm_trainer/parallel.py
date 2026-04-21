@@ -17,14 +17,14 @@ from .log import Logger
 
 
 def _get_optimal_backend():
-    if torch.cuda.is_available() and dist.is_nccl_available():
-        return 'nccl'
-
     if hasattr(torch, 'mlu') and torch.mlu.is_available() and hasattr(dist, 'is_cncl_available') and dist.is_cncl_available():
         return 'cncl'
 
     if hasattr(dist, 'is_hccl_available') and dist.is_hccl_available():
         return 'hccl'
+
+    if torch.cuda.is_available() and dist.is_nccl_available():
+        return 'nccl'
 
     return 'gloo'
 

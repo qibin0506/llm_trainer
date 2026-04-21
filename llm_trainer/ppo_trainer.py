@@ -677,7 +677,11 @@ class PPOTrainer(BaseTrainer):
                         ], device=TrainerTools().parallel.device)
 
                         if TrainerTools().parallel.parallel_train:
-                            dist.all_reduce(stats_tensor, op=dist.ReduceOp.AVG)
+                            if TrainerTools().parallel.device_type == 'mlu':
+                                dist.all_reduce(stats_tensor, op=dist.ReduceOp.SUM)
+                                stats_tensor.div_(TrainerTools().parallel.world_size)
+                            else:
+                                dist.all_reduce(stats_tensor, dist.ReduceOp.AVG)
 
                         ppo_stats['loss'] = stats_tensor[0].item()
                         ppo_stats['moe_aux_loss'] = stats_tensor[1].item()

@@ -583,7 +583,11 @@ class BaseTrainer:
         stacked_losses = torch.stack(loss_tensors)
         # 跨卡同步平均
         if TrainerTools().parallel.parallel_train:
-            dist.all_reduce(stacked_losses, dist.ReduceOp.AVG)
+            if TrainerTools().parallel.device_type == 'mlu':
+                dist.all_reduce(stacked_losses, op=dist.ReduceOp.SUM)
+                stacked_losses.div_(TrainerTools().parallel.world_size)
+            else:
+                dist.all_reduce(stacked_losses, dist.ReduceOp.AVG)
 
         return stacked_losses.detach().cpu().tolist()
 

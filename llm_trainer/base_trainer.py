@@ -92,9 +92,9 @@ class BaseTrainer:
         set_seed(default_seed + TrainerTools().parallel.global_rank)
 
         if TrainerTools().parallel.is_main_process:
-            print(f'parallel_kwargs={self.parallel_kwargs}')
-            print(f'data_loader_kwargs={self.data_loader_kwargs}')
-            print(f'sampler_kwargs={self.sampler_kwargs}')
+            Logger.std_log(f'parallel_kwargs={self.parallel_kwargs}')
+            Logger.std_log(f'data_loader_kwargs={self.data_loader_kwargs}')
+            Logger.std_log(f'sampler_kwargs={self.sampler_kwargs}')
 
     def _init_scaler(self):
         device_type = TrainerTools().parallel.device_type

@@ -511,7 +511,7 @@ class BaseTrainer:
     def _get_eval_pixel_values_and_tokens_count(self, eval_idx):
         return None, None
 
-    def _log(self, keys: Dict[str, any], values: Dict[str, any]):
+    def _log(self, keys: Dict[str, Any], values: Dict[str, Any]):
         """
         格式：keys_key1: keys_value1, keys_key2: keys_value2 -> values_key1: values_value1, values_key2: values_value2
         """
@@ -703,9 +703,9 @@ class BaseTrainer:
                                     'batch': f'{batch + 1}/{batch_count_per_file}'
                                 },
                                 values={
-                                    'loss': avg_loss,
-                                    'moe_aux_loss': avg_aux_loss,
-                                    'perplexity': round(perplexity, 4)
+                                    'loss/total': avg_loss,
+                                    'loss/moe_aux': avg_aux_loss,
+                                    'metrics/ppl': round(perplexity, 4) if avg_ce_loss > 0 else float('inf')
                                 }
                             )
 

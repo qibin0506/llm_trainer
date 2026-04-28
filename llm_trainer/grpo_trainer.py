@@ -64,6 +64,21 @@ class GRPOTrainer(BaseTrainer):
             assert self.ptx_builder is not None
             self.ptx_criterion = self._init_ptx_loss()
 
+        if self.grpo_config.loss_type == "luspo" and self.grpo_config.loss_importance_sampling_level != "sequence":
+            if TrainerTools().parallel.is_main_process:
+                Logger.std_log(
+                    "WARN: When using 'luspo' loss, `loss_importance_sampling_level` should ideally "
+                    "be set to 'sequence' to properly mirror the Length-Bias mitigation setup from the LUSPO paper."
+                )
+
+        # 校验 VESPO 的配置冗余
+        if self.grpo_config.loss_type == "vespo" and self.grpo_config.loss_importance_sampling_level != "token":
+            if TrainerTools().parallel.is_main_process:
+                Logger.std_log(
+                    "WARN: VESPO computes sequence-level importance weights internally. "
+                    "Your `loss_importance_sampling_level` setting will be ignored for the Gamma weights computation."
+                )
+
     def _init_ref_model(self):
         # beta == 0，不需要ref_model
         if self.grpo_config.loss_beta == 0.0:
@@ -96,7 +111,13 @@ class GRPOTrainer(BaseTrainer):
             clip_eps_high=self.grpo_config.loss_clip_eps_high,
             delta=self.grpo_config.loss_delta,
             importance_sampling_level=self.grpo_config.loss_importance_sampling_level,
-            loss_type=self.grpo_config.loss_type
+            loss_type=self.grpo_config.loss_type,
+            sapo_temperature_pos=self.grpo_config.sapo_temperature_pos,
+            sapo_temperature_neg=self.grpo_config.sapo_temperature_neg,
+            vespo_k_pos=self.grpo_config.vespo_k_pos,
+            vespo_lambda_pos=self.grpo_config.vespo_lambda_pos,
+            vespo_k_neg=self.grpo_config.vespo_k_neg,
+            vespo_lambda_neg=self.grpo_config.vespo_lambda_neg,
         )
 
         return criterion, None
@@ -302,6 +323,9 @@ class GRPOTrainer(BaseTrainer):
             "ptx_loss": 0.0,
             "ptx_aux_loss": 0.0,
             "approx_kl": 0.0,
+            "clip_frac": 0.0,
+            "entropy": 0.0,
+            "completion_len": 0.0,
             "rewards": rollout_data['rewards'].mean().item(),
         }
 
@@ -331,7 +355,7 @@ class GRPOTrainer(BaseTrainer):
                     else:
                         padded_completion_mask = mb_completion_mask
 
-                    loss = self.criterion(
+                    loss, clip_frac = self.criterion(
                         log_probs=log_probs,
                         old_log_probs=mb_old_log_probs,
                         ref_log_probs=mb_ref_log_probs,
@@ -339,6 +363,10 @@ class GRPOTrainer(BaseTrainer):
                         advantages=mb_advantages,
                         completion_len=mb_completion_ids.shape[1]
                     )
+
+                    with torch.no_grad():
+                        entropy = -(log_probs * padded_completion_mask).sum() / padded_completion_mask.sum().clamp(min=1.0)
+                        completion_len = padded_completion_mask.sum(dim=-1).float().mean()
 
                     if aux_loss is not None and self.train_config.loss_config.aux_loss_coef:
                         aux_loss = self.train_config.loss_config.aux_loss_coef * aux_loss
@@ -396,17 +424,19 @@ class GRPOTrainer(BaseTrainer):
                 grpo_stats["ptx_loss"] += ptx_loss.detach().item()
                 grpo_stats["ptx_aux_loss"] += ptx_aux_loss.detach().item()
                 grpo_stats["approx_kl"] += approx_kl.detach().item()
+                grpo_stats["clip_frac"] += clip_frac.detach().item()
+                grpo_stats["entropy"] += entropy.detach().item()
+                grpo_stats["completion_len"] += completion_len.detach().item()
                 total_micro_batches_processed += 1
 
                 if need_update_step:
                     self._update_step()
 
         if total_micro_batches_processed > 0:
-            grpo_stats["loss"] /= total_micro_batches_processed
-            grpo_stats["moe_aux_loss"] /= total_micro_batches_processed
-            grpo_stats["ptx_loss"] /= total_micro_batches_processed
-            grpo_stats["ptx_aux_loss"] /= total_micro_batches_processed
-            grpo_stats["approx_kl"] /= total_micro_batches_processed
+            for key in ["loss", "moe_aux_loss", "ptx_loss",
+                        "ptx_aux_loss", "approx_kl", "clip_frac",
+                        "entropy", "completion_len"]:
+                grpo_stats[key] /= total_micro_batches_processed
 
         return grpo_stats
 
@@ -473,8 +503,11 @@ class GRPOTrainer(BaseTrainer):
                             grpo_stats['moe_aux_loss'],
                             grpo_stats["ptx_loss"],
                             grpo_stats["ptx_aux_loss"],
-                            grpo_stats['rewards'],
-                            grpo_stats['approx_kl']
+                            grpo_stats['approx_kl'],
+                            grpo_stats['clip_frac'],
+                            grpo_stats['entropy'],
+                            grpo_stats['completion_len'],
+                            grpo_stats['rewards']
                         ], device=TrainerTools().parallel.device)
 
                         if TrainerTools().parallel.parallel_train:
@@ -484,13 +517,6 @@ class GRPOTrainer(BaseTrainer):
                             else:
                                 dist.all_reduce(stats_tensor, dist.ReduceOp.AVG)
 
-                        avg_loss = stats_tensor[0].item()
-                        avg_moe_aux_loss = stats_tensor[1].item()
-                        avg_ptx_loss = stats_tensor[2].item()
-                        avg_ptx_aux_loss = stats_tensor[3].item()
-                        avg_rewards = stats_tensor[4].item()
-                        avg_kl = stats_tensor[5].item()
-
                         self._log(
                             keys={
                                 'epoch': epoch,
@@ -498,12 +524,15 @@ class GRPOTrainer(BaseTrainer):
                                 'batch': f'{batch + 1}/{batch_count_per_file}',
                             },
                             values={
-                                'loss': avg_loss,
-                                'moe_aux_loss': avg_moe_aux_loss,
-                                'ptx_loss': avg_ptx_loss,
-                                'ptx_aux_loss': avg_ptx_aux_loss,
-                                'approx_kl': avg_kl,
-                                'rewards': avg_rewards
+                                'loss/total': stats_tensor[0].item(),
+                                'loss/moe_aux': stats_tensor[1].item(),
+                                'loss/ptx': stats_tensor[2].item(),
+                                'loss/ptx_aux': stats_tensor[3].item(),
+                                'rl/approx_kl': stats_tensor[4].item(),
+                                'rl/clip_frac': stats_tensor[5].item(),
+                                'rl/entropy': stats_tensor[6].item(),
+                                'env/completion_len': stats_tensor[7].item(),
+                                'env/reward_total': stats_tensor[8].item()
                             }
                         )
 

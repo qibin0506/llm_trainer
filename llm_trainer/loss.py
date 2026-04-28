@@ -1,4 +1,5 @@
 from typing import List, Optional
+import math
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -196,7 +197,9 @@ class PPOLoss(nn.Module):
             clipped = ratio.gt(1.0 + self.clip_eps) | ratio.lt(1.0 - self.clip_eps)
             clip_frac = torch.sum(clipped.float() * mask) / mask.sum().clamp(min=1.0)
 
-        return total_loss, actor_loss, value_loss, approx_kl, clip_frac
+            entropy = -torch.sum(log_probs * mask) / mask.sum().clamp(min=1.0)
+
+        return total_loss, actor_loss, value_loss, approx_kl, clip_frac, entropy
 
 
 class GRPOLoss(nn.Module):
@@ -208,6 +211,12 @@ class GRPOLoss(nn.Module):
             delta: Optional[float] = None,
             importance_sampling_level: str = 'token',
             loss_type: str = 'grpo',
+            sapo_temperature_pos: float = 1.0,
+            sapo_temperature_neg: float = 1.0,
+            vespo_k_pos: float = 2.0,
+            vespo_lambda_pos: float = 3.0,
+            vespo_k_neg: float = 3.0,
+            vespo_lambda_neg: float = 2.0,
     ):
         super().__init__()
 
@@ -218,6 +227,49 @@ class GRPOLoss(nn.Module):
         self.importance_sampling_level = importance_sampling_level
         self.loss_type = loss_type
 
+        self.sapo_temperature_pos = sapo_temperature_pos
+        self.sapo_temperature_neg = sapo_temperature_neg
+        self.vespo_k_pos = vespo_k_pos
+        self.vespo_lambda_pos = vespo_lambda_pos
+        self.vespo_k_neg = vespo_k_neg
+        self.vespo_lambda_neg = vespo_lambda_neg
+
+    @staticmethod
+    @torch.no_grad()
+    def get_gamma_weights(
+            advantages: torch.Tensor,
+            log_ratio_per_token: torch.Tensor,
+            mask: torch.Tensor,
+            k_pos: float,
+            lambda_pos: float,
+            k_neg: float,
+            lambda_neg: float,
+    ) -> torch.Tensor:
+        lower_clamp = math.log(1e-8)
+        log_ratio_clamped = torch.clamp(log_ratio_per_token, -20.0, 20.0)
+        seq_log_ratio = torch.sum(log_ratio_clamped * mask, dim=-1, keepdim=True)
+
+        log_w_seq = torch.clamp(seq_log_ratio, lower_clamp, 20.0)
+        w_seq = torch.exp(log_w_seq)
+
+        is_nonneg_adv = advantages >= 0
+        k_seq = torch.where(
+            is_nonneg_adv,
+            torch.tensor(k_pos, device=advantages.device),
+            torch.tensor(k_neg, device=advantages.device)
+        )
+        lambda_seq = torch.where(
+            is_nonneg_adv,
+            torch.tensor(lambda_pos, device=advantages.device),
+            torch.tensor(lambda_neg, device=advantages.device)
+        ).clamp(min=1e-4)
+
+        # log(φ(w)) = λ + k × log(w) - λ × w
+        log_phi = lambda_seq + k_seq * log_w_seq - lambda_seq * w_seq
+        phi_seq = torch.exp(log_phi).nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
+
+        return phi_seq  # (B, 1)
+
     def forward(
             self,
             log_probs: torch.Tensor,
@@ -227,40 +279,75 @@ class GRPOLoss(nn.Module):
             advantages: torch.Tensor,
             completion_len: int
     ) -> torch.Tensor:
-        if self.beta != 0.0:
+        if advantages.dim() == 1:
+            advantages = advantages.unsqueeze(-1)
+
+        if self.beta != 0.0 and ref_log_probs is not None:
             per_token_kl = torch.exp(ref_log_probs - log_probs) - (ref_log_probs - log_probs) - 1
         else:
             per_token_kl = None
 
         log_ratio = log_probs - old_log_probs
-        if self.importance_sampling_level == "seq":
-            # GSPO
-            log_importance_weights = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
-            log_importance_weights = log_importance_weights.unsqueeze(-1)
+        if self.importance_sampling_level == "sequence":
+            log_importance_weights = (log_ratio * completion_mask).sum(-1, keepdim=True) / completion_mask.sum(-1, keepdim=True).clamp(min=1.0)
         else:
-            # GRPO
             log_importance_weights = log_ratio
 
         coef_1 = torch.exp(log_importance_weights)
-        coef_2 = torch.clamp(coef_1, 1 - self.clip_eps_low, 1 + self.clip_eps_high)
 
-        # Two-sided clipping
-        if self.delta is not None:
-            coef_1 = torch.clamp(coef_1, max=self.delta)
+        if self.loss_type == "cispo":
+            clamped_ratios = torch.clamp(coef_1, max=1 + self.clip_eps_high).detach()
+            per_token_loss = -clamped_ratios * advantages * log_probs
 
-        per_token_loss1 = coef_1 * advantages
-        per_token_loss2 = coef_2 * advantages
-        per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+        elif self.loss_type == "sapo":
+            temperatures = torch.where(
+                advantages > 0,
+                torch.tensor(self.sapo_temperature_pos, device=advantages.device),
+                torch.tensor(self.sapo_temperature_neg, device=advantages.device)
+            )
+            soft_coef_1 = torch.sigmoid(temperatures * (coef_1 - 1)) * 4 / temperatures
+            per_token_loss = -soft_coef_1 * advantages
 
-        if self.beta != 0.0:
+        elif self.loss_type == "vespo":
+            phi_seq = self.get_gamma_weights(
+                advantages=advantages,
+                log_ratio_per_token=log_ratio,
+                mask=completion_mask,
+                k_pos=self.vespo_k_pos,
+                lambda_pos=self.vespo_lambda_pos,
+                k_neg=self.vespo_k_neg,
+                lambda_neg=self.vespo_lambda_neg
+            )
+            per_token_loss = -phi_seq * advantages * log_probs
+
+        elif self.loss_type in ["grpo", "bnpo", "dr_grpo", "dapo", "luspo"]:
+            coef_2 = torch.clamp(coef_1, 1 - self.clip_eps_low, 1 + self.clip_eps_high)
+            if self.delta is not None:
+                coef_1 = torch.clamp(coef_1, max=self.delta)
+
+            per_token_loss1 = coef_1 * advantages
+            per_token_loss2 = coef_2 * advantages
+            per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+        else:
+            raise ValueError(f"Unknown loss type: {self.loss_type}")
+
+        if self.beta != 0.0 and per_token_kl is not None:
             per_token_loss = per_token_loss + self.beta * per_token_kl
 
-        if self.loss_type == "bnpo":
+        if self.loss_type in ["grpo", "sapo"]:
+            loss = ((per_token_loss * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)).mean()
+        elif self.loss_type in ["bnpo", "cispo", "dapo", "vespo"]:
             loss = (per_token_loss * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
         elif self.loss_type == "dr_grpo":
             completion_len = max(completion_len, 1)
             loss = (per_token_loss * completion_mask).sum() / (per_token_loss.size(0) * completion_len)
+        elif self.loss_type == "luspo":
+            loss = (per_token_loss * completion_mask).sum(dim=-1).mean()
         else:
             loss = ((per_token_loss * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)).mean()
 
-        return loss
+        with torch.no_grad():
+            is_clipped = (coef_1 > 1 + self.clip_eps_high) | (coef_1 < 1 - self.clip_eps_low)
+            clip_frac = (is_clipped.float() * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
+
+        return loss, clip_frac

@@ -514,7 +514,8 @@ class PPOTrainer(BaseTrainer):
         ppo_stats = {
             "loss": 0.0, "moe_aux_loss": 0.0, "actor_loss": 0.0,
             "value_loss": 0.0, 'ptx_loss': 0.0, 'ptx_aux_loss': 0.0,
-            "approx_kl": 0.0, "clip_frac": 0.0,
+            "approx_kl": 0.0, "clip_frac": 0.0, "entropy": 0.0,
+            "completion_len": 0.0, "value_mean": 0.0, "return_mean": 0.0, "value_error": 0.0
         }
 
         ppo_batch_size = ppo_config.ppo_batch_size
@@ -554,7 +555,7 @@ class PPOTrainer(BaseTrainer):
                     current_log_probs = log_softmax(logits_completion, mb_completion_ids)
                     current_values = value_output[:, prompt_len - 1: -1]
 
-                    loss, actor_loss, value_loss, approx_kl, clip_frac = self.criterion(
+                    loss, actor_loss, value_loss, approx_kl, clip_frac, entropy = self.criterion(
                         log_probs=current_log_probs,
                         old_log_probs=mb_old_log_probs,
                         values=current_values,
@@ -563,6 +564,12 @@ class PPOTrainer(BaseTrainer):
                         advantages=mb_advantages,
                         mask=mb_completion_mask
                     )
+
+                    with torch.no_grad():
+                        value_mean = (mb_values * mb_completion_mask).sum() / mb_completion_mask.sum().clamp(min=1.0)
+                        return_mean = (mb_returns * mb_completion_mask).sum() / mb_completion_mask.sum().clamp(min=1.0)
+                        value_error = value_mean - return_mean
+                        completion_len = mb_completion_mask.sum(dim=-1).float().mean()
 
                     aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
                     if policy_output['aux_loss'] is not None and self.train_config.loss_config.aux_loss_coef:
@@ -614,6 +621,11 @@ class PPOTrainer(BaseTrainer):
                 ppo_stats["ptx_aux_loss"] += ptx_aux_loss.detach().item()
                 ppo_stats["approx_kl"] += approx_kl.detach().item()
                 ppo_stats["clip_frac"] += clip_frac.detach().item()
+                ppo_stats["entropy"] += entropy.detach().item()
+                ppo_stats["completion_len"] += completion_len.detach().item()
+                ppo_stats["value_mean"] += value_mean.detach().item()
+                ppo_stats["return_mean"] += return_mean.detach().item()
+                ppo_stats["value_error"] += value_error.detach().item()
                 total_micro_batches_processed += 1
 
                 if need_update_step:
@@ -673,6 +685,11 @@ class PPOTrainer(BaseTrainer):
                             ppo_stats["ptx_aux_loss"],
                             ppo_stats['approx_kl'],
                             ppo_stats['clip_frac'],
+                            ppo_stats['entropy'],
+                            ppo_stats['completion_len'],
+                            ppo_stats['value_mean'],
+                            ppo_stats['return_mean'],
+                            ppo_stats['value_error'],
                             rollout_data['env_rewards'].item()
                         ], device=TrainerTools().parallel.device)
 
@@ -683,16 +700,6 @@ class PPOTrainer(BaseTrainer):
                             else:
                                 dist.all_reduce(stats_tensor, dist.ReduceOp.AVG)
 
-                        ppo_stats['loss'] = stats_tensor[0].item()
-                        ppo_stats['moe_aux_loss'] = stats_tensor[1].item()
-                        ppo_stats['actor_loss'] = stats_tensor[2].item()
-                        ppo_stats['value_loss'] = stats_tensor[3].item()
-                        ppo_stats["ptx_loss"] = stats_tensor[4].item()
-                        ppo_stats['ptx_aux_loss'] = stats_tensor[5].item()
-                        ppo_stats['approx_kl'] = stats_tensor[6].item()
-                        ppo_stats['clip_frac'] = stats_tensor[7].item()
-                        reward_value = stats_tensor[8].item()
-
                         self._log(
                             keys={
                                 'epoch': epoch,
@@ -700,15 +707,20 @@ class PPOTrainer(BaseTrainer):
                                 'batch': f'{batch + 1}/{batch_count_per_file}'
                             },
                             values={
-                                'loss': ppo_stats['loss'],
-                                'moe_aux_loss': ppo_stats['moe_aux_loss'],
-                                'actor_loss': ppo_stats['actor_loss'],
-                                'value_loss': ppo_stats['value_loss'],
-                                'ptx_loss': ppo_stats["ptx_loss"],
-                                'ptx_aux_loss': ppo_stats["ptx_aux_loss"],
-                                'approx_kl': ppo_stats['approx_kl'],
-                                'clip_frac': ppo_stats['clip_frac'],
-                                'rewards': reward_value
+                                'loss/total': stats_tensor[0].item(),
+                                'loss/moe_aux': stats_tensor[1].item(),
+                                'loss/actor': stats_tensor[2].item(),
+                                'loss/value': stats_tensor[3].item(),
+                                'loss/ptx': stats_tensor[4].item(),
+                                'loss/ptx_aux': stats_tensor[5].item(),
+                                'rl/approx_kl': stats_tensor[6].item(),
+                                'rl/clip_frac': stats_tensor[7].item(),
+                                'rl/entropy': stats_tensor[8].item(),
+                                'value/mean': stats_tensor[10].item(),
+                                'value/return': stats_tensor[11].item(),
+                                'value/error': stats_tensor[12].item(),
+                                'env/completion_len': stats_tensor[9].item(),
+                                'env/reward_total': stats_tensor[13].item()
                             }
                         )
 

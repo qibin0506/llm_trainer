@@ -295,15 +295,15 @@ class DPOTrainer(BaseTrainer):
                                     'batch': f'{batch + 1}/{batch_count_per_file}',
                                 },
                                 values={
-                                    'loss': avg_total_loss,
-                                    'dpo_loss': avg_dpo_loss,
-                                    'moe_aux_loss': avg_aux_loss,
-                                    'nll_loss': avg_nll_loss,
-                                    'perplexity': round(perplexity, 4) if avg_ce_loss > 0 else float('inf'),
-                                    'reward_chosen': avg_chosen_reward,
-                                    'reward_rejected': avg_rejected_reward,
-                                    'reward_margin': avg_reward_margin,
-                                    'reward_accuracy': avg_reward_accuracy
+                                    'loss/total': avg_total_loss,
+                                    'loss/dpo': avg_dpo_loss,
+                                    'loss/moe_aux': avg_aux_loss,
+                                    'loss/nll': avg_nll_loss,
+                                    'metrics/ppl': round(perplexity, 4) if avg_ce_loss > 0 else float('inf'),
+                                    'reward/chosen': avg_chosen_reward,
+                                    'reward/rejected': avg_rejected_reward,
+                                    'reward/margin': avg_reward_margin,
+                                    'reward/accuracy': avg_reward_accuracy
                                 }
                             )
 

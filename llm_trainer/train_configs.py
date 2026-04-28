@@ -247,8 +247,14 @@ class GRPOConfig:
     loss_clip_eps: float = 3e-4
     loss_clip_eps_high: Optional[float] = 4e-4
     loss_delta: Optional[float] = None
-    loss_importance_sampling_level: str = 'seq' # token or seq
-    loss_type: str = 'grpo' # grpo or bnpo or dr_grpo
+    loss_importance_sampling_level: str = 'token' # token or sequence
+    loss_type: str = 'grpo' # grpo, bnpo, dr_grpo, cispo, dapo, luspo, sapo, vespo
+    sapo_temperature_pos: float = 1.0 # for sapo or vespo
+    sapo_temperature_neg: float = 1.0 # for sapo or vespo
+    vespo_k_pos: float = 2.0 # for sapo or vespo
+    vespo_lambda_pos: float = 3.0 # for sapo or vespo
+    vespo_k_neg: float = 3.0 # for sapo or vespo
+    vespo_lambda_neg: float = 2.0 # for sapo or vespo
     ptx_coef: float = 0.0
     gen_max_seq_len: int
     gen_temperature: Optional[float] = None

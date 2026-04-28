@@ -9,6 +9,25 @@ from .utils import (
 )
 
 
+def _repetition_penalty_warper(logits: torch.Tensor, input_ids: torch.Tensor, penalty: float) -> torch.Tensor:
+    """
+    重复性惩罚
+    :param logits: [batch_size, vocab_size]
+    :param input_ids: 到目前为止生成的所有 token (包含 prompt)[batch_size, seq_len]
+    :param penalty: 惩罚系数 (>1.0表示惩罚，1.0表示不生效)
+    :return:
+    """
+    if penalty == 1.0:
+        return logits
+
+    logits = logits.clone()
+    score = torch.gather(logits, 1, input_ids)
+    score = torch.where(score < 0, score * penalty, score / penalty)
+    logits.scatter_(1, input_ids, score)
+
+    return logits
+
+
 def _suppress_warper(logits: torch.Tensor, suppress_tokens: List[int]) -> torch.Tensor:
     """
     抑制特殊token输出
@@ -35,27 +54,27 @@ def _temperature_warper(logits: torch.Tensor, temperature: float) -> torch.Tenso
     return logits
 
 
-def _top_k_warper(logits: torch.Tensor, k: int, device: Union[str, torch.device, int] = None) -> torch.Tensor:
+def _top_k_warper(logits: torch.Tensor, top_k: int, device: Union[str, torch.device, int] = None) -> torch.Tensor:
     """
     top k采样
     :param logits:
-    :param k:
+    :param top_k:
     :param device:
     :return:
     """
-    # [batch, k]
-    topk_logits, _ = torch.topk(logits, k=k)
+    # [batch, top_k]
+    topk_logits, _ = torch.topk(logits, k=top_k)
     # []
     min_val: torch.Tensor = topk_logits[:, -1]
     logits = torch.where(logits < min_val.unsqueeze(-1), torch.full_like(logits, -float("inf")), logits)
     return logits
 
 
-def _top_p_warper(logits: torch.Tensor, p: float, min_tokens_to_keep: int = 1) -> torch.Tensor:
+def _top_p_warper(logits: torch.Tensor, top_p: float, min_tokens_to_keep: int = 1) -> torch.Tensor:
     """
     top p 核采样
     :param logits:
-    :param p:
+    :param top_p:
     :param min_tokens_to_keep:
     :return:
     """
@@ -64,20 +83,20 @@ def _top_p_warper(logits: torch.Tensor, p: float, min_tokens_to_keep: int = 1) -
     # cumsum求和, 每一个元素的值都是与之前元素的求和
     # 例如：torch.cumsum(torch.tensor([[0.1, 0.2, 0.3]]), dim=-1) 结果是: [0.1, 0.3, 0.6]
     cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
-    # 删除累积概率<=1-p的部分, 因为cumulative_probs是正序排列的，所以要用1-p
+    # 删除累积概率<=1-top_p的部分, 因为cumulative_probs是正序排列的，所以要用1-top_p
     # 例如：
-    #   假设 p=0.9，并且经过排序和计算后，我们有以下的 cumulative_probs
+    #   假设 top_p=0.9，并且经过排序和计算后，我们有以下的 cumulative_probs
     #       cumulative_probs = [0.1, 0.3, 0.7, 0.92, 0.98]
-    #       那么 (1 - p) 就是 0.1
-    #       执行 cumulative_probs <= (1 - p) 后，得到的 sorted_indices_to_remove 就是
+    #       那么 (1 - top_p) 就是 0.1
+    #       执行 cumulative_probs <= (1 - top_p) 后，得到的 sorted_indices_to_remove 就是
     #       sorted_indices_to_remove = [True, False, False, False, False]
     #       这意味着，累积概率小于等于 0.1 的词（也就是第一个词）应该被移除
-    #   为什么是 (1 - p)？
-    #       这里使用 (1 - p) 的原因是为了方便后续的处理。在实际的代码中，
+    #   为什么是 (1 - top_p)？
+    #       这里使用 (1 - top_p) 的原因是为了方便后续的处理。在实际的代码中，
     #       通常会将 sorted_indices_to_remove 向右移动一位，并将第一个元素设置为 False。
     #       这样做是为了保留至少一个词，即使第一个词的概率非常小。
-    #       通过使用 (1 - p)，我们可以直接使用 cumulative_probs 进行比较，而不需要额外的步骤来处理第一个词
-    sorted_indices_to_remove = cumulative_probs <= (1 - p)
+    #       通过使用 (1 - top_p)，我们可以直接使用 cumulative_probs 进行比较，而不需要额外的步骤来处理第一个词
+    sorted_indices_to_remove = cumulative_probs <= (1 - top_p)
     # 保证至少有min_tokens_to_keep个token保留
     # 例如:
     #   sorted_indices_to_remove=[True, True, True]，min_tokens_to_keep=1时
@@ -104,8 +123,9 @@ def _generate(
         tokens: torch.Tensor,
         max_new_tokens: int,
         temperature: Optional[float],
-        k: Optional[int],
-        p: Optional[float],
+        top_k: Optional[int],
+        top_p: Optional[float],
+        repetition_penalty: Optional[float] = 1.0,
         pixel_values: Optional[torch.Tensor] = None,
         tokens_per_image: int = -1,
         suppress_tokens: Optional[List[int]] = None,
@@ -116,13 +136,14 @@ def _generate(
     :param tokens:
     :param max_new_tokens:
     :param temperature: 设置None不不生效temperature
-    :param k: top k参数，设置为None或者0不生效topk
-    :param p: top p参数，设置为None不生效top p
+    :param top_k: top k参数，设置为None或者0不生效top k
+    :param top_p: top p参数，设置为None不生效top p
+    :param repetition_penalty: 重复惩罚参数，设置为1.0或者None不生效
     :param suppress_tokens: 要抑制的tokens
     :param device:
 
-    如果内容质量底，需要减小temperature、k、p
-    如果temperature很大但内容单一，需要增大k、p
+    如果内容质量底，需要减小temperature、top_k、top_p
+    如果temperature很大但内容单一，需要增大top_k、top_p
     """
     use_kv_cache = True
 
@@ -169,16 +190,20 @@ def _generate(
             if suppress_tokens and len(suppress_tokens) != 0:
                 logits = _suppress_warper(logits, suppress_tokens)
 
+            # 重复性惩罚
+            if repetition_penalty and repetition_penalty != 1.0:
+                logits = _repetition_penalty_warper(logits, generate_tokens, repetition_penalty)
+
             multinomial = False
             if temperature and temperature > 0:
                 multinomial = True
                 logits = _temperature_warper(logits, temperature)
 
-            if k and k != 0:
-                logits = _top_k_warper(logits, k, device)
+            if top_k and top_k != 0:
+                logits = _top_k_warper(logits, top_k, device)
 
-            if p and 0 < p <= 1:
-                logits = _top_p_warper(logits, p)
+            if top_p and 0 < top_p <= 1:
+                logits = _top_p_warper(logits, top_p)
 
             if multinomial:
                 prob = logits.softmax(dim=-1)
@@ -214,8 +239,9 @@ def _streaming_generate(
         prompt: Union[str, torch.Tensor],
         max_new_tokens: int,
         temperature: Optional[float] = 1.0,
-        k: Optional[int] = None,
-        p: Optional[float] = None,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        repetition_penalty: Optional[float] = 1.0,
         pixel_values: Optional[torch.Tensor] = None,
         tokens_per_image: int = -1,
         suppress_tokens: Optional[List[int]] = None,
@@ -233,8 +259,9 @@ def _streaming_generate(
         tokens=encoded_tokens,
         max_new_tokens=max_new_tokens,
         temperature=temperature,
-        k=k,
-        p=p,
+        top_k=top_k,
+        top_p=top_p,
+        repetition_penalty=repetition_penalty,
         pixel_values=pixel_values,
         tokens_per_image=tokens_per_image,
         suppress_tokens=suppress_tokens,
@@ -251,8 +278,9 @@ def streaming_generate(
         prompt: Union[str, torch.Tensor],
         max_new_tokens: int,
         temperature: Optional[float] = 1.0,
-        k: Optional[int] = None,
-        p: Optional[float] = None,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        repetition_penalty: Optional[float] = 1.0,
         pixel_values: Optional[torch.Tensor] = None,
         tokens_per_image: int = -1,
         suppress_tokens: Optional[List[int]] = None,
@@ -264,8 +292,9 @@ def streaming_generate(
         prompt=prompt,
         max_new_tokens=max_new_tokens,
         temperature=temperature,
-        k=k,
-        p=p,
+        top_k=top_k,
+        top_p=top_p,
+        repetition_penalty=repetition_penalty,
         pixel_values=pixel_values,
         tokens_per_image=tokens_per_image,
         suppress_tokens=suppress_tokens,
@@ -286,8 +315,9 @@ def generate(
         prompt: Union[str, torch.Tensor],
         max_new_tokens: int,
         temperature: Optional[float] = 1.0,
-        k: Optional[int] = None,
-        p: Optional[float] = None,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        repetition_penalty: Optional[float] = 1.0,
         pixel_values: Optional[torch.Tensor] = None,
         tokens_per_image: int = -1,
         suppress_tokens: Optional[List[int]] = None,
@@ -299,8 +329,9 @@ def generate(
         prompt=prompt,
         max_new_tokens=max_new_tokens,
         temperature=temperature,
-        k=k,
-        p=p,
+        top_k=top_k,
+        top_p=top_p,
+        repetition_penalty=repetition_penalty,
         suppress_tokens=suppress_tokens,
         pixel_values=pixel_values,
         tokens_per_image=tokens_per_image,
@@ -324,8 +355,9 @@ def batch_generate(
         attention_mask: torch.Tensor,
         max_new_tokens: int,
         temperature: Optional[float] = None,
-        k: Optional[int] = None,
-        p: Optional[float] = None,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        repetition_penalty: Optional[float] = 1.0,
         pixel_values: Optional[torch.Tensor] = None,
         tokens_per_image: int = -1,
         suppress_tokens: Optional[List[int]] = None,
@@ -421,14 +453,23 @@ def batch_generate(
             if suppress_tokens:
                 logits = _suppress_warper(logits, suppress_tokens)
 
+            if repetition_penalty and repetition_penalty != 1.0:
+                if i == 0:
+                    current_context = orig_tokens
+                else:
+                    current_context = torch.cat((orig_tokens, generated_tokens_buffer[:, :i]), dim=1)
+                logits = _repetition_penalty_warper(logits, current_context, repetition_penalty)
+
             multinomial = False
             if temperature and temperature > 0:
                 multinomial = True
                 logits = _temperature_warper(logits, temperature)
-            if k and k != 0:
-                logits = _top_k_warper(logits, k, device)
-            if p and 0 < p <= 1:
-                logits = _top_p_warper(logits, p)
+
+            if top_k and top_k != 0:
+                logits = _top_k_warper(logits, top_k, device)
+
+            if top_p and 0 < top_p <= 1:
+                logits = _top_p_warper(logits, top_p)
 
             if multinomial:
                 prob = logits.softmax(dim=-1)

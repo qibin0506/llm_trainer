@@ -22,8 +22,9 @@ def submit_gen_task(
         prompt=tokens,
         max_new_tokens=max_new_tokens,
         temperature=train_config.eval_config.temperature,
-        k=train_config.eval_config.top_k,
-        p=train_config.eval_config.top_p,
+        top_k=train_config.eval_config.top_k,
+        top_p=train_config.eval_config.top_p,
+        repetition_penalty=train_config.eval_config.gen_repetition_penalty,
         pixel_values=pixel_values,
         tokens_per_image=tokens_per_image,
         device=TrainerTools().parallel.device

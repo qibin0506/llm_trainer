@@ -145,7 +145,9 @@ class EvalConfig:
     eval_batch_interval: int = 100
     temperature: float = 1.0
     top_p: float = 0.95
-    top_k: Optional[float] = None
+    top_k: Optional[int] = None
+    gen_repetition_penalty: Optional[float] = 1.0
+
 
 
 @dataclass(kw_only=True)
@@ -231,8 +233,9 @@ class PPOConfig:
     whiten_rewards: bool = False
     gen_max_seq_len: int
     gen_temperature: Optional[float] = None
-    gen_k: Optional[int] = None
-    gen_p: Optional[float] = None
+    gen_top_k: Optional[int] = None
+    gen_top_p: Optional[float] = None
+    gen_repetition_penalty: Optional[float] = 1.0
     gen_suppress_tokens: Optional[list[int]] = None
 
 
@@ -258,8 +261,9 @@ class GRPOConfig:
     ptx_coef: float = 0.0
     gen_max_seq_len: int
     gen_temperature: Optional[float] = None
-    gen_k: Optional[int] = None
-    gen_p: Optional[float] = None
+    gen_top_k: Optional[int] = None
+    gen_top_p: Optional[float] = None
+    gen_repetition_penalty: Optional[float] = 1.0
     gen_suppress_tokens: Optional[list[int]] = None
 
 

@@ -393,8 +393,9 @@ class PPOTrainer(BaseTrainer):
                     attention_mask=prompt_masks,
                     max_new_tokens=max_new_tokens,
                     temperature=ppo_config.gen_temperature,
-                    k=ppo_config.gen_k,
-                    p=ppo_config.gen_p,
+                    top_k=ppo_config.gen_top_k,
+                    top_p=ppo_config.gen_top_p,
+                    repetition_penalty=ppo_config.gen_repetition_penalty,
                     suppress_tokens=ppo_config.gen_suppress_tokens,
                     device=device
                 )

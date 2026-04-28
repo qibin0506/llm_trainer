@@ -229,8 +229,9 @@ class GRPOTrainer(BaseTrainer):
             attention_mask=prompt_masks,
             max_new_tokens=max_new_tokens,
             temperature=self.grpo_config.gen_temperature,
-            k=self.grpo_config.gen_k,
-            p=self.grpo_config.gen_p,
+            top_k=self.grpo_config.gen_top_k,
+            top_p=self.grpo_config.gen_top_p,
+            repetition_penalty=self.grpo_config.gen_repetition_penalty,
             device=device,
             suppress_tokens=self.grpo_config.gen_suppress_tokens,
             return_logits=False

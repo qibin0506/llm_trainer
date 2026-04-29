@@ -10,4 +10,8 @@ from .tools import (
     extract_policy_weights_from_ppo,
     extract_value_weights_from_ppo
 )
-from .generate_utils import generate, streaming_generate
+from .generate_utils import (
+    generate,
+    streaming_generate,
+    batch_generate
+)

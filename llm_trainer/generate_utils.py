@@ -9,41 +9,56 @@ from .utils import (
 )
 
 
-def _repetition_penalty_warper(logits: torch.Tensor, input_ids: torch.Tensor, penalty: float) -> torch.Tensor:
-    """
-    重复性惩罚
-    :param logits: [batch_size, vocab_size]
-    :param input_ids: 到目前为止生成的所有 token (包含 prompt)[batch_size, seq_len]
-    :param penalty: 惩罚系数 (>1.0表示惩罚，1.0表示不生效)
-    :return:
-    """
+def _repetition_penalty_warper(
+        logits: torch.Tensor,
+        input_ids: torch.Tensor,
+        penalty: float,
+        exclude_tokens: Optional[List[int]] = None
+) -> torch.Tensor:
     if penalty == 1.0:
         return logits
 
     logits = logits.clone()
+    valid_exclude =[]
+
+    # 暂存需要排除惩罚的特殊 token 的原始 logits
+    if exclude_tokens is not None and len(exclude_tokens) > 0:
+        valid_exclude =[t for t in exclude_tokens if 0 <= t < logits.shape[-1]]
+        if valid_exclude:
+            saved_logits = logits[:, valid_exclude].clone()
+        else:
+            exclude_tokens = None
+
     score = torch.gather(logits, 1, input_ids)
     score = torch.where(score < 0, score * penalty, score / penalty)
     logits.scatter_(1, input_ids, score)
 
+    if exclude_tokens is not None and len(exclude_tokens) > 0 and valid_exclude:
+        logits[:, valid_exclude] = saved_logits
+
     return logits
 
 
-def _suppress_warper(logits: torch.Tensor, suppress_tokens: List[int]) -> torch.Tensor:
+def _suppress_warper(
+        logits: torch.Tensor,
+        suppress_tokens: List[int]
+) -> torch.Tensor:
     """
     抑制特殊token输出
     :param logits:
     :param suppress_tokens:
     :return:
     """
-    suppress_tokens = torch.tensor(suppress_tokens, device=logits.device)
-    vocab_tensor = torch.arange(logits.shape[-1], device=logits.device)
-    suppress_token_mask = torch.isin(vocab_tensor, suppress_tokens)
-    logits = torch.where(suppress_token_mask, -float("inf"), logits)
+    if suppress_tokens:
+        logits[..., suppress_tokens] = -float("inf")
 
     return logits
 
 
-def _temperature_warper(logits: torch.Tensor, temperature: float) -> torch.Tensor:
+def _temperature_warper(
+        logits: torch.Tensor,
+        temperature: float
+) -> torch.Tensor:
     """
     应用temperature
     :param logits:
@@ -54,7 +69,12 @@ def _temperature_warper(logits: torch.Tensor, temperature: float) -> torch.Tenso
     return logits
 
 
-def _top_k_warper(logits: torch.Tensor, top_k: int, device: Union[str, torch.device, int] = None) -> torch.Tensor:
+def _top_k_warper(
+        logits: torch.Tensor,
+        top_k: int,
+        device: Union[str,
+        torch.device, int] = None
+) -> torch.Tensor:
     """
     top k采样
     :param logits:
@@ -63,14 +83,20 @@ def _top_k_warper(logits: torch.Tensor, top_k: int, device: Union[str, torch.dev
     :return:
     """
     # [batch, top_k]
+    top_k = min(top_k, logits.shape[-1])
     topk_logits, _ = torch.topk(logits, k=top_k)
     # []
     min_val: torch.Tensor = topk_logits[:, -1]
-    logits = torch.where(logits < min_val.unsqueeze(-1), torch.full_like(logits, -float("inf")), logits)
+    logits.masked_fill_(logits < min_val.unsqueeze(-1), -float("inf"))
+
     return logits
 
 
-def _top_p_warper(logits: torch.Tensor, top_p: float, min_tokens_to_keep: int = 1) -> torch.Tensor:
+def _top_p_warper(
+        logits: torch.Tensor,
+        top_p: float,
+        min_tokens_to_keep: int = 1
+) -> torch.Tensor:
     """
     top p 核采样
     :param logits:
@@ -82,7 +108,7 @@ def _top_p_warper(logits: torch.Tensor, top_p: float, min_tokens_to_keep: int = 
     sorted_logits, sorted_indices = torch.sort(logits, dim=-1, descending=False)
     # cumsum求和, 每一个元素的值都是与之前元素的求和
     # 例如：torch.cumsum(torch.tensor([[0.1, 0.2, 0.3]]), dim=-1) 结果是: [0.1, 0.3, 0.6]
-    cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+    cumulative_probs = sorted_logits.float().softmax(dim=-1).cumsum(dim=-1)
     # 删除累积概率<=1-top_p的部分, 因为cumulative_probs是正序排列的，所以要用1-top_p
     # 例如：
     #   假设 top_p=0.9，并且经过排序和计算后，我们有以下的 cumulative_probs
@@ -112,7 +138,7 @@ def _top_p_warper(logits: torch.Tensor, top_p: float, min_tokens_to_keep: int = 
     indices_to_remove = sorted_indices_to_remove.scatter(1, index=sorted_indices, src=sorted_indices_to_remove)
 
     # 将需要移除的元素的值设置为-inf
-    scores_processed = logits.masked_fill_(indices_to_remove, -float("Inf"))
+    scores_processed = logits.masked_fill(indices_to_remove, -float("Inf"))
 
     return scores_processed
 
@@ -141,15 +167,15 @@ def _generate(
     :param repetition_penalty: 重复惩罚参数，设置为1.0或者None不生效
     :param suppress_tokens: 要抑制的tokens
     :param device:
-
-    如果内容质量底，需要减小temperature、top_k、top_p
-    如果temperature很大但内容单一，需要增大top_k、top_p
     """
     use_kv_cache = True
+    special_tokens = list(TrainerTools().tokenizer.get_special_tokens_dict().values())
 
     # 确保输入维度是 [Batch, Seq]
     if tokens.dim() == 1:
         tokens = tokens.unsqueeze(0)
+
+    assert tokens.shape[0] == 1
 
     if isinstance(model, VlmModel):
         tokens, _ = batch_repeat_image_tok(tokens, tokens_per_image)
@@ -157,24 +183,46 @@ def _generate(
     pad_token_id = TrainerTools().tokenizer.pad
     attention_mask = (tokens != pad_token_id).to(device=device, dtype=torch.long)
 
+    batch_size = tokens.shape[0]
+    prompt_len = tokens.shape[1]
+
     kv_cache: Optional[KVCache] = None
     if use_kv_cache:
         # Prompt Length + Max Generation Length
-        total_capacity = tokens.shape[1] + max_new_tokens
+        total_capacity = prompt_len + max_new_tokens
         kv_cache = KVCache(max_capacity=total_capacity)
 
     if pixel_values is not None:
         pixel_values = pixel_values.to(device)
 
-    generate_tokens = tokens.clone()
+    # 提前分配流式生成的全局大 Buffer
+    full_sequence_buffer = torch.full(
+        (batch_size, prompt_len + max_new_tokens),
+        pad_token_id,
+        dtype=torch.long,
+        device=device
+    )
+    full_sequence_buffer[:, :prompt_len] = tokens
+
+    full_attention_mask = torch.zeros(
+        (batch_size, prompt_len + max_new_tokens),
+        dtype=attention_mask.dtype,
+        device=device
+    )
+    full_attention_mask[:, :prompt_len] = attention_mask
+
+    current_tokens = tokens
+    actual_gen_len = 0
 
     with torch.inference_mode():
-        for _ in range(max_new_tokens):
-            t = tokens
+        for i in range(max_new_tokens):
+            actual_gen_len = i + 1
+            current_attention_mask = full_attention_mask[:, :prompt_len + i]
+
             with autocast(TrainerTools().parallel.device_type):
                 result = model(
-                    t,
-                    attention_mask=attention_mask,
+                    current_tokens,
+                    attention_mask=current_attention_mask,
                     past_key_values=kv_cache,
                     use_cache=use_kv_cache,
                     pixel_values=pixel_values
@@ -192,7 +240,13 @@ def _generate(
 
             # 重复性惩罚
             if repetition_penalty and repetition_penalty != 1.0:
-                logits = _repetition_penalty_warper(logits, generate_tokens, repetition_penalty)
+                current_context = full_sequence_buffer[:, :prompt_len + i]
+                logits = _repetition_penalty_warper(
+                    logits,
+                    current_context,
+                    repetition_penalty,
+                    exclude_tokens=special_tokens
+                )
 
             multinomial = False
             if temperature and temperature > 0:
@@ -206,9 +260,11 @@ def _generate(
                 logits = _top_p_warper(logits, top_p)
 
             if multinomial:
-                prob = logits.softmax(dim=-1)
-                # 返回下标
-                next_token = torch.multinomial(prob, num_samples=1)
+                prob = logits.float().softmax(dim=-1)
+                if torch.isnan(prob).any():
+                    next_token = logits.argmax(dim=-1, keepdim=True)
+                else:
+                    next_token = torch.multinomial(prob, num_samples=1)
             else:
                 # 返回下标
                 next_token = logits.argmax(dim=-1, keepdim=True)
@@ -216,21 +272,20 @@ def _generate(
             # token, is_full_result
             yield next_token, False
 
+            full_sequence_buffer[:, prompt_len + i] = next_token.squeeze(-1)
             if use_kv_cache:
-                tokens = next_token
-                generate_tokens = torch.cat((generate_tokens, next_token), dim=-1)
+                current_tokens = next_token
             else:
-                tokens = torch.cat((tokens, next_token), dim=-1)
+                # 如果不用 KV Cache，模型需要每次传入前文全量 Tokens
+                # 直接通过切片获取全局 Buffer，这里也不会触发显存拷贝！
+                current_tokens = full_sequence_buffer[:, :prompt_len + i + 1]
 
-            # 更新 mask：追加 1
-            new_mask_bit = torch.ones((tokens.shape[0], 1), device=device, dtype=attention_mask.dtype)
-            attention_mask = torch.cat((attention_mask, new_mask_bit), dim=-1)
-
+            full_attention_mask[:, prompt_len + i] = 1
             if next_token.item() == TrainerTools().tokenizer.end:
                 break
 
-    # token, is_full_result
-    yield tokens if not use_kv_cache else generate_tokens, True
+    final_full_sequences = full_sequence_buffer[:, :prompt_len + actual_gen_len]
+    yield final_full_sequences, True
 
 
 def _streaming_generate(
@@ -367,6 +422,7 @@ def batch_generate(
     use_kv_cache = True
     end_token = TrainerTools().tokenizer.end
     pad_token_id = TrainerTools().tokenizer.pad
+    special_tokens = list(TrainerTools().tokenizer.get_special_tokens_dict().values())
 
     if isinstance(model, VlmModel):
         tokens, attention_mask = batch_repeat_image_tok(tokens, tokens_per_image, attention_mask)
@@ -382,19 +438,29 @@ def batch_generate(
 
     kv_cache: Optional[KVCache] = None
     batch_size = tokens.shape[0]
+    prompt_len = orig_tokens.shape[1]
 
     if use_kv_cache:
         # Prompt Length + Max Generation Length
-        total_capacity = tokens.shape[1] + max_new_tokens
+        total_capacity = prompt_len + max_new_tokens
         kv_cache = KVCache(max_capacity=total_capacity)
 
-    # 预分配最大长度，避免循环中 cat 造成内存碎片
-    generated_tokens_buffer = torch.full(
-        (batch_size, max_new_tokens),
+    # 直接分配一个涵盖 全局 (Prompt + Generate) 的终极 Buffer
+    full_sequence_buffer = torch.full(
+        (batch_size, prompt_len + max_new_tokens),
         pad_token_id,
         dtype=torch.long,
         device=device
     )
+    # 预先将 prompt 写入 Buffer 的开头
+    full_sequence_buffer[:, :prompt_len] = orig_tokens
+
+    full_attention_mask_buffer = torch.zeros(
+        (batch_size, prompt_len + max_new_tokens),
+        dtype=attention_mask.dtype,
+        device=device
+    )
+    full_attention_mask_buffer[:, :prompt_len] = attention_mask
 
     done = torch.zeros(batch_size, dtype=torch.bool, device=device)
     current_tokens = tokens
@@ -414,13 +480,11 @@ def batch_generate(
             if current_tokens.dtype != torch.long:
                 current_tokens = current_tokens.long()
 
+            current_attention_mask = full_attention_mask_buffer[:, :prompt_len + i]
+
             if kv_cache is None:
-                current_position_ids = position_ids
+                current_position_ids = calc_position_ids(current_attention_mask)
             else:
-                # 下一个位置ID基于当前mask序列的最后一个有效位置
-                # 如果kv_cache有效，当前token是上一步生成的，位置是前一个位置+1
-                # 注意：第一次迭代（Prefill）kv_cache 内部虽空，但我们传入了完整的 tokens
-                # prefill 阶段不需要单独处理 position_ids，因为我们直接传入了全量 position_ids
                 if i == 0:
                      current_position_ids = position_ids
                 else:
@@ -430,7 +494,7 @@ def batch_generate(
             with autocast(TrainerTools().parallel.device_type):
                 result = model(
                     current_tokens,
-                    attention_mask=full_attention_mask,
+                    attention_mask=current_attention_mask,
                     position_ids=current_position_ids,
                     past_key_values=kv_cache,
                     use_cache=use_kv_cache,
@@ -454,11 +518,13 @@ def batch_generate(
                 logits = _suppress_warper(logits, suppress_tokens)
 
             if repetition_penalty and repetition_penalty != 1.0:
-                if i == 0:
-                    current_context = orig_tokens
-                else:
-                    current_context = torch.cat((orig_tokens, generated_tokens_buffer[:, :i]), dim=1)
-                logits = _repetition_penalty_warper(logits, current_context, repetition_penalty)
+                current_context = full_sequence_buffer[:, :prompt_len + i]
+                logits = _repetition_penalty_warper(
+                    logits,
+                    current_context,
+                    repetition_penalty,
+                    exclude_tokens=special_tokens
+                )
 
             multinomial = False
             if temperature and temperature > 0:
@@ -472,8 +538,11 @@ def batch_generate(
                 logits = _top_p_warper(logits, top_p)
 
             if multinomial:
-                prob = logits.softmax(dim=-1)
-                next_token_active = torch.multinomial(prob, num_samples=1)
+                prob = logits.float().softmax(dim=-1)
+                if torch.isnan(prob).any():
+                    next_token_active = logits.argmax(dim=-1, keepdim=True)
+                else:
+                    next_token_active = torch.multinomial(prob, num_samples=1)
             else:
                 next_token_active = logits.argmax(dim=-1, keepdim=True)
 
@@ -483,23 +552,24 @@ def batch_generate(
                 next_token_active
             )
 
-            generated_tokens_buffer[:, i] = next_token.squeeze(-1)
+            full_sequence_buffer[:, prompt_len + i] = next_token.squeeze(-1)
 
             new_done = (next_token.squeeze(-1) == end_token)
             done = done | new_done
 
-            current_tokens = next_token
+            if use_kv_cache:
+                current_tokens = next_token
+            else:
+                current_tokens = full_sequence_buffer[:, :prompt_len + i + 1]
 
-            new_mask = (~done).long().to(full_attention_mask.dtype)
-            full_attention_mask = torch.cat((full_attention_mask, new_mask.unsqueeze(-1)), dim=-1)
+            new_mask = (~done).long().to(full_attention_mask_buffer.dtype)
+            full_attention_mask_buffer[:, prompt_len + i] = new_mask
 
-    final_generated_tokens = generated_tokens_buffer[:, :actual_gen_len]
+    final_full_sequences = full_sequence_buffer[:, :prompt_len + actual_gen_len]
 
     if padded_logits is not None:
         final_padded_logits = padded_logits[:, :actual_gen_len, :]
     else:
         final_padded_logits = None
-
-    final_full_sequences = torch.cat((orig_tokens, final_generated_tokens), dim=1)
 
     return final_full_sequences, final_padded_logits

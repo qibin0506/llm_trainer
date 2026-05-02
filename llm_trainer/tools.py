@@ -1,4 +1,5 @@
 import os
+import math
 from abc import ABC, abstractmethod
 from .tokenizer import Tokenizer
 from .parallel import DsParallel, NoneParallel
@@ -105,3 +106,55 @@ def extract_value_weights_from_ppo(model_config, ppo_weights):
     wrapper.load_state_dict(ppo_weights)
 
     return wrapper.value_model.state_dict()
+
+
+def compute_lr_scheduler_steps(
+        train_stage: str,
+        epochs: int,
+        all_data_size: int,
+        batch_size: int,
+        gradient_accumulation_steps: int,
+        **kwargs
+):
+    world_size = TrainerTools().parallel.world_size
+
+    # 基础 dataloader 的总 batch 数量（每个 GPU 上的 batch 数）
+    dataloader_batches_per_gpu = epochs * (all_data_size // (batch_size * world_size))
+
+    if train_stage in ['pretrain', 'midtrain', 'sft', 'dpo']:
+        # DPO 和常规的 SFT/Pretrain 更新逻辑一致：直接在 dataloader batch 级别上做梯度累积
+        train_batch_per_world = dataloader_batches_per_gpu / gradient_accumulation_steps
+    elif train_stage == 'ppo':
+        # PPO 算法特性：
+        # - 数据加载：每次 dataloader 给出 batch_size 条数据进行 1 次 Rollout。
+        # - 训练拆分：对 Rollout 数据训练 ppo_epochs 次，每次按 ppo_batch_size 拆分成 micro_batch 进行 forward+backward。
+        # - 梯度累积：每 gradient_accumulation_steps 个 micro_batch 执行一次 step()。
+        ppo_epochs = kwargs.get('ppo_epochs', 1)
+        ppo_batch_size = kwargs.get('ppo_batch_size', 1)
+
+        updates_per_dataloader_batch = (ppo_epochs * batch_size / ppo_batch_size) / gradient_accumulation_steps
+        train_batch_per_world = dataloader_batches_per_gpu * updates_per_dataloader_batch
+    elif train_stage == 'grpo':
+        # GRPO 算法特性：
+        # - 数据加载：每次 dataloader 给出 batch_size 个 prompt，内部生成 batch_size * group_size 条数据。
+        # - 训练拆分：对这批扩增后的数据训练 grpo_epochs 次，按 grpo_batch_size 拆分为 micro_batch。
+        # - 梯度累积：每 gradient_accumulation_steps 个 micro_batch 执行一次 step()。
+        grpo_epochs = kwargs.get('grpo_epochs', 1)
+        group_size = kwargs.get('group_size', 1)
+        grpo_batch_size = kwargs.get('grpo_batch_size', 1)
+
+        updates_per_dataloader_batch = (grpo_epochs * batch_size * group_size / grpo_batch_size) / gradient_accumulation_steps
+        train_batch_per_world = dataloader_batches_per_gpu * updates_per_dataloader_batch
+    else:
+        train_batch_per_world = dataloader_batches_per_gpu / gradient_accumulation_steps
+
+    train_batch_per_world = math.floor(train_batch_per_world)
+    warmup_iters = int(0.1 * train_batch_per_world)
+
+    max_warmup_iters = kwargs.get('max_warmup_iters', -1)
+    if max_warmup_iters > -1:
+        warmup_iters = min(warmup_iters, max_warmup_iters)
+
+    cosine_annealing_batches = math.ceil(train_batch_per_world - warmup_iters)
+
+    return warmup_iters, cosine_annealing_batches

@@ -240,7 +240,7 @@ class GRPOTrainer(BaseTrainer):
         # [batch*group_size, max_gen_len]
         completion_ids = outputs[:, prompt_len:]
         # [batch*group_size, max_gen_len]
-        completion_masks = (completion_ids != pad_token_id).int()
+        completion_masks = completion_ids != pad_token_id
 
         return prompt_ids, prompt_masks, completion_ids, completion_masks
 
@@ -366,11 +366,14 @@ class GRPOTrainer(BaseTrainer):
                     )
 
                     with torch.no_grad():
-                        entropy = -(log_probs * padded_completion_mask).sum() / padded_completion_mask.sum().clamp(min=1.0)
-                        completion_len = padded_completion_mask.sum(dim=-1).float().mean()
+                        fp32_log_probs = log_probs.float()
+                        fp32_mask = padded_completion_mask.float()
+
+                        entropy = -(fp32_log_probs * fp32_mask).sum() / fp32_mask.sum().clamp(min=1.0)
+                        completion_len = fp32_mask.sum(dim=-1).mean()
 
                     if aux_loss is not None and self.train_config.loss_config.aux_loss_coef:
-                        aux_loss = self.train_config.loss_config.aux_loss_coef * aux_loss
+                        aux_loss = self.train_config.loss_config.aux_loss_coef * aux_loss.float()
                     else:
                         aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
 
@@ -394,14 +397,14 @@ class GRPOTrainer(BaseTrainer):
                             ptx_loss = self.ptx_criterion(ptx_logits, mb_ptx_labels)
 
                             if ptx_output['aux_loss'] is not None and self.train_config.loss_config.aux_loss_coef:
-                                ptx_aux_loss = self.train_config.loss_config.aux_loss_coef * ptx_output['aux_loss']
+                                ptx_aux_loss = self.train_config.loss_config.aux_loss_coef * ptx_output['aux_loss'].float()
                     # end
 
                     with torch.no_grad():
                         if mb_ref_log_probs is not None:
-                            log_ratio = mb_ref_log_probs - log_probs
+                            log_ratio = mb_ref_log_probs.float() - fp32_log_probs
                             approx_kl = (torch.exp(log_ratio) - log_ratio - 1)
-                            approx_kl = (approx_kl * padded_completion_mask).sum() / padded_completion_mask.sum().clamp(min=1.0)
+                            approx_kl = (approx_kl * fp32_mask).sum() / fp32_mask.sum().clamp(min=1.0)
                         else:
                             approx_kl = torch.tensor(0.0, device=loss.device)
 

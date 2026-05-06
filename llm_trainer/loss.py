@@ -72,9 +72,8 @@ class KDLoss(nn.Module):
         prod_probs = torch.masked_fill(teacher_probs * logprobs, inf_mask, 0)
 
         x = torch.sum(prod_probs, dim=-1).view(-1)
-        mask = (labels != self.ignore_index).int()
-
-        distil_loss = -torch.sum(x * mask.view(-1), dim=0) / torch.sum(mask.view(-1), dim=0)
+        mask = (labels != self.ignore_index).float().view(-1)
+        distil_loss = -torch.sum(x * mask) / mask.sum().clamp(min=1e-8)
 
         return distil_loss
 
@@ -98,6 +97,11 @@ class DPOLoss(nn.Module):
             ref_chosen_logps: torch.Tensor,
             ref_reject_logps: torch.Tensor
     ) -> torch.Tensor:
+        policy_chosen_logps = policy_chosen_logps.float()
+        policy_reject_logps = policy_reject_logps.float()
+        ref_chosen_logps = ref_chosen_logps.float()
+        ref_reject_logps = ref_reject_logps.float()
+
         pi_logratios = policy_chosen_logps - policy_reject_logps
         ref_logratios = ref_chosen_logps - ref_reject_logps
         logits = pi_logratios - ref_logratios
@@ -161,6 +165,14 @@ class PPOLoss(nn.Module):
         :param mask: 掩码，只计算生成部分的损失, 形状: [batch_size, seq_len]
         :return: (总损失, Actor损失, Value损失, Entropy)
         """
+        log_probs = log_probs.float()
+        old_log_probs = old_log_probs.float()
+        values = values.float()
+        old_values = old_values.float()
+        returns = returns.float()
+        advantages = advantages.float()
+        mask = mask.float()
+
         # Value Loss (价值损失) with clipping
         values_clipped = old_values + torch.clamp(values - old_values, -self.clip_eps, self.clip_eps)
         vf_loss_unclipped = F.mse_loss(values, returns, reduction='none')
@@ -245,6 +257,10 @@ class GRPOLoss(nn.Module):
             k_neg: float,
             lambda_neg: float,
     ) -> torch.Tensor:
+        advantages = advantages.float()
+        log_ratio_per_token = log_ratio_per_token.float()
+        mask = mask.float()
+
         lower_clamp = math.log(1e-8)
         log_ratio_clamped = torch.clamp(log_ratio_per_token, -20.0, 20.0)
         seq_log_ratio = torch.sum(log_ratio_clamped * mask, dim=-1, keepdim=True)
@@ -279,6 +295,13 @@ class GRPOLoss(nn.Module):
             advantages: torch.Tensor,
             completion_len: int
     ) -> torch.Tensor:
+        log_probs = log_probs.float()
+        old_log_probs = old_log_probs.float()
+        if ref_log_probs is not None:
+            ref_log_probs = ref_log_probs.float()
+        completion_mask = completion_mask.float()
+        advantages = advantages.float()
+
         if advantages.dim() == 1:
             advantages = advantages.unsqueeze(-1)
 

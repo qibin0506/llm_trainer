@@ -98,18 +98,20 @@ class BaseTrainer:
 
     def _init_scaler(self):
         device_type = TrainerTools().parallel.device_type
-
+        enable_scaler = TrainerTools().use_amp and (
+                    TrainerTools().compute_dtype == 'fp16'
+                    or (TrainerTools().compute_dtype == 'auto' and not is_bf16_supported()))
         try:
-            self.scaler = torch.amp.GradScaler(device=device_type, enabled=TrainerTools().use_amp)
+            self.scaler = torch.amp.GradScaler(device=device_type, enabled=enable_scaler)
         except (AttributeError, TypeError, ValueError):
             if device_type == 'mlu' and hasattr(torch, 'mlu') and hasattr(torch.mlu, 'amp'):
-                self.scaler = torch.mlu.amp.GradScaler(enabled=TrainerTools().use_amp)
+                self.scaler = torch.mlu.amp.GradScaler(enabled=enable_scaler)
             elif device_type == 'npu' and hasattr(torch, 'npu') and hasattr(torch.npu, 'amp'):
-                self.scaler = torch.npu.amp.GradScaler(enabled=TrainerTools().use_amp)
+                self.scaler = torch.npu.amp.GradScaler(enabled=enable_scaler)
             elif device_type == 'mps' or device_type == 'cpu':
                 self.scaler = torch.cuda.amp.GradScaler(enabled=False)
             else:
-                self.scaler = torch.cuda.amp.GradScaler(enabled=TrainerTools().use_amp)
+                self.scaler = torch.cuda.amp.GradScaler(enabled=enable_scaler)
 
     def _new_model(self, train_config: TrainConfig):
         return LlmModel(train_config.model_config)
@@ -671,7 +673,7 @@ class BaseTrainer:
                             # calc loss
                             loss, ce_loss = self._calc_loss(inputs, attention_mask, result['logits'], labels)
                             if result['aux_loss'] is not None and self.train_config.loss_config.aux_loss_coef:
-                                aux_loss = self.train_config.loss_config.aux_loss_coef * result['aux_loss']
+                                aux_loss = self.train_config.loss_config.aux_loss_coef * result['aux_loss'].float()
                             else:
                                 aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
 

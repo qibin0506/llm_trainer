@@ -335,6 +335,11 @@ class PPOTrainer(BaseTrainer):
             completion_mask: torch.Tensor,
             dones: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        rewards = rewards.float()
+        values = values.float()
+        last_values = last_values.float()
+        completion_mask = completion_mask.float()
+
         gamma, lam = self.train_config.ppo_config.gamma, self.train_config.ppo_config.lam
         advantages_reversed = []
         last_gae_lam = 0
@@ -404,7 +409,7 @@ class PPOTrainer(BaseTrainer):
                 full_attention_mask = (full_ids != pad_token_id)
                 full_position_ids = calc_position_ids(full_attention_mask)
 
-                old_log_probs = log_softmax(logitss.float(), completion_ids)
+                old_log_probs = log_softmax(logitss, completion_ids)
                 del logitss
 
                 with autocast(TrainerTools().parallel.device_type):
@@ -415,15 +420,16 @@ class PPOTrainer(BaseTrainer):
                     )
 
             with unwrap_model_for_generation(self.ref_model) as unwrapped_ref_model:
-                ref_outputs = unwrapped_ref_model(
-                    full_ids,
-                    attention_mask=full_attention_mask,
-                    position_ids=full_position_ids
-                )
-                ref_logits_full = ref_outputs['logits']
+                with autocast(TrainerTools().parallel.device_type):
+                    ref_outputs = unwrapped_ref_model(
+                        full_ids,
+                        attention_mask=full_attention_mask,
+                        position_ids=full_position_ids
+                    )
+                    ref_logits_full = ref_outputs['logits']
 
             ref_logits_completion = ref_logits_full[:, prompt_len - 1: -1]
-            ref_log_probs_completion = log_softmax(ref_logits_completion.float(), completion_ids)
+            ref_log_probs_completion = log_softmax(ref_logits_completion, completion_ids)
             del ref_outputs, ref_logits_full, ref_logits_completion
 
             dones = torch.any(completion_ids == eos_token_id, dim=1)
@@ -431,10 +437,10 @@ class PPOTrainer(BaseTrainer):
             completion_mask = (completion_ids != pad_token_id)
 
             if ppo_config.kl_beta > 0.0:
-                logr = ref_log_probs_completion - old_log_probs
+                logr = ref_log_probs_completion.float() - old_log_probs.float()
                 kl = -logr if ppo_config.kl_estimator == "k1" else (logr.exp() - 1) - logr
                 kl_rewards = -ppo_config.kl_beta * kl
-                rewards += kl_rewards * completion_mask
+                rewards += kl_rewards.to(rewards.dtype) * completion_mask
 
             env_rewards_tensor = torch.tensor(
                 self.reward_func(prompts, completion_ids.cpu(), answers),
@@ -546,12 +552,6 @@ class PPOTrainer(BaseTrainer):
                         position_ids=mb_position_ids
                     )
 
-                    target_dtype = policy_output['logits'].dtype
-                    mb_old_log_probs = mb_old_log_probs.to(target_dtype)
-                    mb_values = mb_values.to(target_dtype)
-                    mb_returns = mb_returns.to(target_dtype)
-                    mb_advantages = mb_advantages.to(target_dtype)
-
                     logits_completion = policy_output['logits'][:, prompt_len - 1: -1]
                     current_log_probs = log_softmax(logits_completion, mb_completion_ids)
                     current_values = value_output[:, prompt_len - 1: -1]
@@ -574,7 +574,7 @@ class PPOTrainer(BaseTrainer):
 
                     aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
                     if policy_output['aux_loss'] is not None and self.train_config.loss_config.aux_loss_coef:
-                        aux_loss = self.train_config.loss_config.aux_loss_coef * policy_output['aux_loss']
+                        aux_loss = self.train_config.loss_config.aux_loss_coef * policy_output['aux_loss'].float()
 
                     # ptx
                     ptx_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
@@ -597,7 +597,7 @@ class PPOTrainer(BaseTrainer):
                             ptx_loss = self.ptx_criterion(ptx_logits, mb_ptx_labels)
 
                             if ptx_policy_output['aux_loss'] is not None and self.train_config.loss_config.aux_loss_coef:
-                                ptx_aux_loss = self.train_config.loss_config.aux_loss_coef * ptx_policy_output['aux_loss']
+                                ptx_aux_loss = self.train_config.loss_config.aux_loss_coef * ptx_policy_output['aux_loss'].float()
                     # end
                 ppo_loss_unscaled = loss + aux_loss
                 ptx_loss_unscaled = ppo_config.ptx_coef * (ptx_loss + ptx_aux_loss)

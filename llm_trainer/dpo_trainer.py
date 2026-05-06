@@ -195,6 +195,7 @@ class DPOTrainer(BaseTrainer):
                             with torch.no_grad():
                                 ref_outputs = self.ref_model(concat_inputs, attention_mask=concat_attention_masks)
                                 ref_logprobs_sums, _, _ = self._logprobs(ref_outputs['logits'], concat_labels)
+
                                 del ref_outputs
 
                             policy_outputs = self.train_model(concat_inputs, attention_mask=concat_attention_masks)

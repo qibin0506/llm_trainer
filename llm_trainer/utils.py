@@ -457,9 +457,20 @@ def left_pad_sequence(
         return padded_reversed.flip(dims=(1,))
 
 
-_use_memory_efficient_log_softmax = True
+_log_softmax_method = 2
 def log_softmax(logits, index) -> torch.Tensor:
-    if _use_memory_efficient_log_softmax:
+    if _log_softmax_method == 2:
+        original_shape = index.shape
+        loss = F.cross_entropy(
+            logits.reshape(-1, logits.shape[-1]),
+            index.reshape(-1),
+            ignore_index=-100,
+            reduction='none'
+        )
+
+        return -loss.view(original_shape).float()
+
+    if _log_softmax_method == 1:
         return _selective_log_softmax(logits, index)
 
     # Convert raw logits into log probabilities along the vocabulary axis.
@@ -476,6 +487,9 @@ def log_softmax(logits, index) -> torch.Tensor:
 
 def masked_whiten(values: torch.Tensor, mask: torch.Tensor, shift_mean: bool = True) -> torch.Tensor:
     """Whiten values with masked values."""
+    values = values.float()
+    mask = mask.float()
+
     mean, var = _masked_mean(values, mask), _masked_var(values, mask)
     whitened = (values - mean) * torch.rsqrt(var + 1e-8)
     if not shift_mean:
@@ -544,9 +558,9 @@ def disable_dropout_in_model(model: torch.nn.Module) -> None:
 def _masked_mean(values: torch.Tensor, mask: torch.Tensor, axis: Optional[bool] = None) -> torch.Tensor:
     """Compute mean of tensor with a masked values."""
     if axis is not None:
-        return (values * mask).sum(axis=axis) / mask.sum(axis=axis)
+        return (values * mask).sum(axis=axis) / mask.sum(axis=axis).clamp(min=1e-8)
     else:
-        return (values * mask).sum() / mask.sum()
+        return (values * mask).sum() / mask.sum().clamp(min=1e-8)
 
 
 def _masked_var(values: torch.Tensor, mask: torch.Tensor, unbiased: bool = True) -> torch.Tensor:
@@ -714,10 +728,11 @@ class RunningMeanStd(nn.Module):
 
     def forward(self, x: torch.Tensor, shift_mean: bool = True) -> torch.Tensor:
         target_dtype = x.dtype
-        mean = self.mean.to(target_dtype)
-        var = self.var.to(target_dtype)
+        x_high = x.to(torch.float64)
 
         if shift_mean:
-            return (x - mean) / torch.sqrt(var + self.epsilon)
+            out = (x_high - self.mean) / torch.sqrt(self.var + self.epsilon)
         else:
-            return x / torch.sqrt(var + self.epsilon)
+            out = x_high / torch.sqrt(self.var + self.epsilon)
+
+        return out.to(target_dtype)

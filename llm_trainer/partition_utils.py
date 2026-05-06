@@ -64,7 +64,7 @@ def sync_model_params(_from: nn.Module, _to: Optional[nn.Module], mixup_alpha: f
             if param_name in state_dict:
                 from_param_tensor = state_dict[param_name]
                 target_param.data.mul_(1.0 - mixup_alpha).add_(
-                    from_param_tensor.data.to(target_param.device),
+                    from_param_tensor.data.to(device=target_param.device, dtype=target_param.dtype),
                     alpha=mixup_alpha
                 )
 

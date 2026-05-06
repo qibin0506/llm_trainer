@@ -73,8 +73,19 @@ def plot_with_plotly(results, separator_indices, loss_file):
     metric_names = list(results.keys())
     results_size = len(metric_names)
 
-    # Create subplots, vertically stacked
-    fig = make_subplots(rows=results_size, cols=1, subplot_titles=metric_names, vertical_spacing=0.08)
+    plot_height = 300
+    gap_pixels = 100
+    total_height = plot_height * results_size
+
+    safe_spacing = gap_pixels / total_height if results_size > 1 else 0
+
+    # Create subplots, 使用算好的安全间距
+    fig = make_subplots(
+        rows=results_size,
+        cols=1,
+        subplot_titles=metric_names,
+        vertical_spacing=safe_spacing
+    )
 
     for idx, metric_name in enumerate(metric_names):
         y = results[metric_name]
@@ -86,7 +97,6 @@ def plot_with_plotly(results, separator_indices, loss_file):
         for sep_idx, sep_type, sep_label in separator_indices:
             if sep_type == 'epoch':
                 fig.add_vline(x=sep_idx, line_dash="dash", line_color="red", opacity=0.5, row=idx + 1, col=1)
-                # Only add text labels to the first row to prevent clutter
                 if idx == 0:
                     fig.add_annotation(x=sep_idx, y=1, yref=f"y domain", text=sep_label, showarrow=False,
                                        textangle=-90, xanchor='right', font=dict(color="red", size=10), row=idx + 1,
@@ -94,8 +104,7 @@ def plot_with_plotly(results, separator_indices, loss_file):
             elif sep_type == 'file':
                 fig.add_vline(x=sep_idx, line_dash="dot", line_color="green", opacity=0.3, row=idx + 1, col=1)
 
-    # Dynamically adjust web page height based on the number of metrics
-    fig.update_layout(height=250 * results_size, title_text=f"Training Metrics - {loss_file}", showlegend=False)
+    fig.update_layout(height=total_height, title_text=f"Training Metrics - {loss_file}", showlegend=False)
 
     fig.update_yaxes(exponentformat='e')
 

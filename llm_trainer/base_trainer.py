@@ -346,28 +346,40 @@ class BaseTrainer:
 
                 parallel_kwargs['zero_optimization'] = zero_optimization
 
-            if (self.train_config.ds_config.bf16_config is not None
-                    and self.train_config.ds_config.bf16_config.enabled
-                    and is_bf16_supported()
-            ):
-                bf16_config = self.train_config.ds_config.bf16_config
-                bf16 = {
-                    'enabled': bf16_config.enabled
-                }
-                parallel_kwargs['bf16'] = bf16
-            elif self.train_config.ds_config.fp16_config and is_fp16_supported():
-                fp16_config = self.train_config.ds_config.fp16_config
-                fp16 = {
-                    'enabled': fp16_config.enabled,
-                    'loss_scale': fp16_config.loss_scale,
-                    'loss_scale_window': fp16_config.loss_scale_window,
-                    'initial_scale_power': fp16_config.initial_scale_power,
-                    'hysteresis': fp16_config.hysteresis,
-                    'min_loss_scale': fp16_config.min_loss_scale
-                }
+            compute_dtype = TrainerTools().compute_dtype
+            enable_bf16 = False
+            enable_fp16 = False
 
-                if fp16_config.fp16_opt_level is not None:
-                    fp16['fp16_opt_level'] = fp16_config.fp16_opt_level
+            if compute_dtype == 'bf16':
+                enable_bf16 = True
+            elif compute_dtype == 'fp16':
+                enable_fp16 = True
+            elif compute_dtype == 'fp32':
+                pass
+            elif (self.train_config.ds_config.bf16_config is not None
+                    and self.train_config.ds_config.bf16_config.enabled
+                    and is_bf16_supported()):
+                enable_bf16 = True
+            elif self.train_config.ds_config.fp16_config and is_fp16_supported():
+                enable_fp16 = True
+
+            if enable_bf16:
+                bf16: Dict[str, Any] = {'enabled': True}
+                parallel_kwargs['bf16'] = bf16
+            elif enable_fp16:
+                fp16: Dict[str, Any] = {'enabled': True}
+                fp16_config = self.train_config.ds_config.fp16_config
+                if fp16_config:
+                    fp16.update({
+                        'loss_scale': fp16_config.loss_scale,
+                        'loss_scale_window': fp16_config.loss_scale_window,
+                        'initial_scale_power': fp16_config.initial_scale_power,
+                        'hysteresis': fp16_config.hysteresis,
+                        'min_loss_scale': fp16_config.min_loss_scale
+                    })
+
+                    if fp16_config.fp16_opt_level is not None:
+                        fp16['fp16_opt_level'] = fp16_config.fp16_opt_level
 
                 parallel_kwargs['fp16'] = fp16
 

@@ -6,10 +6,12 @@ from .parallel import DsParallel, NoneParallel
 from .log import Logger
 
 
-parallel_types = {
+_PARALLEL_TYPES = {
     'ds': DsParallel,
     'none': NoneParallel
 }
+
+_SUPPORT_DTYPE = ['auto', 'bf16', 'fp16', 'fp32']
 
 class TrainerTools:
     def __init__(self):
@@ -17,16 +19,22 @@ class TrainerTools:
             TrainerTools._first_init = True
 
             self.parallel = self._new_parallel()
-
             self.tokenizer = Tokenizer()
-            self.use_amp = (self.parallel.device_type != 'cpu') and not isinstance(self.parallel, DsParallel)
+
+            self.compute_dtype = os.environ.get('COMPUTE_DTYPE', 'auto').lower()
+            if self.compute_dtype not in _SUPPORT_DTYPE:
+                raise ValueError(f'DTYPE not in {_SUPPORT_DTYPE}')
+
+            self.use_amp = (self.compute_dtype != 'fp32'
+                            and (self.parallel.device_type != 'cpu')
+                            and not isinstance(self.parallel, DsParallel))
 
             Logger.std_log(f'word_size={self.parallel.world_size}, use_amp={self.use_amp}')
 
     def _new_parallel(self):
         parallel_type = os.environ.get('PARALLEL_TYPE', 'none')
         Logger.std_log(f'parallel_type={parallel_type}')
-        return parallel_types[parallel_type]()
+        return _PARALLEL_TYPES[parallel_type]()
 
     def __new__(cls, *args, **kwargs):
         if not hasattr(TrainerTools, "_instance"):

@@ -246,7 +246,7 @@ class GRPOConfig:
     group_size: int = 12
     gradient_accumulation_steps: int = 1
     mixup_alpha: float = 1.0
-    loss_beta: float = 0.0 # or 0.04 for grpo
+    loss_beta: float = 0.04 # or 0.0 for loss_importance_sampling_level=sequence
     loss_clip_eps: float = 3e-4
     loss_clip_eps_high: Optional[float] = 4e-4
     loss_delta: Optional[float] = None

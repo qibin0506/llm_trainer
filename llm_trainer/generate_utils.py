@@ -152,6 +152,7 @@ def _generate(
         top_k: Optional[int],
         top_p: Optional[float],
         repetition_penalty: Optional[float] = 1.0,
+        exclude_penalty_tokens: Optional[List[int]] = None,
         pixel_values: Optional[torch.Tensor] = None,
         tokens_per_image: int = -1,
         suppress_tokens: Optional[List[int]] = None,
@@ -169,7 +170,11 @@ def _generate(
     :param device:
     """
     use_kv_cache = True
+
     special_tokens = list(TrainerTools().tokenizer.get_special_tokens_dict().values())
+    if exclude_penalty_tokens is not None:
+        special_tokens.extend(exclude_penalty_tokens)
+    special_tokens = list(set(special_tokens))
 
     # 确保输入维度是 [Batch, Seq]
     if tokens.dim() == 1:
@@ -240,7 +245,7 @@ def _generate(
 
             # 重复性惩罚
             if repetition_penalty and repetition_penalty != 1.0:
-                current_context = full_sequence_buffer[:, :prompt_len + i]
+                current_context = full_sequence_buffer[:, prompt_len:prompt_len + i]
                 logits = _repetition_penalty_warper(
                     logits,
                     current_context,
@@ -297,6 +302,7 @@ def _streaming_generate(
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
         repetition_penalty: Optional[float] = 1.0,
+        exclude_penalty_tokens: Optional[List[int]] = None,
         pixel_values: Optional[torch.Tensor] = None,
         tokens_per_image: int = -1,
         suppress_tokens: Optional[List[int]] = None,
@@ -317,6 +323,7 @@ def _streaming_generate(
         top_k=top_k,
         top_p=top_p,
         repetition_penalty=repetition_penalty,
+        exclude_penalty_tokens=exclude_penalty_tokens,
         pixel_values=pixel_values,
         tokens_per_image=tokens_per_image,
         suppress_tokens=suppress_tokens,
@@ -336,6 +343,7 @@ def streaming_generate(
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
         repetition_penalty: Optional[float] = 1.0,
+        exclude_penalty_tokens: Optional[List[int]] = None,
         pixel_values: Optional[torch.Tensor] = None,
         tokens_per_image: int = -1,
         suppress_tokens: Optional[List[int]] = None,
@@ -350,6 +358,7 @@ def streaming_generate(
         top_k=top_k,
         top_p=top_p,
         repetition_penalty=repetition_penalty,
+        exclude_penalty_tokens=exclude_penalty_tokens,
         pixel_values=pixel_values,
         tokens_per_image=tokens_per_image,
         suppress_tokens=suppress_tokens,
@@ -373,6 +382,7 @@ def generate(
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
         repetition_penalty: Optional[float] = 1.0,
+        exclude_penalty_tokens: Optional[List[int]] = None,
         pixel_values: Optional[torch.Tensor] = None,
         tokens_per_image: int = -1,
         suppress_tokens: Optional[List[int]] = None,
@@ -387,6 +397,7 @@ def generate(
         top_k=top_k,
         top_p=top_p,
         repetition_penalty=repetition_penalty,
+        exclude_penalty_tokens=exclude_penalty_tokens,
         suppress_tokens=suppress_tokens,
         pixel_values=pixel_values,
         tokens_per_image=tokens_per_image,
@@ -413,6 +424,7 @@ def batch_generate(
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
         repetition_penalty: Optional[float] = 1.0,
+        exclude_penalty_tokens: Optional[List[int]] = None,
         pixel_values: Optional[torch.Tensor] = None,
         tokens_per_image: int = -1,
         suppress_tokens: Optional[List[int]] = None,
@@ -422,7 +434,11 @@ def batch_generate(
     use_kv_cache = True
     end_token = TrainerTools().tokenizer.end
     pad_token_id = TrainerTools().tokenizer.pad
+
     special_tokens = list(TrainerTools().tokenizer.get_special_tokens_dict().values())
+    if exclude_penalty_tokens is not None:
+        special_tokens.extend(exclude_penalty_tokens)
+    special_tokens = list(set(special_tokens))
 
     if isinstance(model, VlmModel):
         tokens, attention_mask = batch_repeat_image_tok(tokens, tokens_per_image, attention_mask)
@@ -518,7 +534,7 @@ def batch_generate(
                 logits = _suppress_warper(logits, suppress_tokens)
 
             if repetition_penalty and repetition_penalty != 1.0:
-                current_context = full_sequence_buffer[:, :prompt_len + i]
+                current_context = full_sequence_buffer[:, prompt_len:prompt_len + i]
                 logits = _repetition_penalty_warper(
                     logits,
                     current_context,

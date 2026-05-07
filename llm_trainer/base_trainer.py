@@ -614,6 +614,9 @@ class BaseTrainer:
     def _get_pixel_values(self, batch_data):
         return None
 
+    def _calc_attention_mask(self, inputs):
+        return inputs != TrainerTools().tokenizer.pad
+
     def train(self):
         # 梯度累积步数
         loss_accumulation = 0.0
@@ -660,7 +663,7 @@ class BaseTrainer:
 
                     try:
                         inputs, labels = inputs.to(TrainerTools().parallel.device), labels.to(TrainerTools().parallel.device)
-                        attention_mask = inputs != TrainerTools().tokenizer.pad
+                        attention_mask = self._calc_attention_mask(inputs)
                         pixel_values = self._get_pixel_values(batch_data)
 
                         with autocast(TrainerTools().parallel.device_type):

@@ -32,3 +32,6 @@ class Trainer(BaseTrainer):
         file_path = self.train_config.file_dataset[file_idx]
         block_size = self.train_config.dataset_block_size
         return PretrainDataset(file_path, block_size, block_size), file_path
+
+    def _calc_attention_mask(self, inputs):
+        return None

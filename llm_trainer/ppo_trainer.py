@@ -380,7 +380,7 @@ class PPOTrainer(BaseTrainer):
 
         prompt_ids = left_pad_sequence(prompts, padding_value=pad_token_id)
         prompt_ids = prompt_ids.to(device)
-        prompt_masks = (prompt_ids != pad_token_id)
+        prompt_masks = self._calc_attention_mask(prompt_ids)
         prompt_len = prompt_ids.shape[1]
 
         max_new_tokens = ppo_config.gen_max_seq_len - prompt_len
@@ -406,7 +406,7 @@ class PPOTrainer(BaseTrainer):
                 )
 
                 completion_ids = full_ids[:, prompt_len:]
-                full_attention_mask = (full_ids != pad_token_id)
+                full_attention_mask = self._calc_attention_mask(full_ids)
                 full_position_ids = calc_position_ids(full_attention_mask)
 
                 old_log_probs = log_softmax(logitss, completion_ids)
@@ -516,7 +516,7 @@ class PPOTrainer(BaseTrainer):
         advantages_whitened = torch.masked_fill(advantages_whitened, ~completion_mask, 0.0)
 
         input_ids = torch.cat((prompt_ids, completion_ids), dim=1)
-        attention_mask = (input_ids != TrainerTools().tokenizer.pad)
+        attention_mask = self._calc_attention_mask(input_ids)
 
         ppo_stats = {
             "loss": 0.0, "moe_aux_loss": 0.0, "actor_loss": 0.0,
@@ -587,7 +587,7 @@ class PPOTrainer(BaseTrainer):
                             mb_ptx_inputs = px_fn_result['inputs'].to(TrainerTools().parallel.device)
                             mb_ptx_labels = px_fn_result['labels'].to(TrainerTools().parallel.device)
 
-                            mb_ptx_attention_mask = (mb_ptx_inputs != TrainerTools().tokenizer.pad)
+                            mb_ptx_attention_mask = self._calc_attention_mask(mb_ptx_inputs)
                             ptx_policy_output, _ = self.train_model(
                                 mb_ptx_inputs,
                                 forward_type='policy',

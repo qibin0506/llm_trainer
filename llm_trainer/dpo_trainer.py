@@ -182,8 +182,8 @@ class DPOTrainer(BaseTrainer):
                         rejected_inputs: torch.Tensor = batch_data['rejected_inputs'].to(TrainerTools().parallel.device)
                         rejected_labels: torch.Tensor = batch_data['rejected_labels'].to(TrainerTools().parallel.device)
 
-                        chosen_attention_masks: torch.Tensor = chosen_inputs != TrainerTools().tokenizer.pad
-                        rejected_attention_masks: torch.Tensor = rejected_inputs != TrainerTools().tokenizer.pad
+                        chosen_attention_masks: torch.Tensor = self._calc_attention_mask(chosen_inputs)
+                        rejected_attention_masks: torch.Tensor = self._calc_attention_mask(rejected_inputs)
 
                         # 在batch维度concat
                         # [chosen, chosen, reject, reject]

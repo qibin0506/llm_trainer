@@ -213,7 +213,7 @@ class GRPOTrainer(BaseTrainer):
         # [batch*group_size, max_prompt_len]
         prompt_ids = prompt_ids.repeat_interleave(group_size, 0)
         # [batch*group_size, max_prompt_len]
-        prompt_masks = prompt_ids != pad_token_id
+        prompt_masks = self._calc_attention_mask(prompt_ids)
 
         max_new_tokens = self.grpo_config.gen_max_seq_len - prompt_len
         if max_new_tokens <= 0:
@@ -388,7 +388,7 @@ class GRPOTrainer(BaseTrainer):
                             mb_ptx_inputs = px_fn_result['inputs'].to(TrainerTools().parallel.device)
                             mb_ptx_labels = px_fn_result['labels'].to(TrainerTools().parallel.device)
 
-                            mb_ptx_attention_mask = (mb_ptx_inputs != TrainerTools().tokenizer.pad)
+                            mb_ptx_attention_mask = self._calc_attention_mask(mb_ptx_inputs)
                             ptx_output = self.train_model(
                                 mb_ptx_inputs,
                                 attention_mask=mb_ptx_attention_mask,

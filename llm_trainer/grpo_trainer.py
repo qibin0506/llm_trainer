@@ -409,7 +409,7 @@ class GRPOTrainer(BaseTrainer):
                             approx_kl = torch.tensor(0.0, device=loss.device)
 
                 grpo_loss_unscaled = loss + aux_loss
-                ptx_loss_unscaled = grpo_config.ptx_coef * (ptx_loss + ptx_aux_loss)
+                ptx_loss_unscaled = grpo_config.ptx_coef * ptx_loss + ptx_aux_loss
 
                 if self.is_ds:
                     need_update_step = self.train_model.is_gradient_accumulation_boundary()

@@ -49,14 +49,14 @@ class ValueModel(nn.Module):
         self.value_head.weight.data.normal_(mean=0.0, std=0.01)
         self.value_head.bias.data.zero_()
 
-    def forward(self, *args, **kwargs) -> torch.Tensor:
+    def forward(self, *args, **kwargs) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         outputs = self.base_model(*args, **kwargs)
         # [batch_size, seq_len, hidden_size]
         last_hidden_state = outputs['hidden_states']
         # [batch_size, seq_len, 1]
         values = self.value_head(last_hidden_state)
         # [batch_size, seq_len]
-        return values.squeeze(-1)
+        return values.squeeze(-1), outputs['aux_loss']
 
 
 class PolicyAndValueModelWrapper(nn.Module):
@@ -413,7 +413,7 @@ class PPOTrainer(BaseTrainer):
                 del logitss
 
                 with autocast(TrainerTools().parallel.device_type):
-                    value_output = unwrapped_model.value_model(
+                    value_output, _ = unwrapped_model.value_model(
                         full_ids,
                         attention_mask=full_attention_mask,
                         position_ids=full_position_ids
@@ -554,7 +554,8 @@ class PPOTrainer(BaseTrainer):
 
                     logits_completion = policy_output['logits'][:, prompt_len - 1: -1]
                     current_log_probs = log_softmax(logits_completion, mb_completion_ids)
-                    current_values = value_output[:, prompt_len - 1: -1]
+                    current_values = value_output[0][:, prompt_len - 1: -1]
+                    value_aux_loss = value_output[1]
 
                     loss, actor_loss, value_loss, approx_kl, clip_frac, entropy = self.criterion(
                         log_probs=current_log_probs,
@@ -576,6 +577,9 @@ class PPOTrainer(BaseTrainer):
                         aux_loss = policy_output['aux_loss'].to(loss.dtype)
                     else:
                         aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
+
+                    if value_aux_loss is not None:
+                        aux_loss += value_aux_loss.to(loss.dtype)
 
                     # ptx
                     ptx_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
@@ -601,7 +605,7 @@ class PPOTrainer(BaseTrainer):
                                 ptx_aux_loss = ptx_policy_output['aux_loss'].to(ptx_loss.dtype)
                     # end
                 ppo_loss_unscaled = loss + aux_loss
-                ptx_loss_unscaled = ppo_config.ptx_coef * (ptx_loss + ptx_aux_loss)
+                ptx_loss_unscaled = ppo_config.ptx_coef * ptx_loss + ptx_aux_loss
 
                 if self.is_ds:
                     need_update_step = self.train_model.is_gradient_accumulation_boundary()

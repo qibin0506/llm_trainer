@@ -138,7 +138,6 @@ class DPOTrainer(BaseTrainer):
 
         batches_accumulated = 0
 
-        aux_loss_coef = self.train_config.loss_config.aux_loss_coef
         nll_loss_coef = self.dpo_config.nll_loss_coef
         beta = self.dpo_config.loss_beta
 
@@ -201,7 +200,7 @@ class DPOTrainer(BaseTrainer):
                             policy_outputs = self.train_model(concat_inputs, attention_mask=concat_attention_masks)
                             policy_logprobs_sums, policy_logprobs_means, policy_mask_sums = self._logprobs(policy_outputs['logits'], concat_labels)
 
-                            raw_aux_loss = policy_outputs.get('aux_loss', None)
+                            aux_loss = policy_outputs['aux_loss']
                             del policy_outputs
 
                             policy_chosen_logps = policy_logprobs_sums[:chosen_inputs.shape[0]]
@@ -224,8 +223,8 @@ class DPOTrainer(BaseTrainer):
                                 ref_rejected_logps
                             )
 
-                            if aux_loss_coef and raw_aux_loss is not None:
-                                aux_loss = aux_loss_coef * raw_aux_loss
+                            if aux_loss is not None:
+                                aux_loss = aux_loss.to(loss.dtype)
                             else:
                                 aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
 

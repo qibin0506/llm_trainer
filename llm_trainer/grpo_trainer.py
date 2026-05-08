@@ -372,8 +372,8 @@ class GRPOTrainer(BaseTrainer):
                         entropy = -(fp32_log_probs * fp32_mask).sum() / fp32_mask.sum().clamp(min=1.0)
                         completion_len = fp32_mask.sum(dim=-1).mean()
 
-                    if aux_loss is not None and self.train_config.loss_config.aux_loss_coef:
-                        aux_loss = self.train_config.loss_config.aux_loss_coef * aux_loss.float()
+                    if aux_loss is not None:
+                        aux_loss = aux_loss.to(loss.dtype)
                     else:
                         aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
 
@@ -396,8 +396,8 @@ class GRPOTrainer(BaseTrainer):
                             ptx_logits = ptx_output['logits']
                             ptx_loss = self.ptx_criterion(ptx_logits, mb_ptx_labels)
 
-                            if ptx_output['aux_loss'] is not None and self.train_config.loss_config.aux_loss_coef:
-                                ptx_aux_loss = self.train_config.loss_config.aux_loss_coef * ptx_output['aux_loss'].float()
+                            if ptx_output['aux_loss'] is not None:
+                                ptx_aux_loss = ptx_output['aux_loss'].to(ptx_loss.dtype)
                     # end
 
                     with torch.no_grad():

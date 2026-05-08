@@ -675,8 +675,8 @@ class BaseTrainer:
 
                             # calc loss
                             loss, ce_loss = self._calc_loss(inputs, attention_mask, result['logits'], labels)
-                            if result['aux_loss'] is not None and self.train_config.loss_config.aux_loss_coef:
-                                aux_loss = self.train_config.loss_config.aux_loss_coef * result['aux_loss'].float()
+                            if result['aux_loss'] is not None:
+                                aux_loss = result['aux_loss'].to(loss.dtype)
                             else:
                                 aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
 

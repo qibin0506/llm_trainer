@@ -572,9 +572,10 @@ class PPOTrainer(BaseTrainer):
                         value_error = value_mean - return_mean
                         completion_len = mb_completion_mask.sum(dim=-1).float().mean()
 
-                    aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
-                    if policy_output['aux_loss'] is not None and self.train_config.loss_config.aux_loss_coef:
-                        aux_loss = self.train_config.loss_config.aux_loss_coef * policy_output['aux_loss'].float()
+                    if policy_output['aux_loss'] is not None:
+                        aux_loss = policy_output['aux_loss'].to(loss.dtype)
+                    else:
+                        aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
 
                     # ptx
                     ptx_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
@@ -596,8 +597,8 @@ class PPOTrainer(BaseTrainer):
                             ptx_logits = ptx_policy_output['logits']
                             ptx_loss = self.ptx_criterion(ptx_logits, mb_ptx_labels)
 
-                            if ptx_policy_output['aux_loss'] is not None and self.train_config.loss_config.aux_loss_coef:
-                                ptx_aux_loss = self.train_config.loss_config.aux_loss_coef * ptx_policy_output['aux_loss'].float()
+                            if ptx_policy_output['aux_loss'] is not None:
+                                ptx_aux_loss = ptx_policy_output['aux_loss'].to(ptx_loss.dtype)
                     # end
                 ppo_loss_unscaled = loss + aux_loss
                 ptx_loss_unscaled = ppo_config.ptx_coef * (ptx_loss + ptx_aux_loss)

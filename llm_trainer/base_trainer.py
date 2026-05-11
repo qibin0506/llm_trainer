@@ -732,7 +732,7 @@ class BaseTrainer:
                             ce_loss_accumulation = 0.0
                             batches_accumulated = 0
 
-                            if (batch - last_ckpt_batch) >= self.train_config.eval_config.eval_batch_interval:
+                            if (batch - last_ckpt_batch) >= self.train_config.save_and_eval_interval:
                                 save_checkpoint(model=self.train_model, optimizer=self.optimizer)
                                 save_steps(
                                     epoch=epoch,

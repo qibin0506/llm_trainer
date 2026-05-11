@@ -215,11 +215,11 @@ class GRPOTrainer(BaseTrainer):
         # [batch*group_size, max_prompt_len]
         prompt_masks = self._calc_attention_mask(prompt_ids)
 
-        max_new_tokens = self.grpo_config.gen_max_seq_len - prompt_len
+        max_new_tokens = self.grpo_config.generate_config.max_seq_len - prompt_len
         if max_new_tokens <= 0:
             raise ValueError(
-                f"Prompt length ({prompt_len}) >= gen_max_seq_len ({self.grpo_config.gen_max_seq_len}). "
-                f"Cannot generate any tokens. Please increase gen_max_seq_len or reduce dataset_block_size."
+                f"Prompt length ({prompt_len}) >= max_seq_len ({self.grpo_config.generate_config.max_seq_len}). "
+                f"Cannot generate any tokens. Please increase max_seq_len or reduce dataset_block_size."
             )
 
         # [batch*group_size, max_prompt_len+max_gen_len]
@@ -228,12 +228,13 @@ class GRPOTrainer(BaseTrainer):
             tokens=prompt_ids,
             attention_mask=prompt_masks,
             max_new_tokens=max_new_tokens,
-            temperature=self.grpo_config.gen_temperature,
-            top_k=self.grpo_config.gen_top_k,
-            top_p=self.grpo_config.gen_top_p,
-            repetition_penalty=self.grpo_config.gen_repetition_penalty,
+            temperature=self.grpo_config.generate_config.temperature,
+            top_k=self.grpo_config.generate_config.top_k,
+            top_p=self.grpo_config.generate_config.top_p,
+            repetition_penalty=self.grpo_config.generate_config.repetition_penalty,
+            exclude_penalty_tokens=self.grpo_config.generate_config.exclude_penalty_tokens,
             device=device,
-            suppress_tokens=self.grpo_config.gen_suppress_tokens,
+            suppress_tokens=self.grpo_config.generate_config.suppress_tokens,
             return_logits=False
         )
 
@@ -540,7 +541,7 @@ class GRPOTrainer(BaseTrainer):
                             }
                         )
 
-                        if (batch - last_ckpt_batch) >= self.train_config.eval_config.eval_batch_interval:
+                        if (batch - last_ckpt_batch) >= self.train_config.save_and_eval_interval:
                             save_checkpoint(model=self.train_model, optimizer=self.optimizer)
                             save_steps(
                                 epoch=epoch,

@@ -383,11 +383,11 @@ class PPOTrainer(BaseTrainer):
         prompt_masks = self._calc_attention_mask(prompt_ids)
         prompt_len = prompt_ids.shape[1]
 
-        max_new_tokens = ppo_config.gen_max_seq_len - prompt_len
+        max_new_tokens = ppo_config.generate_config.max_seq_len - prompt_len
         if max_new_tokens <= 0:
             raise ValueError(
-                f"Prompt length ({prompt_len}) >= gen_max_seq_len ({ppo_config.gen_max_seq_len}). "
-                f"Cannot generate any tokens. Please increase gen_max_seq_len or reduce dataset_block_size."
+                f"Prompt length ({prompt_len}) >= max_seq_len ({ppo_config.generate_config.max_seq_len}). "
+                f"Cannot generate any tokens. Please increase max_seq_len or reduce dataset_block_size."
             )
 
         with torch.no_grad():
@@ -397,11 +397,12 @@ class PPOTrainer(BaseTrainer):
                     tokens=prompt_ids,
                     attention_mask=prompt_masks,
                     max_new_tokens=max_new_tokens,
-                    temperature=ppo_config.gen_temperature,
-                    top_k=ppo_config.gen_top_k,
-                    top_p=ppo_config.gen_top_p,
-                    repetition_penalty=ppo_config.gen_repetition_penalty,
-                    suppress_tokens=ppo_config.gen_suppress_tokens,
+                    temperature=ppo_config.generate_config.temperature,
+                    top_k=ppo_config.generate_config.top_k,
+                    top_p=ppo_config.generate_config.top_p,
+                    repetition_penalty=ppo_config.generate_config.repetition_penalty,
+                    exclude_penalty_tokens=ppo_config.generate_config.exclude_penalty_tokens,
+                    suppress_tokens=ppo_config.generate_config.suppress_tokens,
                     device=device
                 )
 
@@ -730,7 +731,7 @@ class PPOTrainer(BaseTrainer):
                             }
                         )
 
-                        if (batch - last_ckpt_batch) >= self.train_config.eval_config.eval_batch_interval:
+                        if (batch - last_ckpt_batch) >= self.train_config.save_and_eval_interval:
                             save_checkpoint(
                                 model=self.train_model,
                                 optimizer=self.optimizer,

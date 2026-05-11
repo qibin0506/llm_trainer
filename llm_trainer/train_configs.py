@@ -131,22 +131,14 @@ class KDConfig:
 
 
 @dataclass(kw_only=True)
-class EvalConfig:
-    """
-    训练参数配置项
-
-    Args:
-        eval_batch_interval (`int`, default is 100):
-            每隔多少个batch进行模型eval
-    """
-    max_seq_len: int
-
-    eval_batch_interval: int = 100
+class GenerateConfig:
+    max_seq_len: int = 512
     temperature: float = 1.0
     top_p: float = 0.95
     top_k: Optional[int] = None
-    gen_repetition_penalty: Optional[float] = 1.0
-
+    repetition_penalty: Optional[float] = 1.0
+    exclude_penalty_tokens: Optional[List[int]] = None
+    suppress_tokens: Optional[List[int]] = None
 
 
 @dataclass(kw_only=True)
@@ -230,12 +222,7 @@ class PPOConfig:
     normalize_rewards: bool = False
     normalize_method: str = 'RunningMeanStd' # RunningMeanStd or BatchStd
     whiten_rewards: bool = False
-    gen_max_seq_len: int
-    gen_temperature: Optional[float] = None
-    gen_top_k: Optional[int] = None
-    gen_top_p: Optional[float] = None
-    gen_repetition_penalty: Optional[float] = 1.0
-    gen_suppress_tokens: Optional[list[int]] = None
+    generate_config: GenerateConfig = field(default_factory=GenerateConfig)
 
 
 @dataclass(kw_only=True)
@@ -258,12 +245,7 @@ class GRPOConfig:
     vespo_k_neg: float = 3.0 # for sapo or vespo
     vespo_lambda_neg: float = 2.0 # for sapo or vespo
     ptx_coef: float = 0.0
-    gen_max_seq_len: int
-    gen_temperature: Optional[float] = None
-    gen_top_k: Optional[int] = None
-    gen_top_p: Optional[float] = None
-    gen_repetition_penalty: Optional[float] = 1.0
-    gen_suppress_tokens: Optional[list[int]] = None
+    generate_config: GenerateConfig = field(default_factory=GenerateConfig)
 
 
 @dataclass(kw_only=True)
@@ -318,7 +300,8 @@ class TrainConfig:
     optim_config: OptimConfig = field(default_factory=OptimConfig)
     ds_config: DsConfig = field(default_factory=DsConfig)
 
-    eval_config: EvalConfig = field(default_factory=EvalConfig)
+    eval_config: GenerateConfig = field(default_factory=GenerateConfig)
+    save_and_eval_interval: int = 100
 
     pretrain_config: Optional[PretrainConfig] = None
     sft_config: Optional[SFTConfig] = None

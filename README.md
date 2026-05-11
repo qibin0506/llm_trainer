@@ -132,6 +132,7 @@ def _get_train_config(
     ref_checkpoint = torch.load('./sft.bin', weights_only=True) if os.path.exists('./sft.bin') else None
     
     # 2. 基础配置
+    eval_batch_interval = 100
     gradient_accumulation_steps = 3
     eval_batch_interval = 10 if train_stage in ['grpo', 'ppo'] else 100
 
@@ -173,6 +174,16 @@ def _get_train_config(
         gradient_accumulation_steps=gradient_accumulation_steps
     ) if train_stage == 'sft' else None
 
+    generate_config = train_configs.GenerateConfig(
+        max_seq_len=2048,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=40,
+        repetition_penalty=1.15,
+        exclude_penalty_tokens=TrainerTools().tokenizer.encode('\n'),
+        suppress_tokens=None
+    )
+
     ppo_config = train_configs.PPOConfig(
         ppo_epochs=4,
         ppo_batch_size=5,
@@ -180,7 +191,7 @@ def _get_train_config(
         vf_coef=0.5,
         kl_beta=0.01,
         ref_model_checkpoint=ref_checkpoint,
-        gen_max_seq_len=2048,
+        generate_config=generate_config,
         # PPO 独立的 Value Model 优化器配置
         value_optim_config=train_configs.OptimConfig(...)
     ) if train_stage == 'ppo' else None
@@ -195,6 +206,8 @@ def _get_train_config(
         file_dataset=file_dataset,
         dataset_block_size=model_config.max_position_embeddings,
         optim_config=optim_config,
+        save_and_eval_interval=eval_batch_interval,
+        eval_config=generate_config,
         ds_config=ds_config,
         sft_config=sft_config,
         ppo_config=ppo_config,

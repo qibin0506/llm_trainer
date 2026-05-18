@@ -303,6 +303,21 @@ class BaseTrainer:
                 'train_micro_batch_size_per_gpu': self.train_config.batch_size
             }
 
+            if self.train_config.ds_config.wall_clock_breakdown:
+                parallel_kwargs['wall_clock_breakdown'] = True
+
+            if (self.train_config.ds_config.flops_profiler
+                    and self.train_config.ds_config.flops_profiler.enabled):
+                flops_cfg = self.train_config.ds_config.flops_profiler
+                parallel_kwargs['flops_profiler'] = {
+                    'enabled': flops_cfg.enabled,
+                    'profile_step': flops_cfg.profile_step,
+                    'module_depth': flops_cfg.module_depth,
+                    'top_modules': flops_cfg.top_modules,
+                    'detailed': flops_cfg.detailed,
+                    'output_file': flops_cfg.output_file
+                }
+
             if self.train_config.ds_config.zero_config:
                 zero_config = self.train_config.ds_config.zero_config
                 zero_optimization: Dict[str, Any] = {'stage': zero_config.stage}
@@ -319,18 +334,34 @@ class BaseTrainer:
                     zero_optimization['reduce_bucket_size'] = zero_config.reduce_bucket_size
                 if zero_config.contiguous_gradients is not None:
                     zero_optimization['contiguous_gradients'] = zero_config.contiguous_gradients
+                if zero_config.ignore_unused_parameters:
+                    zero_optimization['ignore_unused_parameters'] = True
+                if zero_config.communication_data_type:
+                    zero_optimization['communication_data_type'] = zero_config.communication_data_type
 
-                if isinstance(zero_config, DsZero2Config) or isinstance(zero_config, DsZero3Config):
+                if isinstance(zero_config, (DsZero2Config, DsZero3Config)):
                     if zero_config.offload_optimizer is not None:
                         zero_optimization['offload_optimizer'] = {
                             "device": zero_config.offload_optimizer.device,
                             "pin_memory": zero_config.offload_optimizer.pin_memory
                         }
+
+                        if zero_config.offload_optimizer.device == 'nvme':
+                            if zero_config.offload_optimizer.nvme_path: zero_optimization['offload_optimizer']["nvme_path"] = zero_config.offload_optimizer.nvme_path
+                            if zero_config.offload_optimizer.buffer_count: zero_optimization['offload_optimizer']["buffer_count"] = zero_config.offload_optimizer.buffer_count
+                            if zero_config.offload_optimizer.buffer_size: zero_optimization['offload_optimizer']["buffer_size"] = zero_config.offload_optimizer.buffer_size
+                            if zero_config.offload_optimizer.max_in_cpu: zero_optimization['offload_optimizer']["max_in_cpu"] = zero_config.offload_optimizer.max_in_cpu
                     if zero_config.offload_param is not None:
                         zero_optimization['offload_param'] = {
                             "device": zero_config.offload_param.device,
                             "pin_memory": zero_config.offload_param.pin_memory
                         }
+
+                        if zero_config.offload_param.device == 'nvme':
+                            if zero_config.offload_param.nvme_path: zero_optimization['offload_param']["nvme_path"] = zero_config.offload_param.nvme_path
+                            if zero_config.offload_param.buffer_count: zero_optimization['offload_param']["buffer_count"] = zero_config.offload_param.buffer_count
+                            if zero_config.offload_param.buffer_size: zero_optimization['offload_param']["buffer_size"] = zero_config.offload_param.buffer_size
+                            if zero_config.offload_param.max_in_cpu: zero_optimization['offload_param']["max_in_cpu"] = zero_config.offload_param.max_in_cpu
 
                 if isinstance(zero_config, DsZero3Config):
                     if zero_config.sub_group_size is not None:
@@ -345,6 +376,14 @@ class BaseTrainer:
                         zero_optimization['stage3_max_reuse_distance'] = zero_config.stage3_max_reuse_distance
                     if zero_config.stage3_gather_16bit_weights_on_model_save is not None:
                         zero_optimization['stage3_gather_16bit_weights_on_model_save'] = zero_config.stage3_gather_16bit_weights_on_model_save
+                    if zero_config.memory_efficient_linear is not None:
+                        zero_optimization['memory_efficient_linear'] = zero_config.memory_efficient_linear
+                    if zero_config.zero_quantized_weights:
+                        zero_optimization['zero_quantized_weights'] = True
+                    if zero_config.zero_hpz_partition_size > 1:
+                        zero_optimization['zero_hpz_partition_size'] = zero_config.zero_hpz_partition_size
+                    if zero_config.zero_quantized_gradients:
+                        zero_optimization['zero_quantized_gradients'] = True
 
                 parallel_kwargs['zero_optimization'] = zero_optimization
 

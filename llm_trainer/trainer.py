@@ -1,11 +1,15 @@
-from typing import List, Tuple
-
+from typing import List, Tuple, Optional, Callable
+import torch
 from torch.utils.data import Dataset
 
 from .base_trainer import BaseTrainer
-from .train_configs import TrainConfig
 from .utils import pretrain_collate_fn
 from .dataset import PretrainDataset
+
+from .train_configs import (
+    TrainConfig,
+    GenerateConfig
+)
 
 
 class Trainer(BaseTrainer):
@@ -14,10 +18,12 @@ class Trainer(BaseTrainer):
             *,
             train_config: TrainConfig,
             eval_prompts: List[str],
+            generation_service: Optional[Callable[[torch.nn.Module, List[str], int, GenerateConfig, str], List[List[int]]]] = None,
     ):
         super().__init__(
             train_config=train_config,
             eval_prompts=eval_prompts,
+            generation_service=generation_service,
             kd_config=train_config.pretrain_config.kd_config,
             gradient_accumulation_steps=train_config.pretrain_config.gradient_accumulation_steps
         )

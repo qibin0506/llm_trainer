@@ -1,4 +1,5 @@
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Optional, Tuple, List, Dict, Any, Callable
+import os
 import copy
 import gc
 import math
@@ -14,29 +15,29 @@ from llm_model import LlmModel
 from .parallel import DsParallel
 from .tools import TrainerTools
 from .loss import LMLoss, KDLoss
-from .eval import submit_gen_task
 from .partition_utils import unwrap_model_for_generation
-
+from .log import (
+    Logger,
+    _get_log_dir
+)
 from .train_configs import (
     TrainConfig,
     DsZero2Config,
     DsZero3Config,
-    KDConfig
+    KDConfig,
+    GenerateConfig
 )
-
 from .scheduler import (
     LRScheduler,
     WarmupCosineAnnealingLRScheduler,
     NoneLRScheduler
 )
-
 from .checkpoint import (
     load_checkpoint,
     save_checkpoint,
     load_steps,
     save_steps,
 )
-
 from .utils import (
     default_seed,
     set_seed,
@@ -45,8 +46,8 @@ from .utils import (
     is_fp16_supported,
     empty_cache
 )
+from .generate_utils import generate
 
-from .log import Logger
 
 class BaseTrainer:
     def __init__(
@@ -54,6 +55,7 @@ class BaseTrainer:
             *,
             train_config: TrainConfig,
             eval_prompts: List[str],
+            generation_service: Optional[Callable[[torch.nn.Module, List[str], int, GenerateConfig, str], List[List[int]]]] = None,
             kd_config: Optional[KDConfig] = None,
             gradient_accumulation_steps: int = 1
     ):
@@ -68,6 +70,7 @@ class BaseTrainer:
         self.resume_file_idx = 0
         self.resume_batch_idx = 0
 
+        self.generation_service = generation_service
         self.kd_config = kd_config
         self.gradient_accumulation_steps = max(1, gradient_accumulation_steps)
 
@@ -593,22 +596,48 @@ class BaseTrainer:
         if eval_prompt is None:
             return
 
-        with unwrap_model_for_generation(self.train_model) as eval_model:
-            if TrainerTools().parallel.is_main_process:
-                eval_model = self._check_eval_model(eval_model)
-                eval_model.eval()
+        if self.generation_service:
+            response_ids = self.generation_service(
+                self.train_model, [eval_prompt], 1, self.train_config.eval_config, 'eval'
+            )
 
-                eval_pixel_values, tokens_per_image = self._get_eval_pixel_values_and_tokens_count(self.eval_idx)
-                submit_gen_task(
-                    eval_model,
-                    self.train_config,
-                    tag=tag,
-                    prompt=eval_prompt,
-                    pixel_values=eval_pixel_values,
-                    tokens_per_image=tokens_per_image
-                )
+            if TrainerTools().parallel.is_main_process and response_ids:
+                gen_text = TrainerTools().tokenizer.decode(response_ids[0])
+                with open(os.path.join(_get_log_dir(), 'gen.txt'), 'a') as f:
+                    f.write(f"{tag}, gen->{eval_prompt}{gen_text}\n")
+        else:
+            with unwrap_model_for_generation(self.train_model) as eval_model:
+                if TrainerTools().parallel.is_main_process:
+                    eval_model = self._check_eval_model(eval_model)
+                    eval_model.eval()
 
-                eval_model.train()
+                    eval_pixel_values, tokens_per_image = self._get_eval_pixel_values_and_tokens_count(self.eval_idx)
+                    if tokens_per_image is None:
+                        tokens_per_image = -1
+                        eval_pixel_values = None
+
+                    tokens = TrainerTools().tokenizer.encode(eval_prompt, unsqueeze=True, covert_tensor=True)
+                    max_new_tokens = max(self.train_config.eval_config.max_seq_len - tokens.shape[1], 0)
+
+                    gen_result = generate(
+                        eval_model,
+                        prompt=tokens,
+                        max_new_tokens=max_new_tokens,
+                        temperature=self.train_config.eval_config.temperature,
+                        top_k=self.train_config.eval_config.top_k,
+                        top_p=self.train_config.eval_config.top_p,
+                        repetition_penalty=self.train_config.eval_config.repetition_penalty,
+                        exclude_penalty_tokens=self.train_config.eval_config.exclude_penalty_tokens,
+                        suppress_tokens=self.train_config.eval_config.suppress_tokens,
+                        pixel_values=eval_pixel_values,
+                        tokens_per_image=tokens_per_image,
+                        device=TrainerTools().parallel.device
+                    )
+
+                    with open(os.path.join(_get_log_dir(), 'gen.txt'), 'a') as f:
+                        f.write(f"{tag}, gen->{gen_result}\n")
+
+                    eval_model.train()
 
         TrainerTools().parallel.wait('eval')
 

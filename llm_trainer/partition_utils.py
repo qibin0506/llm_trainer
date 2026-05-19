@@ -47,7 +47,7 @@ def sync_model_params(_from: nn.Module, _to: Optional[nn.Module], mixup_alpha: f
         当前函数不适用于_to是一个zero3模型
     """
     if isinstance(TrainerTools().parallel, DsParallel):
-        state_dict = _get_ds_model_params(_from, only_rank0=_to is None)
+        state_dict = get_ds_model_params(_from, only_rank0=_to is None)
     else:
         state_dict = _from.state_dict()
 
@@ -79,7 +79,7 @@ def unwrap_model(model) -> nn.Module:
     return model
 
 
-def _get_ds_full_state_dict_on_rank0(model: nn.Module) -> Optional[dict]:
+def get_ds_full_state_dict_on_rank0(model: nn.Module) -> Optional[dict]:
     """
         需要在所有rank上调用，然后只有rank0有值
     """
@@ -106,7 +106,7 @@ def _get_ds_full_state_dict_on_rank0(model: nn.Module) -> Optional[dict]:
     return None
 
 
-def _get_ds_model_params(model: nn.Module, only_rank0=False):
+def get_ds_model_params(model: nn.Module, only_rank0=False):
     """
         从一个正在运行的 DeepSpeedEngine 中高效地提取完整的 FP32 state_dict，
         兼容 ZeRO Stages 0, 1, 2, 3。
@@ -115,7 +115,7 @@ def _get_ds_model_params(model: nn.Module, only_rank0=False):
 
     import deepspeed
     assert isinstance(model, deepspeed.DeepSpeedEngine)
-    state_dict = _get_ds_full_state_dict_on_rank0(model)
+    state_dict = get_ds_full_state_dict_on_rank0(model)
 
     # 现在，只有 rank 0 上的 state_dict 是一个有效的字典，其他 rank 上是 None。
     # 我们需要将其广播给所有进程。

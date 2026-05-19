@@ -596,7 +596,7 @@ class BaseTrainer:
         if eval_prompt is None:
             return
 
-        if self.generation_service:
+        if self.generation_service is not None:
             response_ids = self.generation_service(
                 self.train_model, [eval_prompt], 1, self.train_config.eval_config, 'eval'
             )

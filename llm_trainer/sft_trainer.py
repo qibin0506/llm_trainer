@@ -23,14 +23,14 @@ class SFTTrainer(BaseTrainer):
     SFTTrainer
 
     Args:
-        train_config (TrainConfig):
+        train_config:
             - 全局训练配置，若为多模态模型，model_config 需为 VLMConfig 类型。
 
-        eval_prompts (List[str]):
+        eval_prompts:
             - 评估阶段用于测试生成的文本提示词列表。
             - [num_eval_prompts] 长度的字符串列表。
 
-        generation_service (Optional[Callable]):
+        generation_service:
             - 外部自定义生成服务接口
             - 签名:
                 1. model (torch.nn.Module): 传入的正在执行训练的模型实例（可能已被 DeepSpeed 封装）。
@@ -43,7 +43,7 @@ class SFTTrainer(BaseTrainer):
             - 返回值:
                 - List[List[int]]: 外层列表长度为 [batch_size * group_size]，内层为生成的 Completion Token ID 序列（不应包含 Prompt）。
 
-        eval_image_tags (Optional[List[str]]):
+        eval_image_tags:
             - 用于多模态评估时，与 eval_prompts 严格一一对应的图像 Tag 标识列表（用于通过图片加载器解析像素特征）。
             - 与 eval_prompts 长度相同的列表，即 [num_eval_prompts]。
     """

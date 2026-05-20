@@ -17,14 +17,14 @@ class Trainer(BaseTrainer):
     Trainer
 
     Args:
-        train_config (TrainConfig):
+        train_config:
             - 全局训练配置，包含预训练配置 pretrain_config。
 
-        eval_prompts (List[str]):
+        eval_prompts:
             - 评估测试的提示词列表。
             - [num_eval_prompts] 长度的字符串列表。
 
-        generation_service (Optional[Callable]):
+        generation_service:
             - 自定义自回归生成服务。
             - 签名:
                 1. model (torch.nn.Module): 传入的正在执行训练的模型实例（可能已被 DeepSpeed 封装）。

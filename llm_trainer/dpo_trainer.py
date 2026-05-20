@@ -33,14 +33,14 @@ class DPOTrainer(BaseTrainer):
     DPOTrainer
 
     Args:
-        train_config (TrainConfig):
+        train_config:
             - 全局训练配置，必须包含 dpo_config。
 
-        eval_prompts (List[str]):
+        eval_prompts:
             - 评估阶段生成测试的提示词列表。
             - [num_eval_prompts] 长度的字符串列表。
 
-        generation_service (Optional[Callable]):
+        generation_service:
             - 外部自定义生成服务接口。
             - 签名:
                 1. model (torch.nn.Module): 传入的正在执行训练的模型实例（可能已被 DeepSpeed 封装）。

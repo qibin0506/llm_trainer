@@ -51,35 +51,35 @@ from .generate_utils import generate
 
 class BaseTrainer:
     """
-    BaseTrainer
+        BaseTrainer
 
-    Args:
-        train_config (TrainConfig):
-            - 全局训练配置类，包含模型配置、优化器、调度器以及特定算法配置（如 DPO、PPO、GRPO 等）。
+        Args:
+            train_config:
+                - 全局训练配置类，包含模型配置、优化器、调度器以及特定算法配置（如 DPO、PPO、GRPO 等）。
 
-        eval_prompts (List[str]):
-            - 用于评估阶段生成测试的文本提示词列表。
-            - 长度为 [num_eval_prompts] 的字符串列表。
+            eval_prompts:
+                - 用于评估阶段生成测试的文本提示词列表。
+                - 长度为 [num_eval_prompts] 的字符串列表。
 
-        generation_service (Optional[Callable]):
-            - 外部自定义生成服务接口
-            - 签名:
-                1. model (torch.nn.Module): 传入的正在执行训练的模型实例（可能已被 DeepSpeed 封装）。
-                2. prompts (List[str]): 待生成的一组 Prompt 文本。Shape: [batch_size]。
-                3. group_size (int): 每个 Prompt 需要并行生成的候选 Completion 数量（Eval/PPO 阶段常为 1，GRPO 阶段为 grpo_config.group_size）。
-                4. config (GenerateConfig): 生成解码控制配置（如 temp, top_p, top_k 等）。
-                5. task_type (str): 调用任务上下文类型，如 'eval', 'ppo', 'grpo'。
-                6. pixel_values (Optional[torch.Tensor]): VLM 多模态特征张量。Shape: [batch_size, channels, height, width] 或 [batch_size * num_images, channels, height, width]。
-                7. tokens_per_image (Optional[int]): 每个图片标签对应的虚拟 Token 数值标量。
-            - 返回值:
-                - List[List[int]]: 外层列表长度为 [batch_size * group_size]，内层为生成的 Completion Token ID 序列（不应包含 Prompt）。
+            generation_service:
+                - 外部自定义生成服务接口
+                - 签名:
+                    1. model (torch.nn.Module): 传入的正在执行训练的模型实例（可能已被 DeepSpeed 封装）。
+                    2. prompts (List[str]): 待生成的一组 Prompt 文本。Shape: [batch_size]。
+                    3. group_size (int): 每个 Prompt 需要并行生成的候选 Completion 数量（Eval/PPO 阶段常为 1，GRPO 阶段为 grpo_config.group_size）。
+                    4. config (GenerateConfig): 生成解码控制配置（如 temp, top_p, top_k 等）。
+                    5. task_type (str): 调用任务上下文类型，如 'eval', 'ppo', 'grpo'。
+                    6. pixel_values (Optional[torch.Tensor]): VLM 多模态特征张量。Shape: [batch_size, channels, height, width] 或 [batch_size * num_images, channels, height, width]。
+                    7. tokens_per_image (Optional[int]): 每个图片标签对应的虚拟 Token 数值标量。
+                - 返回值:
+                    - List[List[int]]: 外层列表长度为 [batch_size * group_size]，内层为生成的 Completion Token ID 序列（不应包含 Prompt）。
 
-        kd_config (Optional[KDConfig]):
-            - 知识蒸馏 (Knowledge Distillation) 配置类。
+            kd_config:
+                - 知识蒸馏 (Knowledge Distillation) 配置类。
 
-        gradient_accumulation_steps (int):
-            - 梯度累积步数，用于通过累积多批数据的梯度来模拟更大的 Global Batch Size。
-    """
+            gradient_accumulation_steps:
+                - 梯度累积步数，用于通过累积多批数据的梯度来模拟更大的 Global Batch Size。
+        """
     def __init__(
             self,
             *,

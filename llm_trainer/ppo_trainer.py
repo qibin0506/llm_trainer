@@ -86,10 +86,10 @@ class PPOTrainer(BaseTrainer):
     PPOTrainer
 
     Args:
-        train_config (TrainConfig):
+        train_config:
             - 全局训练配置，必须包含 ppo_config。
 
-        reward_func (Callable):
+        reward_func:
             - 奖励函数，对生成的 Response 打分。
             - 签名:
                 1. prompts (List[torch.Tensor]): 长度为 [B] 的列表，内层 Tensor 形状为 [prompt_len]，表示左填充对齐前的原始 prompt ids。
@@ -98,7 +98,7 @@ class PPOTrainer(BaseTrainer):
             - 返回值:
                 - List[float]: 长度为 [B] 的标量奖励数值一维列表。
 
-        generation_service (Optional[Callable]):
+        generation_service:
             - 外部自定义生成服务接口
             - 签名:
                 1. model (torch.nn.Module): 传入的正在执行训练的模型实例（可能已被 DeepSpeed 封装）。
@@ -111,7 +111,7 @@ class PPOTrainer(BaseTrainer):
             - 返回值:
                 - List[List[int]]: 外层列表长度为 [batch_size * group_size]，内层为生成的 Completion Token ID 序列（不应包含 Prompt）。
 
-        ptx_builder (Optional[Callable]):
+        ptx_builder:
             -  构建预训练混合数据 (PTX Data Mixture) 的回调函数。
             - 签名:
                 1. prompts (List[torch.Tensor]): 长度为 [B] 的列表，内层 Tensor 形状为 [prompt_len]。
@@ -119,7 +119,7 @@ class PPOTrainer(BaseTrainer):
             - 返回值:
                 - List[torch.Tensor]: 长度为 [B] 的训练样本 Token 张量列表，每个 Tensor 形状为 [seq_len]。
 
-        eval_prompts (List[str]):
+        eval_prompts:
             - 评估测试的提示词列表。
             - [num_eval_prompts] 长度的字符串列表。
     """
@@ -436,7 +436,7 @@ class PPOTrainer(BaseTrainer):
 
         with torch.no_grad():
             if self.generation_service is not None:
-                prompt_texts = [TrainerTools().tokenizer.decode(p.tolist()) for p in prompts]
+                prompt_texts = [TrainerTools().tokenizer.decode(p) for p in prompts]
                 completion_ids_list = self.generation_service(
                     self.train_model, prompt_texts, 1, ppo_config.generate_config, 'ppo', None, None
                 )

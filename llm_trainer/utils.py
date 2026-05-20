@@ -437,10 +437,13 @@ def join_batch(batch_data: list[dict]) -> dict:
 # 如果pad_sequence不支持padding_side参数，则将改参数置为False，使用反转的方式
 _use_origin_pad_sequence = True
 def left_pad_sequence(
-        sequences: Union[torch.Tensor, List[torch.Tensor]],
+        sequences: Union[torch.Tensor, List[torch.Tensor], List[List[int]]],
         padding_value: float,
 ) -> torch.Tensor:
     global _use_origin_pad_sequence
+
+    if isinstance(sequences, list) and len(sequences) > 0 and isinstance(sequences[0], list):
+        sequences = [torch.tensor(seq, dtype=torch.long) for seq in sequences]
 
     if _use_origin_pad_sequence:
         try:

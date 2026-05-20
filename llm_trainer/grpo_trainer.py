@@ -7,15 +7,12 @@ import torch.nn.functional as F
 from itertools import islice
 
 from .base_trainer import BaseTrainer
+from .train_configs import TrainConfig
 from .dataset import RLDataset
 from .loss import GRPOLoss, LMLoss
 from .tools import TrainerTools
 from .generate_utils import batch_generate
 from .log import Logger
-from .train_configs import (
-    TrainConfig,
-    GenerateConfig
-)
 from .utils import (
     autocast,
     left_pad_sequence,
@@ -44,7 +41,6 @@ class GRPOTrainer(BaseTrainer):
             *,
             train_config: TrainConfig,
             reward_func: Callable[[List[torch.Tensor], torch.Tensor, List[Optional[torch.Tensor]]], List[float]],
-            generation_service: Optional[Callable[[torch.nn.Module, List[str], int, GenerateConfig, str], List[List[int]]]] = None,
             ptx_builder: Optional[Callable[[List[torch.Tensor], List[torch.Tensor]], List[torch.Tensor]]] = None,
             eval_prompts: List[str]
     ):
@@ -52,7 +48,6 @@ class GRPOTrainer(BaseTrainer):
         super().__init__(
             train_config=train_config,
             eval_prompts=eval_prompts,
-            generation_service=generation_service,
             gradient_accumulation_steps=self.grpo_config.gradient_accumulation_steps
         )
 
@@ -204,7 +199,53 @@ class GRPOTrainer(BaseTrainer):
         # [batch*group_size, 1]
         return advantages.unsqueeze(1)  # Add dimension for token-wise operations
 
-    def _generate_rollout_data(self, batch_data: List[dict]):
+    def _generate_completions(self, model, prompts, group_size: int):
+        pad_token_id = TrainerTools().tokenizer.pad
+        device = TrainerTools().parallel.device
+
+        # 左边添加pad，对齐prompt长度
+        # [batch, max_prompt_len]
+        prompt_ids = left_pad_sequence(prompts, padding_value=pad_token_id)
+        prompt_ids = prompt_ids.to(device)
+
+        prompt_len = prompt_ids.shape[1]
+
+        # [batch*group_size, max_prompt_len]
+        prompt_ids = prompt_ids.repeat_interleave(group_size, 0)
+        # [batch*group_size, max_prompt_len]
+        prompt_masks = self._calc_attention_mask(prompt_ids)
+
+        max_new_tokens = self.grpo_config.generate_config.max_seq_len - prompt_len
+        if max_new_tokens <= 0:
+            raise ValueError(
+                f"Prompt length ({prompt_len}) >= max_seq_len ({self.grpo_config.generate_config.max_seq_len}). "
+                f"Cannot generate any tokens. Please increase max_seq_len or reduce dataset_block_size."
+            )
+
+        # [batch*group_size, max_prompt_len+max_gen_len]
+        outputs, _ = batch_generate(
+            model=model,
+            tokens=prompt_ids,
+            attention_mask=prompt_masks,
+            max_new_tokens=max_new_tokens,
+            temperature=self.grpo_config.generate_config.temperature,
+            top_k=self.grpo_config.generate_config.top_k,
+            top_p=self.grpo_config.generate_config.top_p,
+            repetition_penalty=self.grpo_config.generate_config.repetition_penalty,
+            exclude_penalty_tokens=self.grpo_config.generate_config.exclude_penalty_tokens,
+            device=device,
+            suppress_tokens=self.grpo_config.generate_config.suppress_tokens,
+            return_logits=False
+        )
+
+        # [batch*group_size, max_gen_len]
+        completion_ids = outputs[:, prompt_len:]
+        # [batch*group_size, max_gen_len]
+        completion_masks = completion_ids != pad_token_id
+
+        return prompt_ids, prompt_masks, completion_ids, completion_masks
+
+    def _generate_rollout_data(self, generate_model, batch_data: List[dict]):
         prompts = [item["prompt"] for item in batch_data]
         answers = [item["answer"] for item in batch_data]
         group_size = self.grpo_config.group_size
@@ -217,86 +258,19 @@ class GRPOTrainer(BaseTrainer):
             ptx_data = []
         # end
 
-        pad_token_id = TrainerTools().tokenizer.pad
-        device = TrainerTools().parallel.device
-
-        prompt_ids = left_pad_sequence(prompts, padding_value=pad_token_id)
-        prompt_ids = prompt_ids.to(device)
-        prompt_len = prompt_ids.shape[1]
-
-        # [batch*group_size, max_prompt_len]
-        prompt_ids = prompt_ids.repeat_interleave(group_size, 0)
-        prompt_masks = self._calc_attention_mask(prompt_ids)
-
-        max_new_tokens = self.grpo_config.generate_config.max_seq_len - prompt_len
-        if max_new_tokens <= 0:
-            raise ValueError(
-                f"Prompt length ({prompt_len}) >= max_seq_len ({self.grpo_config.generate_config.max_seq_len}). "
-                f"Cannot generate any tokens. Please increase max_seq_len or reduce dataset_block_size."
-            )
-
+        # 使用no_grad替换inference_mode
+        # 修复问题：Inference tensors cannot be saved for backward. To work around you can make a clone to get a normal
         with torch.no_grad():
-            if self.generation_service is not None:
-                prompt_texts = [TrainerTools().tokenizer.decode(p.tolist()) for p in prompts]
-                completion_ids_list = self.generation_service(
-                    self.train_model, prompt_texts, group_size, self.grpo_config.generate_config, 'grpo'
-                )
+        # with torch.inference_mode():
+            prompt_ids, prompt_mask, completion_ids, completion_mask = self._generate_completions(generate_model, prompts, group_size)
+            input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+            attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
 
-                padded_completions = []
-                max_comp_len = max((len(c) for c in completion_ids_list), default=0)
-                if max_comp_len == 0:
-                    max_comp_len = 1
-                max_comp_len = min(max_comp_len, max_new_tokens)
-
-                for comp in completion_ids_list:
-                    comp = comp[:max_comp_len]
-                    pad_len = max_comp_len - len(comp)
-                    padded_completions.append(comp + [pad_token_id] * pad_len)
-
-                completion_ids = torch.tensor(padded_completions, dtype=torch.long, device=device)
-                completion_mask = completion_ids != pad_token_id
-
-                input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
-                attention_mask = torch.cat([prompt_masks, completion_mask], dim=1)
-
-                with autocast(TrainerTools().parallel.device_type):
-                    old_log_probs, _ = self._compute_log_probs(self.train_model, input_ids, attention_mask)
+            with autocast(TrainerTools().parallel.device_type):
+                old_log_probs, _ = self._compute_log_probs(generate_model, input_ids, attention_mask)
 
                 if self.ref_model:
-                    with autocast(TrainerTools().parallel.device_type):
-                        ref_log_probs, _ = self._compute_log_probs(self.ref_model, input_ids, attention_mask)
-                else:
-                    ref_log_probs = None
-            else:
-                with unwrap_model_for_generation(self.train_model) as unwrapped_model:
-                    outputs, _ = batch_generate(
-                        model=unwrapped_model,
-                        tokens=prompt_ids,
-                        attention_mask=prompt_masks,
-                        max_new_tokens=max_new_tokens,
-                        temperature=self.grpo_config.generate_config.temperature,
-                        top_k=self.grpo_config.generate_config.top_k,
-                        top_p=self.grpo_config.generate_config.top_p,
-                        repetition_penalty=self.grpo_config.generate_config.repetition_penalty,
-                        exclude_penalty_tokens=self.grpo_config.generate_config.exclude_penalty_tokens,
-                        device=device,
-                        suppress_tokens=self.grpo_config.generate_config.suppress_tokens,
-                        return_logits=False
-                    )
-
-                    completion_ids = outputs[:, prompt_len:]
-                    completion_mask = completion_ids != pad_token_id
-
-                    input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
-                    attention_mask = torch.cat([prompt_masks, completion_mask], dim=1)
-
-                    with autocast(TrainerTools().parallel.device_type):
-                        old_log_probs, _ = self._compute_log_probs(unwrapped_model, input_ids, attention_mask)
-
-                if self.ref_model:
-                    with unwrap_model_for_generation(self.ref_model) as unwrapped_ref_model:
-                        with autocast(TrainerTools().parallel.device_type):
-                            ref_log_probs, _ = self._compute_log_probs(unwrapped_ref_model, input_ids, attention_mask)
+                    ref_log_probs, _ = self._compute_log_probs(self.ref_model, input_ids, attention_mask)
                 else:
                     ref_log_probs = None
 
@@ -517,7 +491,8 @@ class GRPOTrainer(BaseTrainer):
                         Logger.std_log(f'start generate for batch {batch + 1}/{batch_count_per_file}')
 
                     # 生成数据
-                    rollout_data = self._generate_rollout_data(batch_data)
+                    with unwrap_model_for_generation(self.train_model) as generate_model:
+                        rollout_data = self._generate_rollout_data(generate_model, batch_data)
                     # end generate
 
                     empty_cache()

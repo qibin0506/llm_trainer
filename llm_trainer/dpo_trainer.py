@@ -10,7 +10,6 @@ from .train_configs import TrainConfig
 from .dataset import DPODataset
 from .loss import DPOLoss
 from .tools import TrainerTools
-from .log import Logger
 from .utils import (
     autocast,
     get_dpo_collate_fn,
@@ -23,6 +22,7 @@ from .checkpoint import (
     save_checkpoint,
     save_steps,
 )
+from .log import Logger
 
 
 class DPOTrainer(BaseTrainer):

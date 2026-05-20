@@ -1,5 +1,4 @@
-from typing import Optional, Tuple, List, Callable
-import torch
+from typing import Optional, Tuple, List
 from torch.utils.data import Dataset
 
 from llm_model import (
@@ -9,13 +8,10 @@ from llm_model import (
 )
 
 from .base_trainer import BaseTrainer
+from .train_configs import TrainConfig
 from .dataset import SFTDataset
 from .utils import get_sft_collate_fn
 from .tools import TrainerTools
-from .train_configs import (
-    TrainConfig,
-    GenerateConfig
-)
 
 
 class SFTTrainer(BaseTrainer):
@@ -24,7 +20,6 @@ class SFTTrainer(BaseTrainer):
             *,
             train_config: TrainConfig,
             eval_prompts: List[str],
-            generation_service: Optional[Callable[[torch.nn.Module, List[str], int, GenerateConfig, str], List[List[int]]]] = None,
             eval_image_tags: Optional[List[str]] = None
     ):
         self.sft_config = train_config.sft_config
@@ -34,7 +29,6 @@ class SFTTrainer(BaseTrainer):
         super().__init__(
             train_config=train_config,
             eval_prompts=eval_prompts,
-            generation_service=generation_service,
             kd_config=self.sft_config.kd_config,
             gradient_accumulation_steps=self.sft_config.gradient_accumulation_steps
         )
@@ -71,11 +65,8 @@ class SFTTrainer(BaseTrainer):
 
     def _get_pixel_values(self, batch_data):
         if self.pixel_values_provider and 'image_tags' in batch_data:
-            valid_tags = [tag for tag in batch_data['image_tags'] if tag]
-            if len(valid_tags) > 0:
-                pixel_values = self.pixel_values_provider(valid_tags)
-                if pixel_values is not None:
-                    return pixel_values.to(TrainerTools().parallel.device, TrainerTools().compute_dtype)
+            image_tags = batch_data['image_tags']
+            return self.pixel_values_provider(image_tags).to(TrainerTools().parallel.device)
 
         return None
 

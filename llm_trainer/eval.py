@@ -1,0 +1,36 @@
+import os
+import torch
+
+from .generate_utils import generate
+from .tools import TrainerTools
+from .train_configs import TrainConfig
+from .log import _get_log_dir
+
+def submit_gen_task(
+        eval_model: torch.nn.Module,
+        train_config: TrainConfig,
+        tag,
+        prompt,
+        pixel_values,
+        tokens_per_image
+):
+    tokens = TrainerTools().tokenizer.encode(prompt, unsqueeze=True, covert_tensor=True)
+    max_new_tokens = max(train_config.eval_config.max_seq_len - tokens.shape[1], 0)
+
+    gen_result = generate(
+        eval_model,
+        prompt=tokens,
+        max_new_tokens=max_new_tokens,
+        temperature=train_config.eval_config.temperature,
+        top_k=train_config.eval_config.top_k,
+        top_p=train_config.eval_config.top_p,
+        repetition_penalty=train_config.eval_config.repetition_penalty,
+        exclude_penalty_tokens=train_config.eval_config.exclude_penalty_tokens,
+        suppress_tokens=train_config.eval_config.suppress_tokens,
+        pixel_values=pixel_values,
+        tokens_per_image=tokens_per_image,
+        device=TrainerTools().parallel.device
+    )
+
+    with open(os.path.join(_get_log_dir(), 'gen.txt'), 'a') as f:
+        f.write(f"{tag}, gen->{gen_result}\n")

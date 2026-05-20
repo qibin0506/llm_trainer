@@ -6,10 +6,12 @@ from torch.utils.data import Dataset
 import torch.nn as nn
 from itertools import islice
 
-from llm_model import LlmModel, VlmModel
+from llm_model import (
+    LlmModel,
+    VlmModel
+)
 
 from .base_trainer import BaseTrainer
-from .train_configs import TrainConfig
 from .dataset import RLDataset
 from .loss import PPOLoss
 from .tools import TrainerTools
@@ -17,6 +19,10 @@ from .generate_utils import batch_generate
 from .partition_utils import unwrap_model_for_generation
 from .log import Logger
 from .loss import LMLoss
+from .train_configs import (
+    TrainConfig,
+    GenerateConfig
+)
 from .utils import (
     autocast,
     left_pad_sequence,
@@ -77,15 +83,52 @@ class PolicyAndValueModelWrapper(nn.Module):
 
 class PPOTrainer(BaseTrainer):
     """
-    reward_func(prompt_ids, complete_ids, answer_ids) -> scores
-    ptx_builder(prompt_ids, answer_ids) -> sft_ids
-    """
+    PPOTrainer
 
+    Args:
+        train_config (TrainConfig):
+            - 全局训练配置，必须包含 ppo_config。
+
+        reward_func (Callable):
+            - 奖励函数，对生成的 Response 打分。
+            - 签名:
+                1. prompts (List[torch.Tensor]): 长度为 [B] 的列表，内层 Tensor 形状为 [prompt_len]，表示左填充对齐前的原始 prompt ids。
+                2. complete_ids (torch.Tensor): 形状为 [B, max_completion_len] 的 CPU Tensor，为生成的 Completion IDs。
+                3. answer_ids (List[Optional[torch.Tensor]]): 长度为 [B] 的列表。内层 Tensor 形状为 [answer_len] 或 None，表示答案真值（用于打分或匹配）。
+            - 返回值:
+                - List[float]: 长度为 [B] 的标量奖励数值一维列表。
+
+        generation_service (Optional[Callable]):
+            - 外部自定义生成服务接口
+            - 签名:
+                1. model (torch.nn.Module): 传入的正在执行训练的模型实例（可能已被 DeepSpeed 封装）。
+                2. prompts (List[str]): 待生成的一组 Prompt 文本。Shape: [batch_size]。
+                3. group_size (int): 每个 Prompt 需要并行生成的候选 Completion 数量（Eval/PPO 阶段常为 1，GRPO 阶段为 grpo_config.group_size）。
+                4. config (GenerateConfig): 生成解码控制配置（如 temp, top_p, top_k 等）。
+                5. task_type (str): 调用任务上下文类型，如 'eval', 'ppo', 'grpo'。
+                6. pixel_values (Optional[torch.Tensor]): VLM 多模态特征张量。Shape: [batch_size, channels, height, width] 或 [batch_size * num_images, channels, height, width]。
+                7. tokens_per_image (Optional[int]): 每个图片标签对应的虚拟 Token 数值标量。
+            - 返回值:
+                - List[List[int]]: 外层列表长度为 [batch_size * group_size]，内层为生成的 Completion Token ID 序列（不应包含 Prompt）。
+
+        ptx_builder (Optional[Callable]):
+            -  构建预训练混合数据 (PTX Data Mixture) 的回调函数。
+            - 签名:
+                1. prompts (List[torch.Tensor]): 长度为 [B] 的列表，内层 Tensor 形状为 [prompt_len]。
+                2. answers (List[torch.Tensor]): 长度为 [B] 的列表，内层 Tensor 形状为 [answer_len]。
+            - 返回值:
+                - List[torch.Tensor]: 长度为 [B] 的训练样本 Token 张量列表，每个 Tensor 形状为 [seq_len]。
+
+        eval_prompts (List[str]):
+            - 评估测试的提示词列表。
+            - [num_eval_prompts] 长度的字符串列表。
+    """
     def __init__(
             self,
             *,
             train_config: TrainConfig,
             reward_func: Callable[[List[torch.Tensor], torch.Tensor, List[Optional[torch.Tensor]]], List[float]],
+            generation_service: Optional[Callable[[torch.nn.Module, List[str], int, GenerateConfig, str, Optional[torch.Tensor], Optional[int]], List[List[int]]]] = None,
             ptx_builder: Optional[Callable[[List[torch.Tensor], List[torch.Tensor]], List[torch.Tensor]]] = None,
             eval_prompts: List[str]
     ):
@@ -105,6 +148,7 @@ class PPOTrainer(BaseTrainer):
         super().__init__(
             train_config=train_config,
             eval_prompts=eval_prompts,
+            generation_service=generation_service,
             gradient_accumulation_steps=self.ppo_config.gradient_accumulation_steps
         )
 
@@ -391,43 +435,84 @@ class PPOTrainer(BaseTrainer):
             )
 
         with torch.no_grad():
-            with unwrap_model_for_generation(self.train_model) as unwrapped_model:
-                full_ids, logitss = batch_generate(
-                    model=unwrapped_model.policy_model,
-                    tokens=prompt_ids,
-                    attention_mask=prompt_masks,
-                    max_new_tokens=max_new_tokens,
-                    temperature=ppo_config.generate_config.temperature,
-                    top_k=ppo_config.generate_config.top_k,
-                    top_p=ppo_config.generate_config.top_p,
-                    repetition_penalty=ppo_config.generate_config.repetition_penalty,
-                    exclude_penalty_tokens=ppo_config.generate_config.exclude_penalty_tokens,
-                    suppress_tokens=ppo_config.generate_config.suppress_tokens,
-                    device=device
+            if self.generation_service is not None:
+                prompt_texts = [TrainerTools().tokenizer.decode(p.tolist()) for p in prompts]
+                completion_ids_list = self.generation_service(
+                    self.train_model, prompt_texts, 1, ppo_config.generate_config, 'ppo', None, None
                 )
 
-                completion_ids = full_ids[:, prompt_len:]
+                padded_completions = []
+                max_comp_len = max((len(c) for c in completion_ids_list), default=0)
+                if max_comp_len == 0:
+                    max_comp_len = 1
+                max_comp_len = min(max_comp_len, max_new_tokens)
+
+                for comp in completion_ids_list:
+                    comp = comp[:max_comp_len]
+                    pad_len = max_comp_len - len(comp)
+                    padded_completions.append(comp + [pad_token_id] * pad_len)
+
+                completion_ids = torch.tensor(padded_completions, dtype=torch.long, device=device)
+                full_ids = torch.cat([prompt_ids, completion_ids], dim=1)
                 full_attention_mask = self._calc_attention_mask(full_ids)
                 full_position_ids = calc_position_ids(full_attention_mask)
 
-                old_log_probs = log_softmax(logitss, completion_ids)
-                del logitss
-
                 with autocast(TrainerTools().parallel.device_type):
-                    value_output, _ = unwrapped_model.value_model(
+                    policy_output, (value_output, _) = self.train_model(
                         full_ids,
                         attention_mask=full_attention_mask,
                         position_ids=full_position_ids
                     )
 
-            with unwrap_model_for_generation(self.ref_model) as unwrapped_ref_model:
+                    logits_full = policy_output['logits']
+                    logits_completion = logits_full[:, prompt_len - 1: -1]
+                    old_log_probs = log_softmax(logits_completion, completion_ids)
+
                 with autocast(TrainerTools().parallel.device_type):
-                    ref_outputs = unwrapped_ref_model(
+                    ref_outputs = self.ref_model(
                         full_ids,
                         attention_mask=full_attention_mask,
                         position_ids=full_position_ids
                     )
                     ref_logits_full = ref_outputs['logits']
+            else:
+                with unwrap_model_for_generation(self.train_model) as unwrapped_model:
+                    full_ids, logitss = batch_generate(
+                        model=unwrapped_model.policy_model,
+                        tokens=prompt_ids,
+                        attention_mask=prompt_masks,
+                        max_new_tokens=max_new_tokens,
+                        temperature=ppo_config.generate_config.temperature,
+                        top_k=ppo_config.generate_config.top_k,
+                        top_p=ppo_config.generate_config.top_p,
+                        repetition_penalty=ppo_config.generate_config.repetition_penalty,
+                        exclude_penalty_tokens=ppo_config.generate_config.exclude_penalty_tokens,
+                        suppress_tokens=ppo_config.generate_config.suppress_tokens,
+                        device=device
+                    )
+
+                    completion_ids = full_ids[:, prompt_len:]
+                    full_attention_mask = self._calc_attention_mask(full_ids)
+                    full_position_ids = calc_position_ids(full_attention_mask)
+
+                    old_log_probs = log_softmax(logitss, completion_ids)
+                    del logitss
+
+                    with autocast(TrainerTools().parallel.device_type):
+                        value_output, _ = unwrapped_model.value_model(
+                            full_ids,
+                            attention_mask=full_attention_mask,
+                            position_ids=full_position_ids
+                        )
+
+                with unwrap_model_for_generation(self.ref_model) as unwrapped_ref_model:
+                    with autocast(TrainerTools().parallel.device_type):
+                        ref_outputs = unwrapped_ref_model(
+                            full_ids,
+                            attention_mask=full_attention_mask,
+                            position_ids=full_position_ids
+                        )
+                        ref_logits_full = ref_outputs['logits']
 
             ref_logits_completion = ref_logits_full[:, prompt_len - 1: -1]
             ref_log_probs_completion = log_softmax(ref_logits_completion, completion_ids)

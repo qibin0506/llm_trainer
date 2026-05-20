@@ -1,4 +1,5 @@
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Callable
+import torch
 from torch.utils.data import Dataset
 
 from llm_model import (
@@ -8,18 +9,50 @@ from llm_model import (
 )
 
 from .base_trainer import BaseTrainer
-from .train_configs import TrainConfig
 from .dataset import SFTDataset
 from .utils import get_sft_collate_fn
 from .tools import TrainerTools
+from .train_configs import (
+    TrainConfig,
+    GenerateConfig
+)
 
 
 class SFTTrainer(BaseTrainer):
+    """
+    SFTTrainer
+
+    Args:
+        train_config (TrainConfig):
+            - 全局训练配置，若为多模态模型，model_config 需为 VLMConfig 类型。
+
+        eval_prompts (List[str]):
+            - 评估阶段用于测试生成的文本提示词列表。
+            - [num_eval_prompts] 长度的字符串列表。
+
+        generation_service (Optional[Callable]):
+            - 外部自定义生成服务接口
+            - 签名:
+                1. model (torch.nn.Module): 传入的正在执行训练的模型实例（可能已被 DeepSpeed 封装）。
+                2. prompts (List[str]): 待生成的一组 Prompt 文本。Shape: [batch_size]。
+                3. group_size (int): 每个 Prompt 需要并行生成的候选 Completion 数量（Eval/PPO 阶段常为 1，GRPO 阶段为 grpo_config.group_size）。
+                4. config (GenerateConfig): 生成解码控制配置（如 temp, top_p, top_k 等）。
+                5. task_type (str): 调用任务上下文类型，如 'eval', 'ppo', 'grpo'。
+                6. pixel_values (Optional[torch.Tensor]): VLM 多模态特征张量。Shape: [batch_size, channels, height, width] 或 [batch_size * num_images, channels, height, width]。
+                7. tokens_per_image (Optional[int]): 每个图片标签对应的虚拟 Token 数值标量。
+            - 返回值:
+                - List[List[int]]: 外层列表长度为 [batch_size * group_size]，内层为生成的 Completion Token ID 序列（不应包含 Prompt）。
+
+        eval_image_tags (Optional[List[str]]):
+            - 用于多模态评估时，与 eval_prompts 严格一一对应的图像 Tag 标识列表（用于通过图片加载器解析像素特征）。
+            - 与 eval_prompts 长度相同的列表，即 [num_eval_prompts]。
+    """
     def __init__(
             self,
             *,
             train_config: TrainConfig,
             eval_prompts: List[str],
+            generation_service: Optional[Callable[[torch.nn.Module, List[str], int, GenerateConfig, str, Optional[torch.Tensor], Optional[int]], List[List[int]]]] = None,
             eval_image_tags: Optional[List[str]] = None
     ):
         self.sft_config = train_config.sft_config
@@ -29,6 +62,7 @@ class SFTTrainer(BaseTrainer):
         super().__init__(
             train_config=train_config,
             eval_prompts=eval_prompts,
+            generation_service=generation_service,
             kd_config=self.sft_config.kd_config,
             gradient_accumulation_steps=self.sft_config.gradient_accumulation_steps
         )
@@ -65,8 +99,11 @@ class SFTTrainer(BaseTrainer):
 
     def _get_pixel_values(self, batch_data):
         if self.pixel_values_provider and 'image_tags' in batch_data:
-            image_tags = batch_data['image_tags']
-            return self.pixel_values_provider(image_tags).to(TrainerTools().parallel.device)
+            valid_tags = [tag for tag in batch_data['image_tags'] if tag]
+            if len(valid_tags) > 0:
+                pixel_values = self.pixel_values_provider(valid_tags)
+                if pixel_values is not None:
+                    return pixel_values.to(TrainerTools().parallel.device, TrainerTools().compute_dtype)
 
         return None
 

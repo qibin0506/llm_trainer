@@ -502,10 +502,11 @@ def batch_generate(
                 current_position_ids = calc_position_ids(current_attention_mask)
             else:
                 if i == 0:
-                     current_position_ids = position_ids
+                    current_position_ids = position_ids
                 else:
-                     current_position_ids = position_ids[:, -1:] + 1
-                     position_ids = torch.cat((position_ids, current_position_ids), dim=-1)
+                    # current_position_ids = position_ids[:, -1:] + 1
+                    # position_ids = torch.cat((position_ids, current_position_ids), dim=-1)
+                    current_position_ids = current_attention_mask.sum(dim=-1, keepdim=True).long() - 1
 
             with autocast(TrainerTools().parallel.device_type):
                 result = model(
@@ -569,10 +570,6 @@ def batch_generate(
             )
 
             full_sequence_buffer[:, prompt_len + i] = next_token.squeeze(-1)
-
-            new_done = (next_token.squeeze(-1) == end_token)
-            done = done | new_done
-
             if use_kv_cache:
                 current_tokens = next_token
             else:
@@ -580,6 +577,9 @@ def batch_generate(
 
             new_mask = (~done).long().to(full_attention_mask_buffer.dtype)
             full_attention_mask_buffer[:, prompt_len + i] = new_mask
+
+            new_done = (next_token.squeeze(-1) == end_token)
+            done = done | new_done
 
     final_full_sequences = full_sequence_buffer[:, :prompt_len + actual_gen_len]
 

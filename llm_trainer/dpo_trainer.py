@@ -1,4 +1,4 @@
-from typing import Tuple, List
+from typing import Tuple, List, Optional, Callable
 import gc
 import math
 import torch
@@ -6,10 +6,14 @@ from torch.utils.data import Dataset
 from itertools import islice
 
 from .base_trainer import BaseTrainer
-from .train_configs import TrainConfig
 from .dataset import DPODataset
 from .loss import DPOLoss
 from .tools import TrainerTools
+from .log import Logger
+from .train_configs import (
+    TrainConfig,
+    GenerateConfig
+)
 from .utils import (
     autocast,
     get_dpo_collate_fn,
@@ -22,20 +26,45 @@ from .checkpoint import (
     save_checkpoint,
     save_steps,
 )
-from .log import Logger
 
 
 class DPOTrainer(BaseTrainer):
+    """
+    DPOTrainer
+
+    Args:
+        train_config (TrainConfig):
+            - 全局训练配置，必须包含 dpo_config。
+
+        eval_prompts (List[str]):
+            - 评估阶段生成测试的提示词列表。
+            - [num_eval_prompts] 长度的字符串列表。
+
+        generation_service (Optional[Callable]):
+            - 外部自定义生成服务接口。
+            - 签名:
+                1. model (torch.nn.Module): 传入的正在执行训练的模型实例（可能已被 DeepSpeed 封装）。
+                2. prompts (List[str]): 待生成的一组 Prompt 文本。Shape: [batch_size]。
+                3. group_size (int): 每个 Prompt 需要并行生成的候选 Completion 数量（Eval/PPO 阶段常为 1，GRPO 阶段为 grpo_config.group_size）。
+                4. config (GenerateConfig): 生成解码控制配置（如 temp, top_p, top_k 等）。
+                5. task_type (str): 调用任务上下文类型，如 'eval', 'ppo', 'grpo'。
+                6. pixel_values (Optional[torch.Tensor]): VLM 多模态特征张量。Shape: [batch_size, channels, height, width] 或 [batch_size * num_images, channels, height, width]。
+                7. tokens_per_image (Optional[int]): 每个图片标签对应的虚拟 Token 数值标量。
+            - 返回值:
+                - List[List[int]]: 外层列表长度为 [batch_size * group_size]，内层为生成的 Completion Token ID 序列（不应包含 Prompt）。
+    """
     def __init__(
             self,
             *,
             train_config: TrainConfig,
-            eval_prompts: List[str]
+            eval_prompts: List[str],
+            generation_service: Optional[Callable[[torch.nn.Module, List[str], int, GenerateConfig, str, Optional[torch.Tensor], Optional[int]], List[List[int]]]] = None,
     ):
         self.dpo_config = train_config.dpo_config
         super().__init__(
             train_config=train_config,
             eval_prompts=eval_prompts,
+            generation_service=generation_service,
             gradient_accumulation_steps=self.dpo_config.gradient_accumulation_steps
         )
         self.ref_model = self._init_ref_model()

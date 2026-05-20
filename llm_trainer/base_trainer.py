@@ -1,4 +1,5 @@
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Optional, Tuple, List, Dict, Any, Callable
+import os
 import copy
 import gc
 import math
@@ -14,29 +15,29 @@ from llm_model import LlmModel
 from .parallel import DsParallel
 from .tools import TrainerTools
 from .loss import LMLoss, KDLoss
-from .eval import submit_gen_task
 from .partition_utils import unwrap_model_for_generation
-
+from .log import (
+    Logger,
+    _get_log_dir
+)
 from .train_configs import (
     TrainConfig,
     DsZero2Config,
     DsZero3Config,
-    KDConfig
+    KDConfig,
+    GenerateConfig
 )
-
 from .scheduler import (
     LRScheduler,
     WarmupCosineAnnealingLRScheduler,
     NoneLRScheduler
 )
-
 from .checkpoint import (
     load_checkpoint,
     save_checkpoint,
     load_steps,
     save_steps,
 )
-
 from .utils import (
     default_seed,
     set_seed,
@@ -45,15 +46,46 @@ from .utils import (
     is_fp16_supported,
     empty_cache
 )
+from .generate_utils import generate
 
-from .log import Logger
 
 class BaseTrainer:
+    """
+    BaseTrainer
+
+    Args:
+        train_config (TrainConfig):
+            - 全局训练配置类，包含模型配置、优化器、调度器以及特定算法配置（如 DPO、PPO、GRPO 等）。
+
+        eval_prompts (List[str]):
+            - 用于评估阶段生成测试的文本提示词列表。
+            - 长度为 [num_eval_prompts] 的字符串列表。
+
+        generation_service (Optional[Callable]):
+            - 外部自定义生成服务接口
+            - 签名:
+                1. model (torch.nn.Module): 传入的正在执行训练的模型实例（可能已被 DeepSpeed 封装）。
+                2. prompts (List[str]): 待生成的一组 Prompt 文本。Shape: [batch_size]。
+                3. group_size (int): 每个 Prompt 需要并行生成的候选 Completion 数量（Eval/PPO 阶段常为 1，GRPO 阶段为 grpo_config.group_size）。
+                4. config (GenerateConfig): 生成解码控制配置（如 temp, top_p, top_k 等）。
+                5. task_type (str): 调用任务上下文类型，如 'eval', 'ppo', 'grpo'。
+                6. pixel_values (Optional[torch.Tensor]): VLM 多模态特征张量。Shape: [batch_size, channels, height, width] 或 [batch_size * num_images, channels, height, width]。
+                7. tokens_per_image (Optional[int]): 每个图片标签对应的虚拟 Token 数值标量。
+            - 返回值:
+                - List[List[int]]: 外层列表长度为 [batch_size * group_size]，内层为生成的 Completion Token ID 序列（不应包含 Prompt）。
+
+        kd_config (Optional[KDConfig]):
+            - 知识蒸馏 (Knowledge Distillation) 配置类。
+
+        gradient_accumulation_steps (int):
+            - 梯度累积步数，用于通过累积多批数据的梯度来模拟更大的 Global Batch Size。
+    """
     def __init__(
             self,
             *,
             train_config: TrainConfig,
             eval_prompts: List[str],
+            generation_service: Optional[Callable[[torch.nn.Module, List[str], int, GenerateConfig, str, Optional[torch.Tensor], Optional[int]], List[List[int]]]] = None,
             kd_config: Optional[KDConfig] = None,
             gradient_accumulation_steps: int = 1
     ):
@@ -68,6 +100,7 @@ class BaseTrainer:
         self.resume_file_idx = 0
         self.resume_batch_idx = 0
 
+        self.generation_service = generation_service
         self.kd_config = kd_config
         self.gradient_accumulation_steps = max(1, gradient_accumulation_steps)
 
@@ -303,6 +336,21 @@ class BaseTrainer:
                 'train_micro_batch_size_per_gpu': self.train_config.batch_size
             }
 
+            if self.train_config.ds_config.wall_clock_breakdown:
+                parallel_kwargs['wall_clock_breakdown'] = True
+
+            if (self.train_config.ds_config.flops_profiler
+                    and self.train_config.ds_config.flops_profiler.enabled):
+                flops_cfg = self.train_config.ds_config.flops_profiler
+                parallel_kwargs['flops_profiler'] = {
+                    'enabled': flops_cfg.enabled,
+                    'profile_step': flops_cfg.profile_step,
+                    'module_depth': flops_cfg.module_depth,
+                    'top_modules': flops_cfg.top_modules,
+                    'detailed': flops_cfg.detailed,
+                    'output_file': flops_cfg.output_file
+                }
+
             if self.train_config.ds_config.zero_config:
                 zero_config = self.train_config.ds_config.zero_config
                 zero_optimization: Dict[str, Any] = {'stage': zero_config.stage}
@@ -319,18 +367,34 @@ class BaseTrainer:
                     zero_optimization['reduce_bucket_size'] = zero_config.reduce_bucket_size
                 if zero_config.contiguous_gradients is not None:
                     zero_optimization['contiguous_gradients'] = zero_config.contiguous_gradients
+                if zero_config.ignore_unused_parameters:
+                    zero_optimization['ignore_unused_parameters'] = True
+                if zero_config.communication_data_type:
+                    zero_optimization['communication_data_type'] = zero_config.communication_data_type
 
-                if isinstance(zero_config, DsZero2Config) or isinstance(zero_config, DsZero3Config):
+                if isinstance(zero_config, (DsZero2Config, DsZero3Config)):
                     if zero_config.offload_optimizer is not None:
                         zero_optimization['offload_optimizer'] = {
                             "device": zero_config.offload_optimizer.device,
                             "pin_memory": zero_config.offload_optimizer.pin_memory
                         }
+
+                        if zero_config.offload_optimizer.device == 'nvme':
+                            if zero_config.offload_optimizer.nvme_path: zero_optimization['offload_optimizer']["nvme_path"] = zero_config.offload_optimizer.nvme_path
+                            if zero_config.offload_optimizer.buffer_count: zero_optimization['offload_optimizer']["buffer_count"] = zero_config.offload_optimizer.buffer_count
+                            if zero_config.offload_optimizer.buffer_size: zero_optimization['offload_optimizer']["buffer_size"] = zero_config.offload_optimizer.buffer_size
+                            if zero_config.offload_optimizer.max_in_cpu: zero_optimization['offload_optimizer']["max_in_cpu"] = zero_config.offload_optimizer.max_in_cpu
                     if zero_config.offload_param is not None:
                         zero_optimization['offload_param'] = {
                             "device": zero_config.offload_param.device,
                             "pin_memory": zero_config.offload_param.pin_memory
                         }
+
+                        if zero_config.offload_param.device == 'nvme':
+                            if zero_config.offload_param.nvme_path: zero_optimization['offload_param']["nvme_path"] = zero_config.offload_param.nvme_path
+                            if zero_config.offload_param.buffer_count: zero_optimization['offload_param']["buffer_count"] = zero_config.offload_param.buffer_count
+                            if zero_config.offload_param.buffer_size: zero_optimization['offload_param']["buffer_size"] = zero_config.offload_param.buffer_size
+                            if zero_config.offload_param.max_in_cpu: zero_optimization['offload_param']["max_in_cpu"] = zero_config.offload_param.max_in_cpu
 
                 if isinstance(zero_config, DsZero3Config):
                     if zero_config.sub_group_size is not None:
@@ -345,6 +409,14 @@ class BaseTrainer:
                         zero_optimization['stage3_max_reuse_distance'] = zero_config.stage3_max_reuse_distance
                     if zero_config.stage3_gather_16bit_weights_on_model_save is not None:
                         zero_optimization['stage3_gather_16bit_weights_on_model_save'] = zero_config.stage3_gather_16bit_weights_on_model_save
+                    if zero_config.memory_efficient_linear is not None:
+                        zero_optimization['memory_efficient_linear'] = zero_config.memory_efficient_linear
+                    if zero_config.zero_quantized_weights:
+                        zero_optimization['zero_quantized_weights'] = True
+                    if zero_config.zero_hpz_partition_size > 1:
+                        zero_optimization['zero_hpz_partition_size'] = zero_config.zero_hpz_partition_size
+                    if zero_config.zero_quantized_gradients:
+                        zero_optimization['zero_quantized_gradients'] = True
 
                 parallel_kwargs['zero_optimization'] = zero_optimization
 
@@ -554,22 +626,49 @@ class BaseTrainer:
         if eval_prompt is None:
             return
 
-        with unwrap_model_for_generation(self.train_model) as eval_model:
-            if TrainerTools().parallel.is_main_process:
-                eval_model = self._check_eval_model(eval_model)
-                eval_model.eval()
+        eval_pixel_values, tokens_per_image = self._get_eval_pixel_values_and_tokens_count(self.eval_idx)
+        if tokens_per_image is None:
+            tokens_per_image = -1
+            eval_pixel_values = None
 
-                eval_pixel_values, tokens_per_image = self._get_eval_pixel_values_and_tokens_count(self.eval_idx)
-                submit_gen_task(
-                    eval_model,
-                    self.train_config,
-                    tag=tag,
-                    prompt=eval_prompt,
-                    pixel_values=eval_pixel_values,
-                    tokens_per_image=tokens_per_image
-                )
+        if self.generation_service is not None:
+            response_ids = self.generation_service(
+                self.train_model, [eval_prompt], 1, self.train_config.eval_config,
+                'eval', eval_pixel_values, tokens_per_image
+            )
 
-                eval_model.train()
+            if TrainerTools().parallel.is_main_process and response_ids:
+                gen_text = TrainerTools().tokenizer.decode(response_ids[0])
+                with open(os.path.join(_get_log_dir(), 'gen.txt'), 'a') as f:
+                    f.write(f"{tag}, gen->{eval_prompt}{gen_text}\n")
+        else:
+            with unwrap_model_for_generation(self.train_model) as eval_model:
+                if TrainerTools().parallel.is_main_process:
+                    eval_model = self._check_eval_model(eval_model)
+                    eval_model.eval()
+
+                    tokens = TrainerTools().tokenizer.encode(eval_prompt, unsqueeze=True, covert_tensor=True)
+                    max_new_tokens = max(self.train_config.eval_config.max_seq_len - tokens.shape[1], 0)
+
+                    gen_result = generate(
+                        eval_model,
+                        prompt=tokens,
+                        max_new_tokens=max_new_tokens,
+                        temperature=self.train_config.eval_config.temperature,
+                        top_k=self.train_config.eval_config.top_k,
+                        top_p=self.train_config.eval_config.top_p,
+                        repetition_penalty=self.train_config.eval_config.repetition_penalty,
+                        exclude_penalty_tokens=self.train_config.eval_config.exclude_penalty_tokens,
+                        suppress_tokens=self.train_config.eval_config.suppress_tokens,
+                        pixel_values=eval_pixel_values,
+                        tokens_per_image=tokens_per_image,
+                        device=TrainerTools().parallel.device
+                    )
+
+                    with open(os.path.join(_get_log_dir(), 'gen.txt'), 'a') as f:
+                        f.write(f"{tag}, gen->{gen_result}\n")
+
+                    eval_model.train()
 
         TrainerTools().parallel.wait('eval')
 

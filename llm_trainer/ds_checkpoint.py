@@ -21,10 +21,15 @@ convert_zero_checkpoint_to_fp32_state_dict	将 ZeRO 检查点转换为独立的 
 
 def save_ds_checkpoint(
         model: nn.Module,
-        extra_module: Optional[nn.Module] = None
+        extra_module: Optional[nn.Module] = None,
+        checkpoint_path: Optional[str] = None
 ):
     assert isinstance(model, DeepSpeedEngine)
-    ckpt_dir = os.environ.get('CHECKPOINT_DIR', './checkpoints')
+
+    if checkpoint_path:
+        ckpt_dir = checkpoint_path
+    else:
+        ckpt_dir = os.environ.get('CHECKPOINT_DIR', './checkpoints')
 
     try:
         # 包括model、optimizer等状态
@@ -53,10 +58,14 @@ def save_ds_checkpoint(
 def load_ds_checkpoint(
         model: nn.Module,
         load_module_only: bool = False,
-        extra_module: Optional[nn.Module] = None
+        extra_module: Optional[nn.Module] = None,
+        checkpoint_path: Optional[str] = None
 ):
     assert isinstance(model, DeepSpeedEngine)
-    ckpt_dir = os.environ.get('CHECKPOINT_DIR', './checkpoints')
+    if checkpoint_path:
+        ckpt_dir = checkpoint_path
+    else:
+        ckpt_dir = os.environ.get('CHECKPOINT_DIR', './checkpoints')
 
     # 包括model、optimizer等状态
     if os.path.exists(ckpt_dir):

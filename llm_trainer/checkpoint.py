@@ -15,16 +15,20 @@ _DEFAULT_STEPS_NAME = 'steps.pt'
 def save_checkpoint(
         model: nn.Module,
         optimizer: Optional[Optimizer] = None,
-        extra_module: Optional[nn.Module] = None
+        extra_module: Optional[nn.Module] = None,
+        checkpoint_path: Optional[str] = None
 ):
     if isinstance(TrainerTools().parallel, DsParallel):
         from .ds_checkpoint import save_ds_checkpoint
-        save_ds_checkpoint(model, extra_module=extra_module)
+        save_ds_checkpoint(
+            model,
+            extra_module=extra_module,
+            checkpoint_path=checkpoint_path
+        )
     else:
         if TrainerTools().parallel.is_main_process:
-            ckpt_dir = _get_ckpt_dir()
-            checkpoint_path = os.path.join(ckpt_dir, _DEFAULT_MODEL_NAME)
-
+            ckpt_dir = _get_ckpt_dir(checkpoint_path)
+            model_path = os.path.join(ckpt_dir, _DEFAULT_MODEL_NAME)
             ckpt = {'model_state_dict': model.state_dict()}
 
             if optimizer:
@@ -33,7 +37,7 @@ def save_checkpoint(
             if extra_module:
                 ckpt.update({'extra_module_state_dict': extra_module.state_dict()})
 
-            torch.save(ckpt, checkpoint_path)
+            torch.save(ckpt, model_path)
 
 
 def load_checkpoint(
@@ -41,17 +45,23 @@ def load_checkpoint(
         optimizer: Optional[Optimizer] = None,
         device: Optional[Union[torch.device, str]] = None,
         load_module_only: bool = False,
-        extra_module: Optional[nn.Module] = None
+        extra_module: Optional[nn.Module] = None,
+        checkpoint_path: Optional[str] = None
 ):
     if isinstance(TrainerTools().parallel, DsParallel):
         from .ds_checkpoint import load_ds_checkpoint
-        load_ds_checkpoint(model, load_module_only=load_module_only, extra_module=extra_module)
+        load_ds_checkpoint(
+            model,
+            load_module_only=load_module_only,
+            extra_module=extra_module,
+            checkpoint_path=checkpoint_path
+        )
     else:
-        ckpt_dir = _get_ckpt_dir()
-        checkpoint_path = os.path.join(ckpt_dir, _DEFAULT_MODEL_NAME)
+        ckpt_dir = _get_ckpt_dir(checkpoint_path)
+        model_path = os.path.join(ckpt_dir, _DEFAULT_MODEL_NAME)
 
-        if os.path.exists(checkpoint_path):
-            state_dict = torch.load(checkpoint_path, weights_only=True, map_location=device)
+        if os.path.exists(model_path):
+            state_dict = torch.load(model_path, weights_only=True, map_location=device)
             model.load_state_dict(state_dict['model_state_dict'])
 
             if optimizer and 'optim_state_dict' in state_dict:
@@ -65,10 +75,11 @@ def save_steps(
     epoch: int = 0,
     file_idx: int = 0,
     batch_idx: int = 0,
-    lr_scheduler: Optional[LRScheduler] = None
+    lr_scheduler: Optional[LRScheduler] = None,
+    checkpoint_path: Optional[str] = None
 ):
     if TrainerTools().parallel.is_main_process:
-        ckpt_dir = _get_ckpt_dir()
+        ckpt_dir = _get_ckpt_dir(checkpoint_path)
         steps_checkpoint_path = os.path.join(ckpt_dir, _DEFAULT_STEPS_NAME)
 
         ckpt = {
@@ -83,11 +94,11 @@ def save_steps(
         torch.save(ckpt, steps_checkpoint_path)
 
 
-def load_steps() -> Optional[dict]:
+def load_steps(checkpoint_path: Optional[str] = None) -> Optional[dict]:
     steps_dict = None
 
     if TrainerTools().parallel.is_main_process:
-        ckpt_dir = _get_ckpt_dir()
+        ckpt_dir = _get_ckpt_dir(checkpoint_path)
         steps_checkpoint_path = os.path.join(ckpt_dir, _DEFAULT_STEPS_NAME)
 
         if os.path.exists(steps_checkpoint_path):
@@ -105,8 +116,13 @@ def load_steps() -> Optional[dict]:
     return steps_dict
 
 
-def _get_ckpt_dir():
-    ckpt_dir = os.environ.get('CHECKPOINT_DIR', './checkpoints')
+def _get_ckpt_dir(checkpoint_path: Optional[str]):
+    if checkpoint_path:
+        ckpt_dir = checkpoint_path
+    else:
+        ckpt_dir = os.environ.get('CHECKPOINT_DIR', './checkpoints')
+
     if TrainerTools().parallel.is_main_process:
         os.makedirs(ckpt_dir, exist_ok=True)
+
     return ckpt_dir

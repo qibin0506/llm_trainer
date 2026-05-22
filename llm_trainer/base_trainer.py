@@ -10,7 +10,10 @@ from itertools import islice
 import torch
 import torch.distributed as dist
 from torch.utils.data import Dataset
-from llm_model import LlmModel
+from llm_model import (
+    LlmModel,
+    ModelConfig
+)
 
 from .parallel import DsParallel
 from .tools import TrainerTools
@@ -486,36 +489,32 @@ class BaseTrainer:
 
         return parallel_kwargs, data_loader_kwargs, sampler_kwargs
 
-    def _init_ref_model_args(self) -> dict:
+    def _init_ref_model_args(self, model_config: Optional[ModelConfig] = None) -> dict:
         parallel_kwargs = copy.deepcopy(self.parallel_kwargs) if self.parallel_kwargs else None
 
         if parallel_kwargs and isinstance(TrainerTools().parallel, DsParallel):
-            # reference to https://github.com/huggingface/trl/blob/main/trl/models/utils.py:prepare_deepspeed
-            # if model is not None:
-            #     hidden_size = (
-            #         max(model.config.hidden_sizes)
-            #         if getattr(model.config, "hidden_sizes", None)
-            #         else getattr(model.config, "hidden_size", None)
-            #     )
-            #     if hidden_size is not None and stage == 3:
-            #         # Note that `stage3_prefetch_bucket_size` can produce DeepSpeed messages like: `Invalidate trace cache
-            #         # @ step 0: expected module 1, but got module 0`
-            #         # This is expected and is not an error, see: https://github.com/microsoft/DeepSpeed/discussions/4081
-            #         config_kwargs.update(
-            #             {
-            #                 "zero_optimization.reduce_bucket_size": hidden_size * hidden_size,
-            #                 "zero_optimization.stage3_param_persistence_threshold": 10 * hidden_size,
-            #                 "zero_optimization.stage3_prefetch_bucket_size": 0.9 * hidden_size * hidden_size,
-            #             }
-            #         )
+            stage = parallel_kwargs.get("zero_optimization", {}).get("stage", 0)
+            if model_config is not None:
+                hidden_size = model_config.hidden_size
+                if hidden_size is not None and stage == 3:
+                    # Note that `stage3_prefetch_bucket_size` can produce DeepSpeed messages like: `Invalidate trace cache
+                    # @ step 0: expected module 1, but got module 0`
+                    # This is expected and is not an error
+                    zero_optimization = parallel_kwargs.get("zero_optimization", {})
+                    zero_optimization.update(
+                        {
+                            "reduce_bucket_size": int(hidden_size * hidden_size),
+                            "stage3_param_persistence_threshold": int(10 * hidden_size),
+                            "stage3_prefetch_bucket_size": int(0.9 * hidden_size * hidden_size),
+                        }
+                    )
 
             parallel_kwargs.pop('activation_checkpointing', None)
             parallel_kwargs.pop('gradient_clipping', None)
+            parallel_kwargs.get("zero_optimization", {}).pop("offload_optimizer", None)
 
-            # ref_model暂时先使用stage 0, 解决训练卡住问题
-            parallel_kwargs["zero_optimization"] = {"stage": 0}
-            # if parallel_kwargs.get("zero_optimization", {}).get("stage", 0) != 3:
-            #     parallel_kwargs["zero_optimization"] = {"stage": 0}
+            if stage != 3:
+                parallel_kwargs["zero_optimization"] = {"stage": 0}
 
         return parallel_kwargs
 

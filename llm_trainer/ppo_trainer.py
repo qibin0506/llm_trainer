@@ -310,7 +310,7 @@ class PPOTrainer(BaseTrainer):
         ref_model, _ = TrainerTools().parallel.process(
             model=ref_model,
             optimizer=None,
-            kwargs=self._init_ref_model_args(),
+            kwargs=self._init_ref_model_args(self.train_config.model_config),
             save_instance=False
         )
 
@@ -452,30 +452,9 @@ class PPOTrainer(BaseTrainer):
 
                 completion_ids = torch.tensor(padded_completions, dtype=torch.long, device=device)
                 full_ids = torch.cat([prompt_ids, completion_ids], dim=1)
-                full_attention_mask = self._calc_attention_mask(full_ids)
-                full_position_ids = calc_position_ids(full_attention_mask)
-
-                with autocast(TrainerTools().parallel.device_type):
-                    policy_output, (value_output, _) = self.train_model(
-                        full_ids,
-                        attention_mask=full_attention_mask,
-                        position_ids=full_position_ids
-                    )
-
-                    logits_full = policy_output['logits']
-                    logits_completion = logits_full[:, prompt_len - 1: -1]
-                    old_log_probs = log_softmax(logits_completion, completion_ids)
-
-                with autocast(TrainerTools().parallel.device_type):
-                    ref_outputs = self.ref_model(
-                        full_ids,
-                        attention_mask=full_attention_mask,
-                        position_ids=full_position_ids
-                    )
-                    ref_logits_full = ref_outputs['logits']
             else:
                 with unwrap_model_for_generation(self.train_model) as unwrapped_model:
-                    full_ids, logitss = batch_generate(
+                    full_ids, _ = batch_generate(
                         model=unwrapped_model.policy_model,
                         tokens=prompt_ids,
                         attention_mask=prompt_masks,
@@ -486,31 +465,35 @@ class PPOTrainer(BaseTrainer):
                         repetition_penalty=ppo_config.generate_config.repetition_penalty,
                         exclude_penalty_tokens=ppo_config.generate_config.exclude_penalty_tokens,
                         suppress_tokens=ppo_config.generate_config.suppress_tokens,
-                        device=device
+                        device=device,
+                        return_logits=False
                     )
 
-                    completion_ids = full_ids[:, prompt_len:]
-                    full_attention_mask = self._calc_attention_mask(full_ids)
-                    full_position_ids = calc_position_ids(full_attention_mask)
+            completion_ids = full_ids[:, prompt_len:]
+            full_attention_mask = self._calc_attention_mask(full_ids)
+            full_position_ids = calc_position_ids(full_attention_mask)
 
-                    old_log_probs = log_softmax(logitss, completion_ids)
-                    del logitss
+            with autocast(TrainerTools().parallel.device_type):
+                policy_output, (value_output, _) = self.train_model(
+                    full_ids,
+                    attention_mask=full_attention_mask,
+                    position_ids=full_position_ids,
+                    forward_type='both'
+                )
 
-                    with autocast(TrainerTools().parallel.device_type):
-                        value_output, _ = unwrapped_model.value_model(
-                            full_ids,
-                            attention_mask=full_attention_mask,
-                            position_ids=full_position_ids
-                        )
+                logits_full = policy_output['logits']
+                logits_completion = logits_full[:, prompt_len - 1: -1]
+                old_log_probs = log_softmax(logits_completion, completion_ids)
 
-                with unwrap_model_for_generation(self.ref_model) as unwrapped_ref_model:
-                    with autocast(TrainerTools().parallel.device_type):
-                        ref_outputs = unwrapped_ref_model(
-                            full_ids,
-                            attention_mask=full_attention_mask,
-                            position_ids=full_position_ids
-                        )
-                        ref_logits_full = ref_outputs['logits']
+            del policy_output, logits_full, logits_completion
+
+            with autocast(TrainerTools().parallel.device_type):
+                ref_outputs = self.ref_model(
+                    full_ids,
+                    attention_mask=full_attention_mask,
+                    position_ids=full_position_ids
+                )
+                ref_logits_full = ref_outputs['logits']
 
             ref_logits_completion = ref_logits_full[:, prompt_len - 1: -1]
             ref_log_probs_completion = log_softmax(ref_logits_completion, completion_ids)
@@ -761,7 +744,6 @@ class PPOTrainer(BaseTrainer):
                     batch = skip_batches + batch
 
                     rollout_data = self._generate_rollout_data(batch_data)
-                    empty_cache()
 
                     try:
                         ppo_stats = self._ppo_learning_phase(rollout_data)

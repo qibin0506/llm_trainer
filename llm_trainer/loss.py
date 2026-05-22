@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import math
 import torch
 from torch import nn
@@ -294,7 +294,7 @@ class GRPOLoss(nn.Module):
             completion_mask: torch.Tensor,
             advantages: torch.Tensor,
             completion_len: int
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         log_probs = log_probs.float()
         old_log_probs = old_log_probs.float()
         if ref_log_probs is not None:

@@ -41,17 +41,22 @@ def unwrap_model_for_generation(model: nn.Module):
         yield model
 
 
-def sync_model_params(_from: nn.Module, _to: Optional[nn.Module], mixup_alpha: float = 1.0):
-    """
-        必须在所有rank上调用，非rank0, _to 可以设置为None.
-        当前函数不适用于_to是一个zero3模型
-    """
+def sync_model_params(_from: nn.Module, _to: nn.Module, mixup_alpha: float = 1.0):
+    if not _to:
+        return
+
     if isinstance(TrainerTools().parallel, DsParallel):
+        import deepspeed
+        assert isinstance(_from, deepspeed.DeepSpeedEngine)
+        if _from.zero_optimization_stage() == 3:
+            _copy_params(unwrap_model(_from), unwrap_model(_to), mixup_alpha)
+            return
+
         state_dict = get_ds_model_params(_from, only_rank0=_to is None)
     else:
         state_dict = _from.state_dict()
 
-    if not _to or not state_dict:
+    if not state_dict:
         return
 
     unwrap_to_model = unwrap_model(_to)

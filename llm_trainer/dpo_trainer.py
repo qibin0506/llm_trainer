@@ -82,7 +82,7 @@ class DPOTrainer(BaseTrainer):
         ref_model, _ = TrainerTools().parallel.process(
             model=ref_model,
             optimizer=None,
-            kwargs=self._init_ref_model_args(),
+            kwargs=self._init_ref_model_args(self.train_config.model_config),
             save_instance=False
         )
 

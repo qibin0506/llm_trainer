@@ -420,8 +420,8 @@ class GRPOConfig:
         grpo_epochs (`int`): 同一批数据的复用训练次数。
         grpo_batch_size (`int`): 模型前向/反向的微批次大小。
         group_size (`int`): 对同一个 Prompt 并行生成多少个不同的答案，用于组内 Advantage 优势归一化计算。
+        ref_model_checkpoint (`Mapping[str, Any]`): GRPO 计算 KL 惩罚奖励时参考模型的权重。
         gradient_accumulation_steps (`int`): 梯度累积步数。
-        mixup_alpha (`float`): 训练模型同步更新至参考模型的 EMA 动量系数。
         loss_beta (`float`): KL 惩罚强度。在特定模式下(loss_importance_sampling_level=sequence) 可设为 0.0 改为隐式约束。
         loss_clip_eps (`float`): PPO 基础截断的下限 epsilon。
         loss_clip_eps_high (`Optional[float]`): 不对称裁剪中的上限 epsilon。
@@ -440,8 +440,8 @@ class GRPOConfig:
     grpo_epochs: int
     grpo_batch_size: int
     group_size: int = 12
+    ref_model_checkpoint: Mapping[str, Any]
     gradient_accumulation_steps: int = 1
-    mixup_alpha: float = 1.0
     loss_beta: float = 0.04
     loss_clip_eps: float = 3e-4
     loss_clip_eps_high: Optional[float] = 4e-4

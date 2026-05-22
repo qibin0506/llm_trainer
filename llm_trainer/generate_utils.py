@@ -429,7 +429,7 @@ def batch_generate(
         tokens_per_image: int = -1,
         suppress_tokens: Optional[List[int]] = None,
         device: Union[str, torch.device, int],
-        return_logits: bool = True
+        return_logits: bool = False
 ):
     use_kv_cache = True
     end_token = TrainerTools().tokenizer.end

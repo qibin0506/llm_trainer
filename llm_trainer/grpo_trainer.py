@@ -3,7 +3,6 @@ import gc
 import torch
 import torch.distributed as dist
 from torch.utils.data import Dataset
-import torch.nn.functional as F
 from itertools import islice
 
 from .base_trainer import BaseTrainer
@@ -12,6 +11,7 @@ from .loss import GRPOLoss, LMLoss
 from .tools import TrainerTools
 from .generate_utils import batch_generate
 from .log import Logger
+from .partition_utils import unwrap_model_for_generation
 from .train_configs import (
     TrainConfig,
     GenerateConfig
@@ -24,10 +24,6 @@ from .utils import (
     disable_dropout_in_model,
     calc_position_ids,
     empty_cache
-)
-from .partition_utils import (
-    sync_model_params,
-    unwrap_model_for_generation
 )
 from .checkpoint import (
     save_checkpoint,
@@ -127,6 +123,10 @@ class GRPOTrainer(BaseTrainer):
 
         ref_model = self._new_model(self.train_config)
 
+        if self.train_config.grpo_config.ref_model_checkpoint:
+            ref_model.load_state_dict(self.train_config.grpo_config.ref_model_checkpoint)
+            self.train_config.grpo_config.ref_model_checkpoint = {}
+
         ref_model.eval()
         for param in ref_model.parameters():
             param.requires_grad = False
@@ -134,7 +134,7 @@ class GRPOTrainer(BaseTrainer):
         ref_model, _ = TrainerTools().parallel.process(
             model=ref_model,
             optimizer=None,
-            kwargs=self._init_ref_model_args(),
+            kwargs=self._init_ref_model_args(self.train_config.model_config),
             save_instance=False
         )
 
@@ -194,11 +194,13 @@ class GRPOTrainer(BaseTrainer):
 
     def _calc_loss(self, inputs, attention_mask, logits, labels): ...
 
-    def _compute_log_probs(
+    def _compute_completion_log_probs(
             self,
             model,
             input_ids,
-            attention_mask
+            attention_mask,
+            prompt_len,
+            completion_ids
     ):
         position_ids = calc_position_ids(attention_mask)
 
@@ -209,12 +211,14 @@ class GRPOTrainer(BaseTrainer):
             position_ids=position_ids
         )
 
-        # [batch_size, total_seq_len - 1, vocab_size]
-        logits = outputs['logits'][:, :-1, :]
-        input_ids = input_ids[:, 1:]
+        logits_full = outputs['logits']
+        logits_completion = logits_full[:, prompt_len - 1: -1]
 
-        # Compute and return the log probabilities for the selected tokens.
-        return log_softmax(logits, input_ids), outputs['aux_loss']
+        log_probs = log_softmax(logits_completion, completion_ids)
+        aux_loss = outputs['aux_loss']
+
+        del outputs, logits_full, logits_completion
+        return log_probs, aux_loss
 
     def _compute_group_relative_advantages(self, rewards):
         group_size = self.grpo_config.group_size
@@ -289,19 +293,6 @@ class GRPOTrainer(BaseTrainer):
                     padded_completions.append(comp + [pad_token_id] * pad_len)
 
                 completion_ids = torch.tensor(padded_completions, dtype=torch.long, device=device)
-                completion_mask = completion_ids != pad_token_id
-
-                input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
-                attention_mask = torch.cat([prompt_masks, completion_mask], dim=1)
-
-                with autocast(TrainerTools().parallel.device_type):
-                    old_log_probs, _ = self._compute_log_probs(self.train_model, input_ids, attention_mask)
-
-                if self.ref_model:
-                    with autocast(TrainerTools().parallel.device_type):
-                        ref_log_probs, _ = self._compute_log_probs(self.ref_model, input_ids, attention_mask)
-                else:
-                    ref_log_probs = None
             else:
                 with unwrap_model_for_generation(self.train_model) as unwrapped_model:
                     outputs, _ = batch_generate(
@@ -319,21 +310,24 @@ class GRPOTrainer(BaseTrainer):
                         return_logits=False
                     )
 
-                    completion_ids = outputs[:, prompt_len:]
-                    completion_mask = completion_ids != pad_token_id
+                completion_ids = outputs[:, prompt_len:]
 
-                    input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
-                    attention_mask = torch.cat([prompt_masks, completion_mask], dim=1)
+            completion_mask = completion_ids != pad_token_id
+            input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+            attention_mask = torch.cat([prompt_masks, completion_mask], dim=1)
 
-                    with autocast(TrainerTools().parallel.device_type):
-                        old_log_probs, _ = self._compute_log_probs(unwrapped_model, input_ids, attention_mask)
+            with autocast(TrainerTools().parallel.device_type):
+                old_log_probs, _ = self._compute_completion_log_probs(
+                    self.train_model, input_ids, attention_mask, prompt_len, completion_ids
+                )
 
-                if self.ref_model:
-                    with unwrap_model_for_generation(self.ref_model) as unwrapped_ref_model:
-                        with autocast(TrainerTools().parallel.device_type):
-                            ref_log_probs, _ = self._compute_log_probs(unwrapped_ref_model, input_ids, attention_mask)
-                else:
-                    ref_log_probs = None
+            if self.ref_model:
+                with autocast(TrainerTools().parallel.device_type):
+                    ref_log_probs, _ = self._compute_completion_log_probs(
+                        self.ref_model, input_ids, attention_mask, prompt_len, completion_ids
+                    )
+            else:
+                ref_log_probs = None
 
         repeated_prompts = [p for p in prompts for _ in range(group_size)]
         repeated_answers = [a for a in answers for _ in range(group_size)]
@@ -410,26 +404,22 @@ class GRPOTrainer(BaseTrainer):
                 mb_advantages = advantages[mini_batch_indices]
 
                 with autocast(TrainerTools().parallel.device_type):
-                    log_probs, aux_loss = self._compute_log_probs(self.train_model, mb_input_ids, mb_attention_mask)
-
-                    pad_len = prompt_len - 1
-                    if pad_len > 0:
-                        padded_completion_mask = F.pad(mb_completion_mask, (pad_len, 0), 'constant', 0)
-                    else:
-                        padded_completion_mask = mb_completion_mask
+                    log_probs, aux_loss = self._compute_completion_log_probs(
+                        self.train_model, mb_input_ids, mb_attention_mask, prompt_len, mb_completion_ids
+                    )
 
                     loss, clip_frac = self.criterion(
                         log_probs=log_probs,
                         old_log_probs=mb_old_log_probs,
                         ref_log_probs=mb_ref_log_probs,
-                        completion_mask=padded_completion_mask,
+                        completion_mask=mb_completion_mask,
                         advantages=mb_advantages,
                         completion_len=mb_completion_ids.shape[1]
                     )
 
                     with torch.no_grad():
                         fp32_log_probs = log_probs.float()
-                        fp32_mask = padded_completion_mask.float()
+                        fp32_mask = mb_completion_mask.float()
 
                         entropy = -(fp32_log_probs * fp32_mask).sum() / fp32_mask.sum().clamp(min=1.0)
                         completion_len = fp32_mask.sum(dim=-1).mean()
@@ -508,13 +498,6 @@ class GRPOTrainer(BaseTrainer):
 
     def train(self):
         for epoch in range(self.resume_epoch, self.train_config.n_epochs):
-            if self.ref_model:
-                sync_model_params(
-                    _from=self.train_model,
-                    _to=self.ref_model,
-                    mixup_alpha=self.grpo_config.mixup_alpha
-                )
-
             file_count = len(self.train_config.file_dataset)
             start_file_idx = self.resume_file_idx if epoch == self.resume_epoch else 0
 
@@ -554,8 +537,6 @@ class GRPOTrainer(BaseTrainer):
                     # 生成数据
                     rollout_data = self._generate_rollout_data(batch_data)
                     # end generate
-
-                    empty_cache()
 
                     try:
                         if TrainerTools().parallel.is_main_process:

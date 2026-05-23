@@ -1,4 +1,4 @@
-from typing import Optional, Union, Callable, List, Mapping, Any, Tuple, Dict
+from typing import Optional, Union, Callable, List, Mapping, Any, Tuple
 from dataclasses import dataclass, field
 
 import torch
@@ -198,17 +198,17 @@ class DsConfig:
         zero_config (`Optional[DsZeROConfig]`): ZeRO 优化器核心配置 (阶段0/1/2/3)。
         fp16_config (`Optional[DsFp16Config]`): FP16 混合精度设置。
         bf16_config (`Optional[DsBf16Config]`): BF16 混合精度设置。
-        gradient_clipping (`Optional[float]`): 全局梯度裁剪阈值，防止梯度爆炸。
+        gradient_clipping (`float`): 全局梯度裁剪阈值，防止梯度爆炸。
         activation_checkpointing (`Optional[DsActivationCheckpointingConfig]`): 激活重计算设置。
-        wall_clock_breakdown (`Optional[bool]`): 是否打印耗时拆解（Forward/Backward/Comm 等时间的占比分析）。
+        wall_clock_breakdown (`bool`): 是否打印耗时拆解（Forward/Backward/Comm 等时间的占比分析）。
         flops_profiler (`Optional[DsFlopsProfilerConfig]`): DeepSpeed 算子性能与 TFLOPS 分析器配置。
     """
     zero_config: Optional[DsZeROConfig] = field(default_factory=DsZero3Config)
     fp16_config: Optional[DsFp16Config] = field(default_factory=DsFp16Config)
     bf16_config: Optional[DsBf16Config] = field(default_factory=DsBf16Config)
-    gradient_clipping: Optional[float] = 1.0
+    gradient_clipping: float = 1.0
     activation_checkpointing: Optional[DsActivationCheckpointingConfig] = None
-    wall_clock_breakdown: Optional[bool] = False
+    wall_clock_breakdown: bool = False
     flops_profiler: Optional[DsFlopsProfilerConfig] = None
 
 

@@ -335,7 +335,7 @@ class BaseTrainer:
             parallel_kwargs = {
                 'gradient_accumulation_steps': self.gradient_accumulation_steps,
                 'gradient_clipping': self.train_config.ds_config.gradient_clipping,
-                'train_micro_batch_size_per_gpu': self.train_config.batch_size
+                'train_micro_batch_size_per_gpu': self.train_config.batch_size,
             }
 
             if self.train_config.ds_config.wall_clock_breakdown:

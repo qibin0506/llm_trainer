@@ -2,8 +2,8 @@ from typing import Optional
 from contextlib import contextmanager
 import itertools
 from packaging import version
+import torch
 from torch import nn
-import torch.distributed as dist
 
 from .tools import TrainerTools
 from .parallel import DsParallel
@@ -12,19 +12,7 @@ from .parallel import DsParallel
 @contextmanager
 def unwrap_model_for_generation(model: nn.Module):
     """
-    Context manager to unwrap distributed or accelerated models for generation tasks.
-
-    Args:
-        model:
-            Model to be unwrapped.
-    Yields:
-        Unwrapped model.
-
-    Example:
-    ```python
-    with unwrap_model_for_generation(model, accelerator) as unwrapped_model:
-        generated_outputs = unwrapped_model.generate(input_ids)
-    ```
+    解包model用于生成
     """
     if isinstance(TrainerTools().parallel, DsParallel):
         import deepspeed
@@ -33,59 +21,112 @@ def unwrap_model_for_generation(model: nn.Module):
         if model.zero_optimization_stage() == 3:
             with deepspeed.zero.GatheredParameters(model.parameters()):
                 _remove_hooks(model)
-                yield unwrap_model(model)
-                _add_hooks(model)
+                try:
+                    yield unwrap_model(model)
+                finally:
+                    _add_hooks(model)
         else:
             yield unwrap_model(model)
     else:
         yield model
 
 
-def sync_model_params(_from: nn.Module, _to: nn.Module, mixup_alpha: float = 1.0):
+def sync_model_state_dict(
+        _from: nn.Module,
+        _to: nn.Module,
+        mixup_alpha: float = 1.0,
+        max_elements_per_chunk = 100_000_000
+):
     """
-    同步参数，需要在所有rank上调用
+    同步_from参数到_to，需要在所有rank上调用
     """
-    if not _to:
-        return
+    assert _from is not None
+    assert _to is not None
+
+    from_model = unwrap_model(_from)
+    to_model = unwrap_model(_to)
+
+    is_from_zero3 = False
+    is_to_zero3 = False
 
     if isinstance(TrainerTools().parallel, DsParallel):
         import deepspeed
-        assert isinstance(_from, deepspeed.DeepSpeedEngine)
-        if _from.zero_optimization_stage() == 3:
-            _copy_params(unwrap_model(_from), unwrap_model(_to), mixup_alpha)
-            return
+        if isinstance(_from, deepspeed.DeepSpeedEngine) and _from.zero_optimization_stage() == 3:
+            is_from_zero3 = True
+        if isinstance(_to, deepspeed.DeepSpeedEngine) and _to.zero_optimization_stage() == 3:
+            is_to_zero3 = True
 
-        state_dict = get_ds_model_params(_from, only_rank0=_to is None)
-    else:
-        state_dict = _from.state_dict()
+    def _apply_mixup(p_from: torch.Tensor, p_to: torch.Tensor):
+        copy_tensor = p_from.to(device=p_to.device, dtype=p_to.dtype)
+        if mixup_alpha == 1.0:
+            p_to.copy_(copy_tensor)
+        else:
+            p_to.mul_(1.0 - mixup_alpha).add_(copy_tensor, alpha=mixup_alpha)
 
-    if not state_dict:
-        return
+    with torch.no_grad():
+        from_buffers = dict(from_model.named_buffers())
+        for name, buf_to in to_model.named_buffers():
+            if name in from_buffers:
+                _apply_mixup(from_buffers[name], buf_to)
 
-    unwrap_to_model = unwrap_model(_to)
-    if mixup_alpha == 1.0:
-        # 直接覆盖
-        unwrap_to_model.load_state_dict(state_dict, strict=False)
-    else:
-        # 混合参数
-        for param_name, target_param in unwrap_to_model.named_parameters():
-            if param_name in state_dict:
-                from_param_tensor = state_dict[param_name]
-                target_param.data.mul_(1.0 - mixup_alpha).add_(
-                    from_param_tensor.data.to(device=target_param.device, dtype=target_param.dtype),
-                    alpha=mixup_alpha
-                )
+        from_params = dict(from_model.named_parameters())
+
+        chunk_p_from = []
+        chunk_p_to = []
+        current_elements = 0
+
+        def _process_sync_chunk(p_from_list, p_to_list):
+            if not p_from_list:
+                return
+
+            if is_from_zero3 and is_to_zero3:
+                import deepspeed
+                with deepspeed.zero.GatheredParameters(p_from_list, modifier_rank=None):
+                    with deepspeed.zero.GatheredParameters(p_to_list, modifier_rank=0):
+                        if TrainerTools().parallel.is_main_process:
+                            for pf, pt in zip(p_from_list, p_to_list):
+                                _apply_mixup(pf, pt)
+            elif is_from_zero3 and not is_to_zero3:
+                import deepspeed
+                with deepspeed.zero.GatheredParameters(p_from_list, modifier_rank=None):
+                    for pf, pt in zip(p_from_list, p_to_list):
+                        _apply_mixup(pf, pt)
+            elif not is_from_zero3 and is_to_zero3:
+                raise NotImplementedError('is_from_zero3=False and is_to_zero3=True is not implemented')
+            else:
+                for pf, pt in zip(p_from_list, p_to_list):
+                    _apply_mixup(pf, pt)
+
+        for name, param_to in to_model.named_parameters():
+            if name in from_params:
+                param_from = from_params[name]
+                chunk_p_from.append(param_from)
+                chunk_p_to.append(param_to)
+
+                numel = getattr(param_from, 'ds_numel', param_from.numel())
+                current_elements += numel
+
+                if current_elements >= max_elements_per_chunk:
+                    _process_sync_chunk(chunk_p_from, chunk_p_to)
+                    chunk_p_from = []
+                    chunk_p_to = []
+                    current_elements = 0
+
+        _process_sync_chunk(chunk_p_from, chunk_p_to)
 
 
-def get_full_state_dict_on_rank0(model: nn.Module):
+def get_full_state_dict_on_rank0(
+        model: nn.Module,
+        max_elements_per_chunk = 100_000_000
+):
     """
     在rank0上获取完整参数，需要在所有rank上调用，其他rank返回None
     """
     try:
         import deepspeed
         if isinstance(model, deepspeed.DeepSpeedEngine):
-            return get_ds_full_state_dict_on_rank0(model)
-    except: ...
+            return _get_ds_full_state_dict_on_rank0(model, max_elements_per_chunk)
+    except Exception: ...
 
     if TrainerTools().parallel.is_main_process:
         return {k: v.cpu().clone() for k, v in unwrap_model(model).state_dict().items()}
@@ -93,7 +134,71 @@ def get_full_state_dict_on_rank0(model: nn.Module):
     return None
 
 
-def get_ds_full_state_dict_on_rank0(model: nn.Module) -> Optional[dict]:
+def unwrap_model(model) -> nn.Module:
+    try:
+        import deepspeed
+        if isinstance(model, deepspeed.DeepSpeedEngine):
+            return model.module
+    except Exception: ...
+
+    return model
+
+
+# def get_ds_state_dict(
+#         model: nn.Module,
+#         only_rank0 = False,
+#         max_elements_per_chunk = 100_000_000
+# ):
+#     """
+#     从一个正在运行的 DeepSpeedEngine 中高效地提取完整的 FP32 state_dict，兼容 ZeRO Stages 0, 1, 2, 3。
+#     需要在所有rank上调用；如果only_rank0为False，则所有rank都会同步获取最新参数，否则，其他rank返回None
+#     """
+#     import deepspeed
+#     assert isinstance(model, deepspeed.DeepSpeedEngine)
+#
+#     if only_rank0:
+#         return _get_ds_full_state_dict_on_rank0(model, max_elements_per_chunk=max_elements_per_chunk)
+#
+#     if model.zero_optimization_stage() != 3:
+#         return {k: v.cpu().clone() for k, v in model.module.state_dict().items()}
+#
+#     state_dict = {}
+#     if TrainerTools().parallel.is_main_process or not only_rank0:
+#         for name, buf in model.module.named_buffers():
+#             state_dict[name] = buf.cpu().clone()
+#
+#     chunk_names = []
+#     chunk_params = []
+#     current_elements = 0
+#
+#     def _process_chunk(names, params):
+#         if not params:
+#             return
+#         with deepspeed.zero.GatheredParameters(params, modifier_rank=None):
+#             for n, p in zip(names, params):
+#                 state_dict[n] = p.cpu().clone()
+#
+#     for name, param in model.module.named_parameters():
+#         chunk_names.append(name)
+#         chunk_params.append(param)
+#
+#         numel = getattr(param, 'ds_numel', param.numel())
+#         current_elements += numel
+#
+#         if current_elements >= max_elements_per_chunk:
+#             _process_chunk(chunk_names, chunk_params)
+#             chunk_names = []
+#             chunk_params = []
+#             current_elements = 0
+#
+#     _process_chunk(chunk_names, chunk_params)
+#     return state_dict
+
+
+def _get_ds_full_state_dict_on_rank0(
+        model: nn.Module,
+        max_elements_per_chunk = 100_000_000
+) -> Optional[dict]:
     """
     在rank0上获取完整ds模型参数，需要在所有rank上调用，其他rank返回None
     """
@@ -105,75 +210,53 @@ def get_ds_full_state_dict_on_rank0(model: nn.Module) -> Optional[dict]:
             return {k: v.cpu().clone() for k, v in model.module.state_dict().items()}
         return None
 
-    # --- ZeRO-3 ---
-    # 只调用一次 GatheredParameters，传入所有参数
-    with deepspeed.zero.GatheredParameters(model.parameters(), modifier_rank=0):
-        if TrainerTools().parallel.is_main_process:
-            # 在这个 'with' 代码块内，rank 0 上的 model.module 拥有完整的参数
-            # 所以我们可以像操作普通模型一样直接调用 state_dict()
-            full_state_dict = model.module.state_dict()
+    state_dict = {}
+    state_vars = model.module.state_dict(keep_vars=True)
 
-            # 将其克隆到 CPU 并返回
-            return {k: v.cpu().clone() for k, v in full_state_dict.items()}
+    if TrainerTools().parallel.is_main_process:
+        for name, var in state_vars.items():
+            if not isinstance(var, torch.nn.Parameter):
+                state_dict[name] = var.cpu().clone()
 
-    # 其他 rank 执行到这里时，上下文结束，直接返回 None
-    return None
+    unique_params = []
+    param_id_to_names = {}
 
+    for name, var in state_vars.items():
+        if isinstance(var, torch.nn.Parameter):
+            pid = id(var)
+            if pid not in param_id_to_names:
+                param_id_to_names[pid] = []
+                unique_params.append(var)
+            param_id_to_names[pid].append(name)
 
-def get_ds_model_params(model: nn.Module, only_rank0=False):
-    """
-    从一个正在运行的 DeepSpeedEngine 中高效地提取完整的 FP32 state_dict，兼容 ZeRO Stages 0, 1, 2, 3。
-    需要在所有rank上调用；如果only_rank0为False，则所有rank都会同步获取最新参数，否则，其他rank返回None
-    """
+    chunk_params = []
+    chunk_names_list = []
+    current_elements = 0
 
-    import deepspeed
-    assert isinstance(model, deepspeed.DeepSpeedEngine)
-    state_dict = get_ds_full_state_dict_on_rank0(model)
-
-    # 现在，只有 rank 0 上的 state_dict 是一个有效的字典，其他 rank 上是 None。
-    # 我们需要将其广播给所有进程。
-    if not only_rank0 and TrainerTools().parallel.world_size > 1:
-        # 准备一个列表，rank 0 有数据，其他 rank 是占位符
-        object_list = [state_dict] if TrainerTools().parallel.is_main_process else [None]
-        # 执行广播，这个操作是阻塞的，会同步所有进程
-        dist.broadcast_object_list(object_list, src=0)
-        # 所有进程从列表中获取广播后的 state_dict 副本
-        state_dict = object_list[0]
-
-    return state_dict
-
-
-def unwrap_model(model) -> nn.Module:
-    try:
-        import deepspeed
-        if isinstance(model, deepspeed.DeepSpeedEngine):
-            return model.module
-    except: ...
-
-    return model
-
-
-def _copy_params(model, target_model, mixup_alpha):
-    for target_param, copy_param in zip(target_model.parameters(), model.parameters()):
-        target_param.data.mul_(1.0 - mixup_alpha).add_(copy_param.data, alpha=mixup_alpha)
-
-
-def _sync_ds_model_params(_from: nn.Module, _to: Optional[nn.Module], mixup_alpha: float = 1.0):
-    """
-    需要在所有rank上调用
-    """
-    import deepspeed
-    assert isinstance(_from, deepspeed.DeepSpeedEngine)
-
-    origin_from = unwrap_model(_from)
-
-    if _from.zero_optimization_stage() == 3:
-        with deepspeed.zero.GatheredParameters(list(origin_from.parameters()) + list(_to.parameters()), modifier_rank=0):
-            # why only rank 0?
+    def _process_chunk(params, names_list):
+        if not params:
+            return
+        with deepspeed.zero.GatheredParameters(params, modifier_rank=None):
             if TrainerTools().parallel.is_main_process:
-                _copy_params(origin_from, _to, mixup_alpha)
-    else:
-        _copy_params(origin_from, _to, mixup_alpha)
+                for p, names in zip(params, names_list):
+                    for n in names:
+                        state_dict[n] = p.cpu().clone()
+
+    for p in unique_params:
+        chunk_params.append(p)
+        chunk_names_list.append(param_id_to_names[id(p)])
+
+        numel = getattr(p, 'ds_numel', p.numel())
+        current_elements += numel
+
+        if current_elements >= max_elements_per_chunk:
+            _process_chunk(chunk_params, chunk_names_list)
+            chunk_params = []
+            chunk_names_list = []
+            current_elements = 0
+
+    _process_chunk(chunk_params, chunk_names_list)
+    return state_dict if TrainerTools().parallel.is_main_process else None
 
 
 def _add_hooks(model: nn.Module) -> None:
@@ -181,7 +264,7 @@ def _add_hooks(model: nn.Module) -> None:
     import deepspeed
     assert isinstance(model, deepspeed.DeepSpeedEngine)
 
-    if not hasattr(model, "optimizer"):  # before the first training step, the model has no optimizer
+    if not hasattr(model, "optimizer") or model.optimizer is None:  # before the first training step, the model has no optimizer
         return
     if model.optimizer is not None and hasattr(model.optimizer, "parameter_offload"):
         optimizer_offload = model.optimizer.parameter_offload
@@ -201,7 +284,7 @@ def _remove_hooks(model: nn.Module) -> None:
     import deepspeed
     assert isinstance(model, deepspeed.DeepSpeedEngine)
 
-    if not hasattr(model, "optimizer"):  # before the first training step, the model has no optimizer
+    if not hasattr(model, "optimizer") or model.optimizer is None:  # before the first training step, the model has no optimizer
         return
     if model.optimizer is not None and hasattr(model.optimizer, "parameter_offload"):
         optimizer_offload = model.optimizer.parameter_offload

@@ -21,7 +21,6 @@ from .utils import (
     disable_dropout_in_model,
     empty_cache
 )
-
 from .checkpoint import (
     save_checkpoint,
     save_steps,

@@ -562,7 +562,7 @@ def disable_dropout_in_model(model: torch.nn.Module) -> None:
             module.p = 0
 
 
-def _masked_mean(values: torch.Tensor, mask: torch.Tensor, axis: Optional[bool] = None) -> torch.Tensor:
+def _masked_mean(values: torch.Tensor, mask: torch.Tensor, axis: Optional[int] = None) -> torch.Tensor:
     """Compute mean of tensor with a masked values."""
     if axis is not None:
         return (values * mask).sum(axis=axis) / mask.sum(axis=axis).clamp(min=1e-8)

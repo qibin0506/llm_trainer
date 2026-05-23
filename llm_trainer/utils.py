@@ -32,28 +32,32 @@ def set_seed(seed):
 
 def autocast(device_type):
     if TrainerTools().use_amp:
-        compute_dtype = TrainerTools().compute_dtype
-        if compute_dtype == 'bf16':
-            dtype = torch.bfloat16
-        elif compute_dtype == 'fp16':
-            dtype = torch.float16
-        elif compute_dtype == 'fp32':
-            dtype = torch.float32
-        elif is_bf16_supported():
-            dtype = torch.bfloat16
-        elif is_fp16_supported():
-            dtype = torch.float16
-        else:
-            dtype = torch.float32
-
         return torch.autocast(
             device_type=device_type,
-            dtype=dtype,
+            dtype=get_dtype(),
             enabled=True,
             cache_enabled=None
         )
     else:
         return nullcontext()
+
+
+def get_dtype():
+    compute_dtype = TrainerTools().compute_dtype
+    if compute_dtype == 'bf16':
+        dtype = torch.bfloat16
+    elif compute_dtype == 'fp16':
+        dtype = torch.float16
+    elif compute_dtype == 'fp32':
+        dtype = torch.float32
+    elif is_bf16_supported():
+        dtype = torch.bfloat16
+    elif is_fp16_supported():
+        dtype = torch.float16
+    else:
+        dtype = torch.float32
+
+    return dtype
 
 
 def is_bf16_supported():

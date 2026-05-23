@@ -42,6 +42,9 @@ def unwrap_model_for_generation(model: nn.Module):
 
 
 def sync_model_params(_from: nn.Module, _to: nn.Module, mixup_alpha: float = 1.0):
+    """
+    同步参数，需要在所有rank上调用
+    """
     if not _to:
         return
 
@@ -74,19 +77,25 @@ def sync_model_params(_from: nn.Module, _to: nn.Module, mixup_alpha: float = 1.0
                 )
 
 
-def unwrap_model(model) -> nn.Module:
+def get_full_state_dict_on_rank0(model: nn.Module):
+    """
+    在rank0上获取完整参数，需要在所有rank上调用，其他rank返回None
+    """
     try:
         import deepspeed
         if isinstance(model, deepspeed.DeepSpeedEngine):
-            return model.module
+            return get_ds_full_state_dict_on_rank0(model)
     except: ...
 
-    return model
+    if TrainerTools().parallel.is_main_process:
+        return {k: v.cpu().clone() for k, v in unwrap_model(model).state_dict().items()}
+
+    return None
 
 
 def get_ds_full_state_dict_on_rank0(model: nn.Module) -> Optional[dict]:
     """
-        需要在所有rank上调用，然后只有rank0有值
+    在rank0上获取完整ds模型参数，需要在所有rank上调用，其他rank返回None
     """
     import deepspeed
     assert isinstance(model, deepspeed.DeepSpeedEngine)
@@ -113,9 +122,8 @@ def get_ds_full_state_dict_on_rank0(model: nn.Module) -> Optional[dict]:
 
 def get_ds_model_params(model: nn.Module, only_rank0=False):
     """
-        从一个正在运行的 DeepSpeedEngine 中高效地提取完整的 FP32 state_dict，
-        兼容 ZeRO Stages 0, 1, 2, 3。
-        包含了对 ZeRO-3 中分片参数的正确处理。
+    从一个正在运行的 DeepSpeedEngine 中高效地提取完整的 FP32 state_dict，兼容 ZeRO Stages 0, 1, 2, 3。
+    需要在所有rank上调用；如果only_rank0为False，则所有rank都会同步获取最新参数，否则，其他rank返回None
     """
 
     import deepspeed
@@ -135,12 +143,25 @@ def get_ds_model_params(model: nn.Module, only_rank0=False):
     return state_dict
 
 
+def unwrap_model(model) -> nn.Module:
+    try:
+        import deepspeed
+        if isinstance(model, deepspeed.DeepSpeedEngine):
+            return model.module
+    except: ...
+
+    return model
+
+
 def _copy_params(model, target_model, mixup_alpha):
     for target_param, copy_param in zip(target_model.parameters(), model.parameters()):
         target_param.data.mul_(1.0 - mixup_alpha).add_(copy_param.data, alpha=mixup_alpha)
 
 
 def _sync_ds_model_params(_from: nn.Module, _to: Optional[nn.Module], mixup_alpha: float = 1.0):
+    """
+    需要在所有rank上调用
+    """
     import deepspeed
     assert isinstance(_from, deepspeed.DeepSpeedEngine)
 

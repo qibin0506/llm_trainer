@@ -20,7 +20,7 @@ if __name__ == '__main__':
     os.environ['PARALLEL_TYPE'] = parallel_type
 
     if parallel_type == 'ds':
-        command = f'deepspeed {extra_args}{run_file_name}'
+        command = f'torchrun {extra_args}{run_file_name}'
     else:
         command = f'python3 {run_file_name}'
 

@@ -1,13 +1,13 @@
+from typing import Union, List, Optional, Tuple
 import random
 from contextlib import nullcontext
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.utils.rnn import pad_sequence
 import torch.nn.functional as F
 from .tools import TrainerTools
-import numpy as np
-from typing import Union, List, Optional, Tuple
 
 default_seed = 42
 

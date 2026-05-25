@@ -1,6 +1,7 @@
 import os
 import math
 from abc import ABC, abstractmethod
+
 from .tokenizer import Tokenizer
 from .parallel import DsParallel, NoneParallel
 from .log import Logger

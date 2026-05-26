@@ -160,8 +160,12 @@ class BaseTrainer:
 
         self._check_freeze_llm_model(model)
 
-        if self.train_config.ds_config and self.train_config.ds_config.activation_checkpointing:
-            model.gradient_checkpointing_enable()
+        if self.train_config.gradient_checkpointing:
+            if self.is_ds:
+                import deepspeed
+                model.gradient_checkpointing_enable(checkpoint_func=deepspeed.checkpointing.checkpoint)
+            else:
+                model.gradient_checkpointing_enable()
 
         if TrainerTools().parallel.is_main_process:
             total_params = sum(p.numel() for p in model.parameters())

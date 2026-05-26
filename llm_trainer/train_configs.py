@@ -476,6 +476,7 @@ class TrainConfig:
         ds_config (`DsConfig`): 掌控分布式底层的 DeepSpeed 引擎配置（含 ZeRO）。
         eval_config (`GenerateConfig`): 训练期间触发 Evaluation 测试集时的生成配置。
         save_and_eval_interval (`int`): 指定多少个 global batch step 后触发一次 checkpoint 保存和评估。
+        gradient_checkpointing (`bool`): 是否开启梯度检查点，如果开启且使用ds模式，会自动配置DsActivationCheckpointingConfig
         pretrain_config (`Optional[PretrainConfig]`): 使用基础 Trainer 时的配置组。
         sft_config (`Optional[SFTConfig]`): 使用 SFTTrainer 时的监督微调配置组。
         dpo_config (`Optional[DPOConfig]`): 使用 DPOTrainer 时的对齐微调配置组。
@@ -497,9 +498,17 @@ class TrainConfig:
 
     eval_config: GenerateConfig = field(default_factory=GenerateConfig)
     save_and_eval_interval: int = 100
+    gradient_checkpointing: bool = False
 
     pretrain_config: Optional[PretrainConfig] = None
     sft_config: Optional[SFTConfig] = None
     dpo_config: Optional[DPOConfig] = None
     ppo_config: Optional[PPOConfig] = None
     grpo_config: Optional[GRPOConfig] = None
+
+    def __post_init__(self):
+        if self.gradient_checkpointing and self.ds_config and not self.ds_config.activation_checkpointing:
+            self.ds_config.activation_checkpointing = DsActivationCheckpointingConfig()
+        elif self.ds_config and self.ds_config.activation_checkpointing:
+            self.gradient_checkpointing = True
+

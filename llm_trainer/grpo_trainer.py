@@ -582,7 +582,7 @@ class GRPOTrainer(BaseTrainer):
                             }
                         )
 
-                        if (batch - last_ckpt_batch) >= self.train_config.save_and_eval_interval:
+                        if (batch + 1 - last_ckpt_batch) >= self.train_config.save_and_eval_interval:
                             save_checkpoint(model=self.train_model, optimizer=self.optimizer)
                             save_steps(
                                 epoch=epoch,
@@ -591,7 +591,7 @@ class GRPOTrainer(BaseTrainer):
                                 lr_scheduler=self.lr_scheduler
                             )
 
-                            last_ckpt_batch = batch
+                            last_ckpt_batch = batch + 1
                             self._on_batch_end(tag=f'epoch:{epoch}/batch:{batch}')
                     except Exception as e:
                         self._on_exception(e, epoch, batch)

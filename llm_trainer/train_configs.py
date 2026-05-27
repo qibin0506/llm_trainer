@@ -507,8 +507,7 @@ class TrainConfig:
     grpo_config: Optional[GRPOConfig] = None
 
     def __post_init__(self):
-        if self.gradient_checkpointing and self.ds_config and not self.ds_config.activation_checkpointing:
+        if self.gradient_checkpointing and self.ds_config is not None and self.ds_config.activation_checkpointing is None:
             self.ds_config.activation_checkpointing = DsActivationCheckpointingConfig()
-        elif self.ds_config and self.ds_config.activation_checkpointing:
+        elif not self.gradient_checkpointing and self.ds_config is not None and self.ds_config.activation_checkpointing is not None:
             self.gradient_checkpointing = True
-

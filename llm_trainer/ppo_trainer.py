@@ -191,7 +191,7 @@ class PPOTrainer(BaseTrainer):
                 total_size_mb = total_size_bytes / (1024 * 1024)
                 Logger.std_log(f"Total size of the model: {total_size_mb:.2f} MB")
 
-        if self.train_config.init_weights_path:
+        if self.train_config.init_weights_path is not None:
             self._load_external_weights(
                 train_model,
                 self.train_config.init_weights_path,

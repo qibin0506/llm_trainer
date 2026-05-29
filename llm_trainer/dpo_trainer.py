@@ -68,20 +68,21 @@ class DPOTrainer(BaseTrainer):
         self.ref_model = self._init_ref_model()
 
     def _init_ref_model(self):
-        ref_model = self._new_model(self.train_config)
-
-        if self.dpo_config.ref_model_checkpoint:
-            ref_model.load_state_dict(self.dpo_config.ref_model_checkpoint)
-            self.dpo_config.ref_model_checkpoint = {}
+        parallel_kwargs = self._init_ref_model_args(self.train_config.model_config)
+        with self._new_model_context(parallel_kwargs):
+            ref_model = self._new_model(self.train_config)
 
         ref_model.eval()
         for param in ref_model.parameters():
             param.requires_grad = False
 
+        if self.dpo_config.ref_model_weights_path is not None:
+            self._load_external_weights(ref_model, self.dpo_config.ref_model_weights_path)
+
         ref_model, _ = TrainerTools().parallel.process(
             model=ref_model,
             optimizer=None,
-            kwargs=self._init_ref_model_args(self.train_config.model_config),
+            kwargs=parallel_kwargs,
             save_instance=False
         )
 
@@ -118,8 +119,6 @@ class DPOTrainer(BaseTrainer):
         file_path = self.train_config.file_dataset[file_idx]
         block_size = self.train_config.dataset_block_size
         return DPODataset(file_path, block_size), file_path
-
-    def _calc_loss(self, inputs, attention_mask, logits, labels): ...
 
     def _logprobs(self, logits, labels):
         """

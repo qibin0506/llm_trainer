@@ -164,8 +164,9 @@ class PPOTrainer(BaseTrainer):
             self.ptx_criterion = self._init_ptx_loss()
 
     def _init_train_model_and_optim(self, initial_lr: float):
-        policy_model = self._new_model(self.train_config)
-        value_model = ValueModel(self._new_model(self.train_config))
+        with self._new_model_context(self.parallel_kwargs):
+            policy_model = self._new_model(self.train_config)
+            value_model = ValueModel(self._new_model(self.train_config))
 
         if self.train_config.gradient_checkpointing:
             if self.is_ds:
@@ -178,26 +179,31 @@ class PPOTrainer(BaseTrainer):
 
         train_model = PolicyAndValueModelWrapper(policy_model, value_model)
 
-        if self.train_config.init_state_dict:
-            policy_model.load_state_dict(self.train_config.init_state_dict, strict=False)
-            value_model.base_model.load_state_dict(self.train_config.init_state_dict, strict=False)
-            self.train_config.init_state_dict = None
-
-        if self.train_config.ppo_config.value_model_checkpoint:
-            value_model.load_state_dict(self.train_config.ppo_config.value_model_checkpoint)
-            self.train_config.ppo_config.value_model_checkpoint = {}
-
         if TrainerTools().parallel.is_main_process:
             for name, model in zip(['policy', 'value'], [policy_model, value_model]):
-                total_params = sum(p.numel() for p in model.parameters())
-                Logger.std_log(f"Total number of {name} model parameters: {total_params:,}")
+                total_params = sum(getattr(p, 'ds_numel', p.numel()) for p in model.parameters())
+                Logger.std_log(f"Total number of parameters: {total_params:,}")
 
-                trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-                Logger.std_log(f"Trainable number of {name} model parameters: {trainable_params:,}")
+                trainable_params = sum(getattr(p, 'ds_numel', p.numel()) for p in model.parameters() if p.requires_grad)
+                Logger.std_log(f"Trainable number of parameters: {trainable_params:,}")
 
                 total_size_bytes = total_params * 4
                 total_size_mb = total_size_bytes / (1024 * 1024)
-                Logger.std_log(f"Total size of {name} model model: {total_size_mb:.2f} MB")
+                Logger.std_log(f"Total size of the model: {total_size_mb:.2f} MB")
+
+        if self.train_config.init_weights_path:
+            self._load_external_weights(
+                train_model,
+                self.train_config.init_weights_path,
+                prefixes=['policy_model.', 'value_model.base_model.']
+            )
+
+        if self.ppo_config.value_model_weights_path is not None:
+            self._load_external_weights(
+                train_model,
+                self.ppo_config.value_model_weights_path,
+                prefixes=['value_model.']
+            )
 
         model, optim = TrainerTools().parallel.process(
             model=train_model,
@@ -302,20 +308,21 @@ class PPOTrainer(BaseTrainer):
         return CompositeLRScheduler(schedulers)
 
     def _init_ref_model(self):
-        ref_model = self._new_model(self.train_config)
-
-        if self.train_config.ppo_config.ref_model_checkpoint:
-            ref_model.load_state_dict(self.train_config.ppo_config.ref_model_checkpoint)
-            self.train_config.ppo_config.ref_model_checkpoint = {}
+        parallel_kwargs = self._init_ref_model_args(self.train_config.model_config)
+        with self._new_model_context(parallel_kwargs):
+            ref_model = self._new_model(self.train_config)
 
         ref_model.eval()
         for param in ref_model.parameters():
             param.requires_grad = False
 
+        if self.ppo_config.ref_model_weights_path is not None:
+            self._load_external_weights(ref_model, self.ppo_config.ref_model_weights_path)
+
         ref_model, _ = TrainerTools().parallel.process(
             model=ref_model,
             optimizer=None,
-            kwargs=self._init_ref_model_args(self.train_config.model_config),
+            kwargs=parallel_kwargs,
             save_instance=False
         )
 
@@ -327,27 +334,14 @@ class PPOTrainer(BaseTrainer):
         return model
 
     def _init_loss(self):
-        ppo_config = self.train_config.ppo_config
         criterion = PPOLoss(
-            clip_eps=ppo_config.clip_eps,
-            vf_coef=ppo_config.vf_coef
+            clip_eps=self.ppo_config.clip_eps,
+            vf_coef=self.ppo_config.vf_coef
         )
         return criterion, None
 
     def _init_ptx_loss(self):
-        critical_tokens: Optional[List[int]] = None
-        critical_alpha: float = 1.0
-        if self.train_config.loss_config.critical_tokens:
-            critical_tokens = self.train_config.loss_config.critical_tokens
-            critical_alpha = self.train_config.loss_config.critical_alpha
-
-        criterion = LMLoss(
-            critical_tokens=critical_tokens,
-            critical_alpha=critical_alpha,
-            vocab_size=TrainerTools().tokenizer.vocab_size
-        )
-
-        return criterion
+        return LMLoss()
 
     def _load_train_model_checkpoint(self):
         load_checkpoint(
@@ -370,8 +364,6 @@ class PPOTrainer(BaseTrainer):
         file_path = self.train_config.file_dataset[file_idx]
         return RLDataset(file_path), file_path
 
-    def _calc_loss(self, inputs, attention_mask, logits, labels): ...
-
     def _check_eval_model(self, eval_model):
         return eval_model.policy_model
 
@@ -388,7 +380,7 @@ class PPOTrainer(BaseTrainer):
         last_values = last_values.float()
         completion_mask = completion_mask.float()
 
-        gamma, lam = self.train_config.ppo_config.gamma, self.train_config.ppo_config.lam
+        gamma, lam = self.ppo_config.gamma, self.ppo_config.lam
         advantages_reversed = []
         last_gae_lam = 0
         seq_len = rewards.size(1)
@@ -410,7 +402,6 @@ class PPOTrainer(BaseTrainer):
         return advantages * completion_mask, returns * completion_mask
 
     def _generate_rollout_data(self, batch_data: List[dict]) -> dict:
-        ppo_config = self.train_config.ppo_config
         device = TrainerTools().parallel.device
         pad_token_id = TrainerTools().tokenizer.pad
         eos_token_id = TrainerTools().tokenizer.end
@@ -419,7 +410,7 @@ class PPOTrainer(BaseTrainer):
         answers = [item["answer"] for item in batch_data]
 
         # for PTX
-        if ppo_config.ptx_coef > 0.0 and self.ptx_builder is not None:
+        if self.ppo_config.ptx_coef > 0.0 and self.ptx_builder is not None:
             ptx_data = self.ptx_builder(prompts, answers)
             ptx_data = [{'inputs': t} if t is not None else None for t in ptx_data]
         else:
@@ -431,17 +422,17 @@ class PPOTrainer(BaseTrainer):
         prompt_masks = self._calc_attention_mask(prompt_ids)
         prompt_len = prompt_ids.shape[1]
 
-        max_new_tokens = ppo_config.generate_config.max_seq_len - prompt_len
+        max_new_tokens = self.ppo_config.generate_config.max_seq_len - prompt_len
         if max_new_tokens <= 0:
             raise ValueError(
-                f"Prompt length ({prompt_len}) >= max_seq_len ({ppo_config.generate_config.max_seq_len}). "
+                f"Prompt length ({prompt_len}) >= max_seq_len ({self.ppo_config.generate_config.max_seq_len}). "
                 f"Cannot generate any tokens. Please increase max_seq_len or reduce dataset_block_size."
             )
 
         with torch.no_grad():
             if self.generation_service is not None:
                 completion_ids_list = self.generation_service(
-                    self.train_model, prompt_ids, ppo_config.generate_config, 'ppo', None, None
+                    self.train_model, prompt_ids, self.ppo_config.generate_config, 'ppo', None, None
                 )
 
                 padded_completions = []
@@ -464,12 +455,12 @@ class PPOTrainer(BaseTrainer):
                         tokens=prompt_ids,
                         attention_mask=prompt_masks,
                         max_new_tokens=max_new_tokens,
-                        temperature=ppo_config.generate_config.temperature,
-                        top_k=ppo_config.generate_config.top_k,
-                        top_p=ppo_config.generate_config.top_p,
-                        repetition_penalty=ppo_config.generate_config.repetition_penalty,
-                        exclude_penalty_tokens=ppo_config.generate_config.exclude_penalty_tokens,
-                        suppress_tokens=ppo_config.generate_config.suppress_tokens,
+                        temperature=self.ppo_config.generate_config.temperature,
+                        top_k=self.ppo_config.generate_config.top_k,
+                        top_p=self.ppo_config.generate_config.top_p,
+                        repetition_penalty=self.ppo_config.generate_config.repetition_penalty,
+                        exclude_penalty_tokens=self.ppo_config.generate_config.exclude_penalty_tokens,
+                        suppress_tokens=self.ppo_config.generate_config.suppress_tokens,
                         device=device,
                         return_logits=False
                     )
@@ -508,10 +499,10 @@ class PPOTrainer(BaseTrainer):
             rewards = torch.zeros_like(completion_ids, dtype=torch.float32, device=device)
             completion_mask = (completion_ids != pad_token_id)
 
-            if ppo_config.kl_beta > 0.0:
+            if self.ppo_config.kl_beta > 0.0:
                 logr = ref_log_probs_completion.float() - old_log_probs.float()
-                kl = -logr if ppo_config.kl_estimator == "k1" else (logr.exp() - 1) - logr
-                kl_rewards = -ppo_config.kl_beta * kl
+                kl = -logr if self.ppo_config.kl_estimator == "k1" else (logr.exp() - 1) - logr
+                kl_rewards = -self.ppo_config.kl_beta * kl
                 rewards += kl_rewards.to(rewards.dtype) * completion_mask
 
             env_rewards_tensor = torch.tensor(
@@ -520,12 +511,12 @@ class PPOTrainer(BaseTrainer):
                 device=device
             )
 
-            if ppo_config.missing_eos_penalty is not None:
-                env_rewards_tensor[~dones] -= ppo_config.missing_eos_penalty
+            if self.ppo_config.missing_eos_penalty is not None:
+                env_rewards_tensor[~dones] -= self.ppo_config.missing_eos_penalty
 
             raw_reward_mean = env_rewards_tensor.mean()
 
-            if self.train_config.ppo_config.normalize_rewards:
+            if self.ppo_config.normalize_rewards:
                 if self.reward_normalizer:
                     self.reward_normalizer.update(env_rewards_tensor)
                     env_rewards_tensor = self.reward_normalizer(env_rewards_tensor)
@@ -557,8 +548,6 @@ class PPOTrainer(BaseTrainer):
         }
 
     def _ppo_learning_phase(self, rollout_data: dict):
-        ppo_config = self.train_config.ppo_config
-
         prompt_ids: torch.Tensor = rollout_data['prompt_ids']
         completion_ids: torch.Tensor = rollout_data['completion_ids']
         old_log_probs: torch.Tensor = rollout_data['old_log_probs']
@@ -576,7 +565,7 @@ class PPOTrainer(BaseTrainer):
 
         completion_mask: torch.Tensor = (completion_ids != TrainerTools().tokenizer.pad)
 
-        if ppo_config.whiten_rewards:
+        if self.ppo_config.whiten_rewards:
             rewards = masked_whiten(rewards, completion_mask, shift_mean=False)
             rewards = torch.masked_fill(rewards, ~completion_mask, 0.0)
 
@@ -597,11 +586,11 @@ class PPOTrainer(BaseTrainer):
             "completion_len": 0.0, "value_mean": 0.0, "return_mean": 0.0, "value_error": 0.0
         }
 
-        ppo_batch_size = ppo_config.ppo_batch_size
+        ppo_batch_size = self.ppo_config.ppo_batch_size
         total_micro_batches_processed = 0
-        has_ptx = ppo_config.ptx_coef > 0.0 and self.ptx_builder is not None and len(ptx_data) > 0
+        has_ptx = self.ppo_config.ptx_coef > 0.0 and self.ptx_builder is not None and len(ptx_data) > 0
 
-        for ppo_epoch in range(ppo_config.ppo_epochs):
+        for ppo_epoch in range(self.ppo_config.ppo_epochs):
             indices = torch.randperm(batch_size, device=TrainerTools().parallel.device)
 
             for i in range(0, batch_size, ppo_batch_size):
@@ -677,7 +666,7 @@ class PPOTrainer(BaseTrainer):
                                 ptx_aux_loss = ptx_policy_output['aux_loss'].to(ptx_loss.dtype)
                     # end
                 ppo_loss_unscaled = loss + aux_loss
-                ptx_loss_unscaled = ppo_config.ptx_coef * ptx_loss + ptx_aux_loss
+                ptx_loss_unscaled = self.ppo_config.ptx_coef * ptx_loss + ptx_aux_loss
 
                 if self.is_ds:
                     need_update_step = self.train_model.is_gradient_accumulation_boundary()

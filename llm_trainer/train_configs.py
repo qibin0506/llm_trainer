@@ -1,4 +1,4 @@
-from typing import Optional, Union, Callable, List, Mapping, Any, Tuple
+from typing import Optional, Union, Callable, List, Tuple
 from dataclasses import dataclass, field
 
 import torch
@@ -259,19 +259,6 @@ class OptimConfig:
 
 
 @dataclass(kw_only=True)
-class LossConfig:
-    """
-    通用的交叉熵损失 (Cross Entropy) 控制配置。
-
-    Args:
-        critical_tokens (`Optional[List[int]]`): 需要特别加大 Loss 惩罚权重的关键 Token IDs (如 EOS 或系统结构符)。
-        critical_alpha (`float`): 对 critical_tokens 加大的权重倍数。
-    """
-    critical_tokens: Optional[List[int]] = None
-    critical_alpha: float = 1.0
-
-
-@dataclass(kw_only=True)
 class KDConfig:
     """
     基于 Logits 级别的知识蒸馏 (Knowledge Distillation) 配置。
@@ -349,7 +336,7 @@ class DPOConfig:
     直接偏好优化 (Direct Preference Optimization) 训练配置。
 
     Args:
-        ref_model_checkpoint (`Mapping[str, Any]`): 参考模型 (Reference Model) 的初始化权重路径或字典。
+        ref_model_weights_path (Optional[str]): 参考模型 (Reference Model) 的初始化权重路径。
         mask_prompt (`bool`): 是否在 Chosen 和 Rejected 数据中屏蔽掉 Prompt 部分的损失。
         gradient_accumulation_steps (`int`): 梯度累积步数。
         loss_beta (`float`): DPO 的 KL 散度约束强度参数 (通常为 0.1)。值越大，模型越紧贴参考模型。
@@ -357,7 +344,7 @@ class DPOConfig:
         loss_ipo (`bool`): 是否采用 IPO (Identity Preference Optimization) 的 Loss 形式。
         nll_loss_coef (`Optional[float]`): 加入辅助的负对数似然 (NLL) 损失权重，缓解 DPO 生成质量退化。
     """
-    ref_model_checkpoint: Mapping[str, Any]
+    ref_model_weights_path: Optional[str] = None
     mask_prompt: bool = True
     gradient_accumulation_steps: int = 1
     loss_beta: float
@@ -374,8 +361,8 @@ class PPOConfig:
     Args:
         ppo_epochs (`int`): 在当前 Rollout 数据批次上，反复更新 Policy 和 Value 模型的次数。
         ppo_batch_size (`int`): PPO 内部计算 Loss 时的微批次 (Micro-batch) 大小。
-        ref_model_checkpoint (`Mapping[str, Any]`): PPO 计算 KL 惩罚奖励时参考模型的权重。
-        value_model_checkpoint (`Optional[Mapping[str, Any]]`): Value (Critic) 模型的初始化权重。
+        ref_model_weights_path (`Optional[str]`): PPO 计算 KL 惩罚奖励时参考模型的权重路径。
+        value_model_weights_path (`Optional[str]`): Value (Critic) 模型的初始化权重路径。
         value_optim_config (`Optional[OptimConfig]`): 专门为 Value 模型配置独立的优化器及学习率。
         gradient_accumulation_steps (`int`): 梯度累积步数。
         gamma (`float`): 优势函数 (GAE) 中的折扣因子 (Discount Factor)，决定长期奖励的衰减。
@@ -393,8 +380,8 @@ class PPOConfig:
     """
     ppo_epochs: int
     ppo_batch_size: int
-    ref_model_checkpoint: Mapping[str, Any]
-    value_model_checkpoint: Optional[Mapping[str, Any]] = None
+    ref_model_weights_path: Optional[str] = None
+    value_model_weights_path: Optional[str] = None
     value_optim_config: Optional['OptimConfig'] = None
     gradient_accumulation_steps: int = 1
     gamma: float = 1.0
@@ -420,7 +407,7 @@ class GRPOConfig:
         grpo_epochs (`int`): 同一批数据的复用训练次数。
         grpo_batch_size (`int`): 模型前向/反向的微批次大小。
         group_size (`int`): 对同一个 Prompt 并行生成多少个不同的答案，用于组内 Advantage 优势归一化计算。
-        ref_model_checkpoint (`Mapping[str, Any]`): GRPO 计算 KL 惩罚奖励时参考模型的权重。
+        ref_model_weights_path (Optional[str]): GRPO 计算 KL 惩罚奖励时参考模型的权重路径。
         gradient_accumulation_steps (`int`): 梯度累积步数。
         loss_beta (`float`): KL 惩罚强度。在特定模式下(loss_importance_sampling_level=sequence) 可设为 0.0 改为隐式约束。
         loss_clip_eps (`float`): PPO 基础截断的下限 epsilon。
@@ -440,7 +427,7 @@ class GRPOConfig:
     grpo_epochs: int
     grpo_batch_size: int
     group_size: int = 12
-    ref_model_checkpoint: Mapping[str, Any]
+    ref_model_weights_path: Optional[str] = None
     gradient_accumulation_steps: int = 1
     loss_beta: float = 0.04
     loss_clip_eps: float = 3e-4
@@ -467,11 +454,10 @@ class TrainConfig:
         n_epochs (`int`): 全局数据集需要训练的 Epoch 轮数。
         batch_size (`int`): Global Batch Size (每个 GPU 每次 Data Loader 取出的数据条数)。
         model_config (`Union[ModelConfig, VLMConfig]`): LLM/VLM 底层模型的元配置定义。
-        init_state_dict (`Optional[Mapping[str, Any]]`): 初始化主干模型的权重路径/字典。
+        init_weights_path (`Optional[str]`): 初始化主干模型的权重路径。
         file_dataset (`FileDataset`): 用于加载训练数据的 DataSet 类实例。
         dataset_block_size (`int`): 序列截断长度。如果不传将取 Model 的 max_position_embedding。
         data_loader_config (`DataLoaderConfig`): PyTorch Dataloader 配置项（如 shuffle/worker）。
-        loss_config (`LossConfig`): LM Loss 及惩罚系数控制。
         optim_config (`OptimConfig`): 优化器 (Lion/Adam) 及学习率配置。
         ds_config (`DsConfig`): 掌控分布式底层的 DeepSpeed 引擎配置（含 ZeRO）。
         eval_config (`GenerateConfig`): 训练期间触发 Evaluation 测试集时的生成配置。
@@ -486,13 +472,12 @@ class TrainConfig:
     n_epochs: int
     batch_size: int
     model_config: Union[ModelConfig, VLMConfig]
-    init_state_dict: Optional[Mapping[str, Any]] = None
+    init_weights_path: Optional[str] = None
 
     file_dataset: FileDataset
     dataset_block_size: int
     data_loader_config: DataLoaderConfig = field(default_factory=DataLoaderConfig)
 
-    loss_config: LossConfig = field(default_factory=LossConfig)
     optim_config: OptimConfig = field(default_factory=OptimConfig)
     ds_config: DsConfig = field(default_factory=DsConfig)
 

@@ -167,3 +167,21 @@ def compute_lr_scheduler_steps(
     cosine_annealing_batches = math.ceil(train_batch_per_world - warmup_iters)
 
     return warmup_iters, cosine_annealing_batches
+
+
+def save_ds_weights_to_safetensors(input_path: str, output_path: str):
+    from safetensors.torch import save_file
+    from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
+
+    state_dict = get_fp32_state_dict_from_zero_checkpoint(input_path)
+    clean_dict = {k: v.clone().contiguous() for k, v in state_dict.items()}
+    save_file(clean_dict, output_path)
+
+
+def save_pt_weights_to_safetensors(input_path: str, output_path: str):
+    import torch
+    from safetensors.torch import save_file
+
+    state_dict = torch.load(input_path, map_location="cpu", weights_only=True)
+    clean_dict = {k: v.clone().contiguous() for k, v in state_dict.items()}
+    save_file(clean_dict, output_path)

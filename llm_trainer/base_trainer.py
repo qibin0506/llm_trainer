@@ -6,6 +6,7 @@ import math
 import importlib.metadata
 from packaging import version
 from itertools import islice
+from contextlib import nullcontext
 
 import torch
 import torch.distributed as dist
@@ -17,8 +18,9 @@ from llm_model import (
 
 from .parallel import DsParallel
 from .tools import TrainerTools
-from .loss import LMLoss, KDLoss
 from .partition_utils import unwrap_model_for_generation
+from .generate_utils import generate
+
 from .log import (
     Logger,
     _get_log_dir
@@ -27,7 +29,6 @@ from .train_configs import (
     TrainConfig,
     DsZero2Config,
     DsZero3Config,
-    KDConfig,
     GenerateConfig
 )
 from .scheduler import (
@@ -49,7 +50,6 @@ from .utils import (
     is_fp16_supported,
     empty_cache
 )
-from .generate_utils import generate
 
 
 class BaseTrainer:
@@ -76,9 +76,6 @@ class BaseTrainer:
                 - 返回值:
                     - List[List[int]]: 外层列表长度为 [batch_size * group_size]，内层为生成的 Completion Token ID 序列（不应包含 Prompt）。
 
-            kd_config:
-                - 知识蒸馏 (Knowledge Distillation) 配置类。
-
             gradient_accumulation_steps:
                 - 梯度累积步数，用于通过累积多批数据的梯度来模拟更大的 Global Batch Size。
         """
@@ -88,7 +85,6 @@ class BaseTrainer:
             train_config: TrainConfig,
             eval_prompts: List[str],
             generation_service: Optional[Callable[[torch.nn.Module, torch.Tensor, GenerateConfig, str, Optional[torch.Tensor], Optional[int]], List[List[int]]]] = None,
-            kd_config: Optional[KDConfig] = None,
             gradient_accumulation_steps: int = 1
     ):
         set_seed(default_seed)
@@ -103,7 +99,6 @@ class BaseTrainer:
         self.resume_batch_idx = 0
 
         self.generation_service = generation_service
-        self.kd_config = kd_config
         self.gradient_accumulation_steps = max(1, gradient_accumulation_steps)
 
         self.logger = Logger('log.txt')
@@ -148,15 +143,143 @@ class BaseTrainer:
             else:
                 self.scaler = torch.cuda.amp.GradScaler(enabled=enable_scaler)
 
+    def _new_model_context(self, parallel_kwargs):
+        if self.is_ds and parallel_kwargs and 'zero_optimization' in parallel_kwargs:
+            stage = parallel_kwargs["zero_optimization"].get("stage", 0)
+            if stage == 3:
+                import deepspeed
+                return deepspeed.zero.Init(config_dict_or_path=parallel_kwargs)
+
+        return nullcontext()
+
     def _new_model(self, train_config: TrainConfig):
         return LlmModel(train_config.model_config)
 
-    def _init_train_model_and_optim(self, initial_lr: float):
-        model = self._new_model(self.train_config)
+    def _load_external_weights(
+            self,
+            model: torch.nn.Module,
+            weights_path: str,
+            prefixes: Optional[List[str]] = None
+    ):
+        max_elements_per_chunk = int(os.environ.get('LOAD_WEIGHTS_MAX_ELEMENTS_PER_CHUNK', 100_000_000))
 
-        if self.train_config.init_state_dict:
-            model.load_state_dict(self.train_config.init_state_dict, strict=False)
-            self.train_config.init_state_dict = None
+        if TrainerTools().parallel.is_main_process:
+            self.logger.log(f"Loading external weights from {weights_path} ...", log_to_console=True)
+
+        if os.path.isfile(weights_path):
+            files = [weights_path]
+        elif os.path.isdir(weights_path):
+            st_files = [f for f in os.listdir(weights_path) if f.endswith('.safetensors')]
+            if st_files:
+                files = [os.path.join(weights_path, f) for f in st_files]
+            else:
+                pt_files = [f for f in os.listdir(weights_path) if f.endswith(('.bin', '.pt', '.pth'))]
+                files = [os.path.join(weights_path, f) for f in pt_files]
+        else:
+            raise ValueError(f"Invalid weight_path: {weights_path}")
+
+        if not files:
+            raise FileNotFoundError(f"No valid weight files (.safetensors, .bin, .pt, .pth) found in {weights_path}")
+
+        files.sort()
+
+        is_zero3 = False
+        try:
+            import deepspeed
+            if isinstance(model, deepspeed.DeepSpeedEngine):
+                if hasattr(model, "zero_optimization_stage") and model.zero_optimization_stage() == 3:
+                    is_zero3 = True
+            elif any(hasattr(p, 'ds_id') for p in model.parameters()):
+                is_zero3 = True
+        except ImportError: ...
+
+        target_model = model.module if hasattr(model, 'module') else model
+
+        for f in files:
+            state_dict = {}
+            if (not is_zero3) or TrainerTools().parallel.is_main_process:
+                if f.endswith('.safetensors'):
+                    try:
+                        from safetensors.torch import load_file
+                    except ImportError:
+                        raise ImportError("Please install safetensors: pip install safetensors")
+                    state_dict = load_file(f, device="cpu")
+                else:
+                    state_dict = torch.load(f, map_location="cpu", weights_only=True)
+                    if isinstance(state_dict, dict) and 'model_state_dict' in state_dict:
+                        state_dict = state_dict['model_state_dict']
+
+            if prefixes:
+                mapped_state_dict = {}
+                for k, v in state_dict.items():
+                    for prefix in prefixes:
+                        mapped_state_dict[prefix + k] = v
+                state_dict = mapped_state_dict
+
+            valid_keys = []
+            if TrainerTools().parallel.is_main_process:
+                valid_keys = list(state_dict.keys())
+
+            if TrainerTools().parallel.world_size > 1:
+                object_list = [valid_keys]
+                torch.distributed.broadcast_object_list(object_list, src=0)
+                valid_keys = object_list[0]
+
+            if is_zero3:
+                import deepspeed
+                chunk_params = []
+                chunk_names = []
+                current_elements = 0
+
+                def _flush_chunk():
+                    nonlocal chunk_params, chunk_names, current_elements
+                    if not chunk_params:
+                        return
+
+                    with deepspeed.zero.GatheredParameters(chunk_params, modifier_rank=0):
+                        if TrainerTools().parallel.is_main_process:
+                            for n, p in zip(chunk_names, chunk_params):
+                                if n in state_dict:
+                                    p.data.copy_(state_dict[n].to(p.device, dtype=p.dtype))
+
+                    chunk_params.clear()
+                    chunk_names.clear()
+                    current_elements = 0
+
+                with torch.no_grad():
+                    for name, param in target_model.named_parameters():
+                        if name in valid_keys:
+                            chunk_params.append(param)
+                            chunk_names.append(name)
+                            current_elements += getattr(param, 'ds_numel', param.numel())
+
+                            if current_elements >= max_elements_per_chunk:
+                                _flush_chunk()
+
+                    _flush_chunk()
+
+                    for name, buf in target_model.named_buffers():
+                        if name in valid_keys:
+                            if TrainerTools().parallel.is_main_process:
+                                buf.data.copy_(state_dict[name].to(buf.device, dtype=buf.dtype))
+                            if TrainerTools().parallel.world_size > 1:
+                                tmp_tensor = buf.data.to(TrainerTools().parallel.device).contiguous()
+                                torch.distributed.broadcast(tmp_tensor, src=0)
+                                buf.data.copy_(tmp_tensor.to(buf.device, non_blocking=True))
+            else:
+                target_model.load_state_dict(state_dict, strict=False)
+
+            del state_dict
+            import gc
+            gc.collect()
+            empty_cache()
+
+        if TrainerTools().parallel.is_main_process:
+            self.logger.log("Successfully loaded weights.", log_to_console=True)
+
+    def _init_train_model_and_optim(self, initial_lr: float):
+        with self._new_model_context(self.parallel_kwargs):
+            model = self._new_model(self.train_config)
 
         self._check_freeze_llm_model(model)
 
@@ -168,15 +291,18 @@ class BaseTrainer:
                 model.gradient_checkpointing_enable()
 
         if TrainerTools().parallel.is_main_process:
-            total_params = sum(p.numel() for p in model.parameters())
+            total_params = sum(getattr(p, 'ds_numel', p.numel()) for p in model.parameters())
             Logger.std_log(f"Total number of parameters: {total_params:,}")
 
-            trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            trainable_params = sum(getattr(p, 'ds_numel', p.numel()) for p in model.parameters() if p.requires_grad)
             Logger.std_log(f"Trainable number of parameters: {trainable_params:,}")
 
             total_size_bytes = total_params * 4
             total_size_mb = total_size_bytes / (1024 * 1024)
             Logger.std_log(f"Total size of the model: {total_size_mb:.2f} MB")
+
+        if self.train_config.init_weights_path is not None:
+            self._load_external_weights(model, self.train_config.init_weights_path)
 
         model, optim = TrainerTools().parallel.process(
             model=model,
@@ -297,22 +423,7 @@ class BaseTrainer:
 
         return NoneLRScheduler(initial_lr)
 
-    def _init_loss(self):
-        critical_tokens: Optional[List[int]] = None
-        critical_alpha: float = 1.0
-        if self.train_config.loss_config.critical_tokens:
-            critical_tokens = self.train_config.loss_config.critical_tokens
-            critical_alpha = self.train_config.loss_config.critical_alpha
-
-        criterion = LMLoss(
-            critical_tokens=critical_tokens,
-            critical_alpha=critical_alpha,
-            vocab_size=TrainerTools().tokenizer.vocab_size
-        )
-
-        kd_loss = KDLoss() if self.kd_config else None
-
-        return criterion, kd_loss
+    def _init_loss(self) -> Tuple[torch.nn.Module, Optional[torch.nn.Module]]: ...
 
     def _load_train_model_checkpoint(self):
         load_checkpoint(
@@ -524,17 +635,7 @@ class BaseTrainer:
 
     def _create_dataset(self, file_idx) -> Tuple[Dataset, str]: ...
 
-    def _calc_loss(self, inputs, attention_mask, logits, labels):
-        # calc loss
-        ce_loss = self.criterion(logits, labels)
-        if not self.kd_loss or self.kd_config.kd_coef == 0.0:
-            # 不用计算kd_loss
-            return ce_loss, ce_loss
-
-        teacher_logits = self.kd_config.teacher_logits_provider(inputs, attention_mask)
-        loss = self.kd_loss(logits, teacher_logits, labels)
-
-        return (1 - self.kd_config.kd_coef) * ce_loss + self.kd_config.kd_coef * loss, ce_loss
+    def _calc_loss(self, inputs, attention_mask, logits, labels) -> Tuple[torch.Tensor, Optional[torch.Tensor]]: ...
 
     def _backward_loss(self, total_loss_unscaled, gradient_accumulation_steps, step = True):
         if isinstance(TrainerTools().parallel, DsParallel):

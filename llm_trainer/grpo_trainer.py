@@ -121,20 +121,21 @@ class GRPOTrainer(BaseTrainer):
         if self.grpo_config.loss_beta == 0.0:
             return None
 
-        ref_model = self._new_model(self.train_config)
-
-        if self.train_config.grpo_config.ref_model_checkpoint:
-            ref_model.load_state_dict(self.train_config.grpo_config.ref_model_checkpoint)
-            self.train_config.grpo_config.ref_model_checkpoint = {}
+        parallel_kwargs = self._init_ref_model_args(self.train_config.model_config)
+        with self._new_model_context(parallel_kwargs):
+            ref_model = self._new_model(self.train_config)
 
         ref_model.eval()
         for param in ref_model.parameters():
             param.requires_grad = False
 
+        if self.grpo_config.ref_model_weights_path is not None:
+            self._load_external_weights(ref_model, self.grpo_config.ref_model_weights_path)
+
         ref_model, _ = TrainerTools().parallel.process(
             model=ref_model,
             optimizer=None,
-            kwargs=self._init_ref_model_args(self.train_config.model_config),
+            kwargs=parallel_kwargs,
             save_instance=False
         )
 
@@ -164,19 +165,7 @@ class GRPOTrainer(BaseTrainer):
         return criterion, None
 
     def _init_ptx_loss(self):
-        critical_tokens: Optional[List[int]] = None
-        critical_alpha: float = 1.0
-        if self.train_config.loss_config.critical_tokens:
-            critical_tokens = self.train_config.loss_config.critical_tokens
-            critical_alpha = self.train_config.loss_config.critical_alpha
-
-        criterion = LMLoss(
-            critical_tokens=critical_tokens,
-            critical_alpha=critical_alpha,
-            vocab_size=TrainerTools().tokenizer.vocab_size
-        )
-
-        return criterion
+        return LMLoss()
 
     def _convert_train_args(self) -> Tuple[dict, dict, dict]:
         parallel_kwargs, data_loader_kwargs, sampler_kwargs = super()._convert_train_args()
@@ -191,8 +180,6 @@ class GRPOTrainer(BaseTrainer):
     def _create_dataset(self, file_idx) -> Tuple[Dataset, str]:
         file_path = self.train_config.file_dataset[file_idx]
         return RLDataset(file_path), file_path
-
-    def _calc_loss(self, inputs, attention_mask, logits, labels): ...
 
     def _compute_completion_log_probs(
             self,
@@ -358,8 +345,7 @@ class GRPOTrainer(BaseTrainer):
         }
 
     def _grpo_learning_phase(self, rollout_data: dict):
-        grpo_config = self.train_config.grpo_config
-        grpo_batch_size = grpo_config.grpo_batch_size
+        grpo_batch_size = self.grpo_config.grpo_batch_size
         device = TrainerTools().parallel.device
 
         input_ids = rollout_data['input_ids']
@@ -387,9 +373,9 @@ class GRPOTrainer(BaseTrainer):
         }
 
         total_micro_batches_processed = 0
-        has_ptx = grpo_config.ptx_coef > 0.0 and self.ptx_builder is not None and len(ptx_data) > 0
+        has_ptx = self.grpo_config.ptx_coef > 0.0 and self.ptx_builder is not None and len(ptx_data) > 0
 
-        for grpo_epoch in range(grpo_config.grpo_epochs):
+        for grpo_epoch in range(self.grpo_config.grpo_epochs):
             indices = torch.randperm(total_samples, device=device)
 
             for i in range(0, total_samples, grpo_batch_size):
@@ -461,7 +447,7 @@ class GRPOTrainer(BaseTrainer):
                             approx_kl = torch.tensor(0.0, device=loss.device)
 
                 grpo_loss_unscaled = loss + aux_loss
-                ptx_loss_unscaled = grpo_config.ptx_coef * ptx_loss + ptx_aux_loss
+                ptx_loss_unscaled = self.grpo_config.ptx_coef * ptx_loss + ptx_aux_loss
 
                 if self.is_ds:
                     need_update_step = self.train_model.is_gradient_accumulation_boundary()

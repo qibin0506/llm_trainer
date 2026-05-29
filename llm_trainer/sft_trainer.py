@@ -12,9 +12,14 @@ from .base_trainer import BaseTrainer
 from .dataset import SFTDataset
 from .utils import get_sft_collate_fn
 from .tools import TrainerTools
+
 from .train_configs import (
     TrainConfig,
     GenerateConfig
+)
+from .loss import (
+    LMLoss,
+    KDLoss
 )
 
 
@@ -62,7 +67,6 @@ class SFTTrainer(BaseTrainer):
             train_config=train_config,
             eval_prompts=eval_prompts,
             generation_service=generation_service,
-            kd_config=self.sft_config.kd_config,
             gradient_accumulation_steps=self.sft_config.gradient_accumulation_steps
         )
 
@@ -131,3 +135,18 @@ class SFTTrainer(BaseTrainer):
                 tokens_per_image = self.train_config.model_config.tokens_per_image
 
         return SFTDataset(file_path, block_size, image_tag_file_path, tokens_per_image), file_path
+
+    def _init_loss(self) -> Tuple[torch.nn.Module, Optional[torch.nn.Module]]:
+        return LMLoss(), KDLoss() if self.sft_config.kd_config else None
+
+    def _calc_loss(self, inputs, attention_mask, logits, labels) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        # calc loss
+        ce_loss = self.criterion(logits, labels)
+        if not self.kd_loss or self.sft_config.kd_config.kd_coef == 0.0:
+            # 不用计算kd_loss
+            return ce_loss, ce_loss
+
+        teacher_logits = self.sft_config.kd_config.teacher_logits_provider(inputs, attention_mask)
+        loss = self.kd_loss(logits, teacher_logits, labels)
+
+        return (1 - self.sft_config.kd_config.kd_coef) * ce_loss + self.sft_config.kd_config.kd_coef * loss, ce_loss

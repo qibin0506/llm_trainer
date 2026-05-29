@@ -276,7 +276,6 @@ def get_train_config(
 | `file_dataset` | `FileDataset` | 提供具体读取逻辑的数据集对象实例。 |
 | `dataset_block_size` | `int` | 训练序列的截断长度。默认应与模型 `max_position_embeddings` 对齐。 |
 | `data_loader_config` | `DataLoaderConfig` | DataLoader 加载器配置 (如 num_workers)。 |
-| `loss_config` | `LossConfig` | 通用 Loss 调整配置 (如 Token 级别惩罚)。 |
 | `optim_config` | `OptimConfig` | 全局主干优化器与学习率调度器配置。 |
 | `ds_config` | `DsConfig` | DeepSpeed 引擎相关配置。 |
 | `eval_config` | `GenerateConfig` | 触发边训边测 (Eval) 时模型的生成解码配置。 |

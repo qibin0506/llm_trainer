@@ -109,7 +109,7 @@ class SFTTrainer(BaseTrainer):
         if self.pixel_values_provider and 'image_tags' in batch_data:
             valid_tags = [tag for tag in batch_data['image_tags'] if tag]
             if len(valid_tags) > 0:
-                pixel_values: torch.Tensor = self.pixel_values_provider(valid_tags)
+                pixel_values = self.pixel_values_provider(valid_tags)
                 if pixel_values is not None:
                     return pixel_values.to(TrainerTools().parallel.device, get_dtype())
 

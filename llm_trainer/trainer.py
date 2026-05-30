@@ -5,7 +5,6 @@ from torch.utils.data import Dataset
 from .base_trainer import BaseTrainer
 from .utils import pretrain_collate_fn
 from .dataset import PretrainDataset
-from .tools import TrainerTools
 
 from .train_configs import (
     TrainConfig,
@@ -54,6 +53,8 @@ class Trainer(BaseTrainer):
             generation_service=generation_service,
             gradient_accumulation_steps=self.pretrain_config.gradient_accumulation_steps
         )
+
+        self.criterion, self.kd_loss = self._init_loss()
 
     def _convert_train_args(self) -> Tuple[dict, dict, dict]:
         parallel_kwargs, data_loader_kwargs, sampler_kwargs = super()._convert_train_args()

@@ -132,12 +132,10 @@ class PPOTrainer(BaseTrainer):
             eval_prompts: List[str]
     ):
         self.ppo_config = train_config.ppo_config
-
+        self.reward_normalizer = None
         if self.ppo_config.normalize_rewards:
             if self.ppo_config.normalize_method == 'RunningMeanStd':
                 self.reward_normalizer = RunningMeanStd(shape=()).to(TrainerTools().parallel.device)
-            else:
-                self.reward_normalizer = None
 
             if self.ppo_config.whiten_rewards:
                 self.ppo_config.whiten_rewards = False
@@ -281,7 +279,7 @@ class PPOTrainer(BaseTrainer):
 
         def create_scheduler(config, group_indices, need_log):
             real_initial_lr = initial_lr if config is None else config.initial_lr
-            if config.enable_lr_scheduler:
+            if config is not None and config.enable_lr_scheduler:
                 warmup_iters = config.warmup_iters
                 min_lr = config.min_lr
                 max_lr = config.max_lr

@@ -543,7 +543,7 @@ def truncate_sequences_at_eos(
 
     # 利用广播机制创建一个掩码，标记所有应保留的token
     # 对于每个序列，当 token_index < first_eos_index 时为True
-    keep_mask = indices_mask < first_eos_indices.unsqueeze(1)
+    keep_mask = indices_mask <= first_eos_indices.unsqueeze(1)
 
     # 使用 torch.where 进行安全替换
     # 如果 keep_mask 为 True，则保留原始序列的token，否则替换为 pad_token_id
@@ -565,9 +565,9 @@ def disable_dropout_in_model(model: torch.nn.Module) -> None:
 def _masked_mean(values: torch.Tensor, mask: torch.Tensor, axis: Optional[int] = None) -> torch.Tensor:
     """Compute mean of tensor with a masked values."""
     if axis is not None:
-        return (values * mask).sum(axis=axis) / mask.sum(axis=axis).clamp(min=1e-8)
+        return (values * mask).sum(axis=axis) / mask.sum(axis=axis).clamp(min=1.0)
     else:
-        return (values * mask).sum() / mask.sum().clamp(min=1e-8)
+        return (values * mask).sum() / mask.sum().clamp(min=1.0)
 
 
 def _masked_var(values: torch.Tensor, mask: torch.Tensor, unbiased: bool = True) -> torch.Tensor:
@@ -582,7 +582,7 @@ def _masked_var(values: torch.Tensor, mask: torch.Tensor, unbiased: bool = True)
 
         # note that if mask_sum == 1, then there is a division by zero issue
         # to avoid it you just need to use a larger minibatch_size
-        bessel_correction = mask_sum / (mask_sum - 1)
+        bessel_correction = mask_sum / (mask_sum - 1).clamp(min=1.0)
         variance = variance * bessel_correction
     return variance
 

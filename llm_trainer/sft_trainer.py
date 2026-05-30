@@ -10,7 +10,6 @@ from llm_model import (
 
 from .base_trainer import BaseTrainer
 from .dataset import SFTDataset
-from .utils import get_sft_collate_fn
 from .tools import TrainerTools
 
 from .train_configs import (
@@ -20,6 +19,10 @@ from .train_configs import (
 from .loss import (
     LMLoss,
     KDLoss
+)
+from .utils import (
+    get_sft_collate_fn,
+    get_dtype
 )
 
 
@@ -70,6 +73,8 @@ class SFTTrainer(BaseTrainer):
             gradient_accumulation_steps=self.sft_config.gradient_accumulation_steps
         )
 
+        self.criterion, self.kd_loss = self._init_loss()
+
         if isinstance(train_config.model_config, VLMConfig):
             self.pixel_values_provider = self.sft_config.pixel_values_provider
         else:
@@ -104,9 +109,9 @@ class SFTTrainer(BaseTrainer):
         if self.pixel_values_provider and 'image_tags' in batch_data:
             valid_tags = [tag for tag in batch_data['image_tags'] if tag]
             if len(valid_tags) > 0:
-                pixel_values = self.pixel_values_provider(valid_tags)
+                pixel_values: torch.Tensor = self.pixel_values_provider(valid_tags)
                 if pixel_values is not None:
-                    return pixel_values.to(TrainerTools().parallel.device, TrainerTools().compute_dtype)
+                    return pixel_values.to(TrainerTools().parallel.device, get_dtype())
 
         return None
 

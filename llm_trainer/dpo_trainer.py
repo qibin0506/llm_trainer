@@ -254,7 +254,7 @@ class DPOTrainer(BaseTrainer):
                             else:
                                 aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
 
-                            if nll_loss_coef and nll_loss:
+                            if nll_loss_coef is not None and nll_loss_coef != 0.0:
                                 nll_loss = nll_loss_coef * nll_loss
                             else:
                                 nll_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)

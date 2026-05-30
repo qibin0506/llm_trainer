@@ -114,8 +114,6 @@ class BaseTrainer:
         self.train_model, self.optimizer = self._init_train_model_and_optim(initial_lr)
         self.lr_scheduler = self._init_lr_scheduler(initial_lr, self.optimizer)
 
-        self.criterion, self.kd_loss = self._init_loss()
-
         self._load_train_model_checkpoint()
         self._apply_restore_ckpt()
 
@@ -422,8 +420,6 @@ class BaseTrainer:
             )
 
         return NoneLRScheduler(initial_lr)
-
-    def _init_loss(self) -> Tuple[torch.nn.Module, Optional[torch.nn.Module]]: ...
 
     def _load_train_model_checkpoint(self):
         load_checkpoint(

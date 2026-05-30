@@ -19,11 +19,11 @@ def _repetition_penalty_warper(
         return logits
 
     logits = logits.clone()
-    valid_exclude =[]
+    valid_exclude = []
 
     # 暂存需要排除惩罚的特殊 token 的原始 logits
     if exclude_tokens is not None and len(exclude_tokens) > 0:
-        valid_exclude =[t for t in exclude_tokens if 0 <= t < logits.shape[-1]]
+        valid_exclude = [t for t in exclude_tokens if 0 <= t < logits.shape[-1]]
         if valid_exclude:
             saved_logits = logits[:, valid_exclude].clone()
         else:
@@ -72,14 +72,11 @@ def _temperature_warper(
 def _top_k_warper(
         logits: torch.Tensor,
         top_k: int,
-        device: Union[str,
-        torch.device, int] = None
 ) -> torch.Tensor:
     """
     top k采样
     :param logits:
     :param top_k:
-    :param device:
     :return:
     """
     # [batch, top_k]
@@ -259,7 +256,7 @@ def _generate(
                 logits = _temperature_warper(logits, temperature)
 
             if top_k and top_k != 0:
-                logits = _top_k_warper(logits, top_k, device)
+                logits = _top_k_warper(logits, top_k,)
 
             if top_p and 0 < top_p <= 1:
                 logits = _top_p_warper(logits, top_p)
@@ -549,7 +546,7 @@ def batch_generate(
                 logits = _temperature_warper(logits, temperature)
 
             if top_k and top_k != 0:
-                logits = _top_k_warper(logits, top_k, device)
+                logits = _top_k_warper(logits, top_k)
 
             if top_p and 0 < top_p <= 1:
                 logits = _top_p_warper(logits, top_p)

@@ -201,7 +201,7 @@ class DPODataset(Dataset):
             'rejected':
                 [{'role': 'system', 'content': 'system_content'},
                 {'role': 'user', 'content': 'user_content'},
-                'role': 'assistant', 'think': 'think_content', 'content': 'assistant_content'}],
+                {'role': 'assistant', 'think': 'think_content', 'content': 'assistant_content'}],
             }
     pkl: [
             {'chosen': xxx, 'rejected': xxx},

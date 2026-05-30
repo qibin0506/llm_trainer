@@ -37,13 +37,16 @@ class LMLoss(nn.Module):
 class KDLoss(nn.Module):
     """
     Language Model Knowledge Distillation Loss
-    https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/models/loss.py#L266
     """
     def __init__(self, ignore_index: int = -100):
         super().__init__()
         self.ignore_index = ignore_index
 
     def forward(self, logits: torch.Tensor, teacher_logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        logits = logits[..., :-1, :].contiguous()
+        teacher_logits = teacher_logits[..., :-1, :].contiguous()
+        labels = labels[..., 1:].contiguous()
+
         teacher_probs = F.softmax(teacher_logits, dim=-1, dtype=torch.float32)
         inf_mask = torch.isinf(logits)
 
@@ -52,7 +55,7 @@ class KDLoss(nn.Module):
 
         x = torch.sum(prod_probs, dim=-1).view(-1)
         mask = (labels != self.ignore_index).float().view(-1)
-        distil_loss = -torch.sum(x * mask) / mask.sum().clamp(min=1e-8)
+        distil_loss = -torch.sum(x * mask) / torch.sum(mask).clamp(min=1.0)
 
         return distil_loss
 

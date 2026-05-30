@@ -103,7 +103,7 @@ class WarmupCosineAnnealingLRScheduler(LRScheduler):
             for param_group in target_groups:
                 param_group['lr'] = lr
         else:
-            if not self._cosine_annealing_base_lr:
+            if self._cosine_annealing_base_lr is None:
                 self._cosine_annealing_base_lr = self.cur_lr
 
             """每步更新学习率"""

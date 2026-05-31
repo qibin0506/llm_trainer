@@ -162,7 +162,7 @@ class BaseTrainer:
         max_elements_per_chunk = int(os.environ.get('LOAD_WEIGHTS_MAX_ELEMENTS_PER_CHUNK', 100_000_000))
 
         if TrainerTools().parallel.is_main_process:
-            self.logger.log(f"Loading external weights from {weights_path} ...", log_to_console=True)
+            Logger.std_log(f"Loading external weights from {weights_path} ...")
 
         if os.path.isfile(weights_path):
             files = [weights_path]
@@ -273,7 +273,7 @@ class BaseTrainer:
             empty_cache()
 
         if TrainerTools().parallel.is_main_process:
-            self.logger.log("Successfully loaded weights.", log_to_console=True)
+            Logger.std_log("Successfully loaded weights.")
 
     def _init_train_model_and_optim(self, initial_lr: float):
         with self._new_model_context(self.parallel_kwargs):

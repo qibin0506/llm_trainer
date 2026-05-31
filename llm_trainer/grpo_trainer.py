@@ -96,11 +96,7 @@ class GRPOTrainer(BaseTrainer):
         self.reward_func = reward_func
         self.ptx_builder = ptx_builder
         self.ref_model = self._init_ref_model()
-        self.criterion = self._init_loss()
-
-        if self.grpo_config.ptx_coef > 0.0:
-            assert self.ptx_builder is not None
-            self.ptx_criterion = self._init_ptx_loss()
+        self.criterion, self.ptx_criterion = self._init_loss()
 
         if self.grpo_config.loss_type == "luspo" and self.grpo_config.loss_importance_sampling_level != "sequence":
             if TrainerTools().parallel.is_main_process:
@@ -148,7 +144,7 @@ class GRPOTrainer(BaseTrainer):
         return model
 
     def _init_loss(self):
-        return GRPOLoss(
+        grpo_criterion = GRPOLoss(
             beta=self.grpo_config.loss_beta,
             clip_eps_low=self.grpo_config.loss_clip_eps,
             clip_eps_high=self.grpo_config.loss_clip_eps_high,
@@ -163,8 +159,12 @@ class GRPOTrainer(BaseTrainer):
             vespo_lambda_neg=self.grpo_config.vespo_lambda_neg,
         )
 
-    def _init_ptx_loss(self):
-        return LMLoss()
+        ptx_criterion = None
+        if self.grpo_config.ptx_coef > 0.0:
+            assert self.ptx_builder is not None
+            ptx_criterion = LMLoss()
+
+        return grpo_criterion, ptx_criterion
 
     def _convert_train_args(self) -> Tuple[dict, dict, dict]:
         parallel_kwargs, data_loader_kwargs, sampler_kwargs = super()._convert_train_args()
@@ -372,7 +372,7 @@ class GRPOTrainer(BaseTrainer):
         }
 
         total_micro_batches_processed = 0
-        has_ptx = self.grpo_config.ptx_coef > 0.0 and self.ptx_builder is not None and len(ptx_data) > 0
+        has_ptx = self.ptx_criterion is not None and len(ptx_data) > 0
 
         for grpo_epoch in range(self.grpo_config.grpo_epochs):
             indices = torch.randperm(total_samples, device=device)

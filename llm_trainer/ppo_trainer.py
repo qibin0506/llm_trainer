@@ -156,11 +156,7 @@ class PPOTrainer(BaseTrainer):
         self.reward_func = reward_func
         self.ptx_builder = ptx_builder
         self.ref_model = self._init_ref_model()
-        self.criterion = self._init_loss()
-
-        if self.ppo_config.ptx_coef > 0.0:
-            assert self.ptx_builder is not None
-            self.ptx_criterion = self._init_ptx_loss()
+        self.criterion, self.ptx_criterion = self._init_loss()
 
     def _init_train_model_and_optim(self, initial_lr: float):
         with self._new_model_context(self.parallel_kwargs):
@@ -333,13 +329,17 @@ class PPOTrainer(BaseTrainer):
         return model
 
     def _init_loss(self):
-        return PPOLoss(
+        ppo_criterion = PPOLoss(
             clip_eps=self.ppo_config.clip_eps,
             vf_coef=self.ppo_config.vf_coef
         )
 
-    def _init_ptx_loss(self):
-        return LMLoss()
+        ptx_criterion = None
+        if self.ppo_config.ptx_coef > 0.0:
+            assert self.ptx_builder is not None
+            ptx_criterion = LMLoss()
+
+        return ppo_criterion, ptx_criterion
 
     def _load_train_model_checkpoint(self):
         load_checkpoint(
@@ -586,7 +586,7 @@ class PPOTrainer(BaseTrainer):
 
         ppo_batch_size = self.ppo_config.ppo_batch_size
         total_micro_batches_processed = 0
-        has_ptx = self.ppo_config.ptx_coef > 0.0 and self.ptx_builder is not None and len(ptx_data) > 0
+        has_ptx = self.ptx_criterion is not None and len(ptx_data) > 0
 
         for ppo_epoch in range(self.ppo_config.ppo_epochs):
             indices = torch.randperm(batch_size, device=TrainerTools().parallel.device)

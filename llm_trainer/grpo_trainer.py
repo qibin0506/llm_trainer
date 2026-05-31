@@ -96,6 +96,7 @@ class GRPOTrainer(BaseTrainer):
         self.reward_func = reward_func
         self.ptx_builder = ptx_builder
         self.ref_model = self._init_ref_model()
+        self.criterion = self._init_loss()
 
         if self.grpo_config.ptx_coef > 0.0:
             assert self.ptx_builder is not None
@@ -147,7 +148,7 @@ class GRPOTrainer(BaseTrainer):
         return model
 
     def _init_loss(self):
-        criterion = GRPOLoss(
+        return GRPOLoss(
             beta=self.grpo_config.loss_beta,
             clip_eps_low=self.grpo_config.loss_clip_eps,
             clip_eps_high=self.grpo_config.loss_clip_eps_high,
@@ -161,8 +162,6 @@ class GRPOTrainer(BaseTrainer):
             vespo_k_neg=self.grpo_config.vespo_k_neg,
             vespo_lambda_neg=self.grpo_config.vespo_lambda_neg,
         )
-
-        return criterion, None
 
     def _init_ptx_loss(self):
         return LMLoss()

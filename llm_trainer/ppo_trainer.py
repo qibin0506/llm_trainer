@@ -156,6 +156,7 @@ class PPOTrainer(BaseTrainer):
         self.reward_func = reward_func
         self.ptx_builder = ptx_builder
         self.ref_model = self._init_ref_model()
+        self.criterion = self._init_loss()
 
         if self.ppo_config.ptx_coef > 0.0:
             assert self.ptx_builder is not None
@@ -332,11 +333,10 @@ class PPOTrainer(BaseTrainer):
         return model
 
     def _init_loss(self):
-        criterion = PPOLoss(
+        return PPOLoss(
             clip_eps=self.ppo_config.clip_eps,
             vf_coef=self.ppo_config.vf_coef
         )
-        return criterion, None
 
     def _init_ptx_loss(self):
         return LMLoss()

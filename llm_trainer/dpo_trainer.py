@@ -66,6 +66,7 @@ class DPOTrainer(BaseTrainer):
             gradient_accumulation_steps=self.dpo_config.gradient_accumulation_steps
         )
         self.ref_model = self._init_ref_model()
+        self.criterion = self._init_loss()
 
     def _init_ref_model(self):
         parallel_kwargs = self._init_ref_model_args(self.train_config.model_config)
@@ -94,13 +95,11 @@ class DPOTrainer(BaseTrainer):
         return model
 
     def _init_loss(self):
-        criterion = DPOLoss(
+        return DPOLoss(
             beta=self.dpo_config.loss_beta,
             label_smoothing=self.dpo_config.loss_label_smoothing,
             ipo=self.dpo_config.loss_ipo
         )
-
-        return criterion, None
 
     def _convert_train_args(self) -> Tuple[dict, dict, dict]:
         dpo_collate_fn = get_dpo_collate_fn(self.dpo_config.mask_prompt)

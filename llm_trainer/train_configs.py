@@ -233,7 +233,7 @@ class OptimConfig:
     优化器及学习率调度器 (LR Scheduler) 核心配置。
 
     Args:
-        optim_type (`str`): 优化器类型，支持 'adam' (AdamW) 或 'lion'。
+        optim_type (`str`): 优化器类型，支持 'adam', 'lion'。
         auto_optimize_optimizer (`bool`): 如果允许，是否由 DeepSpeed 自行替换并接管 CPU/Fused 优化器实现。
         enable_lr_scheduler (`bool`): 是否启用学习率调度器。
         initial_lr (`float`): 初始学习率 (或经过 warmup 后达到的最大学习率)。
@@ -256,7 +256,7 @@ class OptimConfig:
     min_lr: Optional[float] = None
     cosine_annealing_period: Optional[int] = None
     cosine_annealing_period_mul: int = 0
-
+    
 
 @dataclass(kw_only=True)
 class KDConfig:
@@ -382,7 +382,7 @@ class PPOConfig:
     ppo_batch_size: int
     ref_model_weights_path: Optional[str] = None
     value_model_weights_path: Optional[str] = None
-    value_optim_config: Optional['OptimConfig'] = None
+    value_optim_config: Optional[OptimConfig] = None
     gradient_accumulation_steps: int = 1
     gamma: float = 1.0
     lam: float = 0.95

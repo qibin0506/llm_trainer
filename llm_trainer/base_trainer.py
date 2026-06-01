@@ -373,7 +373,6 @@ class BaseTrainer:
                             optimizer = deepspeed.ops.lion.DeepSpeedCPULion
                         else:
                             optimizer = deepspeed.ops.adam.DeepSpeedCPUAdam
-                            use_lion_optim = False
                             if TrainerTools().parallel.is_main_process:
                                 Logger.std_log(
                                     'When set offload_optimizer, lion optim is unsupported, so set optim to adam!!!!!')

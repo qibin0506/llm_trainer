@@ -449,10 +449,25 @@ def batch_generate(
     # 初始化 position_ids，处理 left padding
     position_ids = calc_position_ids(full_attention_mask)
 
-    kv_cache: Optional[KVCache] = None
     batch_size = tokens.shape[0]
     prompt_len = orig_tokens.shape[1]
 
+    group_size = 1
+    if use_kv_cache and pixel_values is None and batch_size > 1:
+        for i in range(1, batch_size):
+            if torch.equal(orig_tokens[0], orig_tokens[i]):
+                group_size += 1
+            else:
+                break
+
+        if batch_size % group_size != 0:
+            group_size = 1
+        elif group_size > 1:
+            unique_t = orig_tokens[::group_size]
+            if not torch.equal(unique_t.repeat_interleave(group_size, dim=0), orig_tokens):
+                group_size = 1
+
+    kv_cache: Optional[KVCache] = None
     if use_kv_cache:
         # Prompt Length + Max Generation Length
         total_capacity = prompt_len + max_new_tokens
@@ -506,15 +521,31 @@ def batch_generate(
                     current_position_ids = current_attention_mask.sum(dim=-1, keepdim=True).long() - 1
 
             with autocast(TrainerTools().parallel.device_type):
-                result = model(
-                    current_tokens,
-                    attention_mask=current_attention_mask,
-                    position_ids=current_position_ids,
-                    past_key_values=kv_cache,
-                    use_cache=use_kv_cache,
-                    pixel_values=pixel_values
-                )
-                logits = result['logits']
+                if i == 0 and group_size > 1:
+                    unique_tokens = current_tokens[::group_size]
+                    unique_attention_mask = current_attention_mask[::group_size]
+                    unique_position_ids = current_position_ids[::group_size]
+
+                    result = model(
+                        unique_tokens,
+                        attention_mask=unique_attention_mask,
+                        position_ids=unique_position_ids,
+                        past_key_values=kv_cache,
+                        use_cache=use_kv_cache,
+                        pixel_values=None
+                    )
+
+                    logits = result['logits'].repeat_interleave(group_size, dim=0)
+                else:
+                    result = model(
+                        current_tokens,
+                        attention_mask=current_attention_mask,
+                        position_ids=current_position_ids,
+                        past_key_values=kv_cache,
+                        use_cache=use_kv_cache,
+                        pixel_values=pixel_values
+                    )
+                    logits = result['logits']
 
             logits = logits[:, -1, :]
 

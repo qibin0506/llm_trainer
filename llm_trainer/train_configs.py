@@ -461,7 +461,8 @@ class TrainConfig:
         optim_config (`OptimConfig`): 优化器 (Lion/Adam) 及学习率配置。
         ds_config (`DsConfig`): 掌控分布式底层的 DeepSpeed 引擎配置（含 ZeRO）。
         eval_config (`GenerateConfig`): 训练期间触发 Evaluation 测试集时的生成配置。
-        save_and_eval_interval (`int`): 指定多少个 global batch step 后触发一次 checkpoint 保存和评估。
+        save_interval (`int`): 指定多少个 global batch step 后触发一次 checkpoint 保存。
+        eval_interval (`int`): 指定多少个 global batch step 后触发一次 checkpoint 保存。
         gradient_checkpointing (`bool`): 是否开启梯度检查点，如果开启且使用ds模式，会自动配置DsActivationCheckpointingConfig
         pretrain_config (`Optional[PretrainConfig]`): 使用基础 Trainer 时的配置组。
         sft_config (`Optional[SFTConfig]`): 使用 SFTTrainer 时的监督微调配置组。
@@ -482,7 +483,8 @@ class TrainConfig:
     ds_config: DsConfig = field(default_factory=DsConfig)
 
     eval_config: GenerateConfig = field(default_factory=GenerateConfig)
-    save_and_eval_interval: int = 100
+    save_interval: int = 100
+    eval_interval: int = 100
     gradient_checkpointing: bool = False
 
     pretrain_config: Optional[PretrainConfig] = None

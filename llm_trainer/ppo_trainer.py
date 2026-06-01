@@ -715,7 +715,8 @@ class PPOTrainer(BaseTrainer):
                     sampler_kwargs=self.sampler_kwargs
                 )
 
-                last_ckpt_batch = 0
+                last_save_batch = 0
+                last_eval_batch = 0
                 batch_count_per_file = len(train_data_loader)
 
                 TrainerTools().parallel.on_epoch_start(epoch)
@@ -730,7 +731,8 @@ class PPOTrainer(BaseTrainer):
                 data_iterator = iter(train_data_loader)
                 if skip_batches > 0:
                     data_iterator = islice(data_iterator, skip_batches, None)
-                    last_ckpt_batch = skip_batches
+                    last_save_batch = skip_batches
+                    last_eval_batch = skip_batches
 
                 for batch, batch_data in enumerate(data_iterator):
                     batch = skip_batches + batch
@@ -788,7 +790,7 @@ class PPOTrainer(BaseTrainer):
                             }
                         )
 
-                        if (batch + 1 - last_ckpt_batch) >= self.train_config.save_and_eval_interval:
+                        if (batch + 1 - last_save_batch) >= self.train_config.save_interval:
                             save_checkpoint(
                                 model=self.train_model,
                                 optimizer=self.optimizer,
@@ -800,9 +802,11 @@ class PPOTrainer(BaseTrainer):
                                 batch_idx=batch + 1,
                                 lr_scheduler=self.lr_scheduler
                             )
+                            last_save_batch = batch + 1
 
-                            last_ckpt_batch = batch + 1
+                        if (batch + 1 - last_eval_batch) >= self.train_config.eval_interval:
                             self._on_batch_end(tag=f'epoch:{epoch}/batch:{batch}')
+                            last_eval_batch = batch + 1
 
                         del rollout_data
                     except Exception as e:

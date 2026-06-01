@@ -247,8 +247,8 @@ def get_train_config(
         optim_config=optim_config,
         ds_config=ds_config,
         eval_config=generate_config,
-        save_and_eval_interval=50 if train_stage in ['ppo', 'grpo'] else 200,
-        
+        save_interval=50 if train_stage in ['ppo', 'grpo'] else 200,
+        eval_interval=50 if train_stage in ['ppo', 'grpo'] else 200,
         # 挂载全部阶段配置 (框架会根据 Trainer 类型自动提取，None 会被安全忽略)
         pretrain_config=pretrain_config,
         sft_config=sft_config,
@@ -279,7 +279,8 @@ def get_train_config(
 | `optim_config` | `OptimConfig` | 全局主干优化器与学习率调度器配置。 |
 | `ds_config` | `DsConfig` | DeepSpeed 引擎相关配置。 |
 | `eval_config` | `GenerateConfig` | 触发边训边测 (Eval) 时模型的生成解码配置。 |
-| `save_and_eval_interval` | `int` | 间隔多少个 global steps 自动保存 Checkpoint 并执行 Eval 测试。 |
+| `save_interval` | `int` | 间隔多少个 global steps 自动保存 Checkpoint。 |
+| `eval_interval` | `int` | 间隔多少个 global steps 并执行 Eval 测试。 |
 | `pretrain_config` | `PretrainConfig` | **基础预训练阶段**专属的配置项包裹。 |
 | `sft_config` | `SFTConfig` | **SFT (监督微调)** 专属的配置项包裹。 |
 | `dpo_config` | `DPOConfig` | **DPO (直接偏好优化)** 专属的配置项包裹。 |

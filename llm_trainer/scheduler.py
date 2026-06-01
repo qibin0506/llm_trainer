@@ -95,15 +95,13 @@ class WarmupCosineAnnealingLRScheduler(LRScheduler):
         if self._cosine_annealing_period_mul == 0 and self._steps >= self._cosine_annealing_period + self._warmup_iters:
             lr = self._min_lr
             for param_group in target_groups:
-                multiplier = param_group.get('muon_multiplier', 1.0)
-                param_group['lr'] = lr * multiplier
+                param_group['lr'] = lr
         elif self._steps <= self._warmup_iters:
             # Warmup: adjust learning rate linearly
             # (max_lr - initial_lr) / warmup_iters
             lr = self._initial_lr + self._steps * self._lr_increment
             for param_group in target_groups:
-                multiplier = param_group.get('muon_multiplier', 1.0)
-                param_group['lr'] = lr * multiplier
+                param_group['lr'] = lr
         else:
             if self._cosine_annealing_base_lr is None:
                 self._cosine_annealing_base_lr = self.cur_lr

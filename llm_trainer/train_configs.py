@@ -256,7 +256,7 @@ class OptimConfig:
     min_lr: Optional[float] = None
     cosine_annealing_period: Optional[int] = None
     cosine_annealing_period_mul: int = 0
-    
+
 
 @dataclass(kw_only=True)
 class KDConfig:

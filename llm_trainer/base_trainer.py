@@ -313,16 +313,17 @@ class BaseTrainer:
     def _check_freeze_llm_model(self, model): ...
 
     def _config_optim(self, model, initial_lr):
-        optimizer_cls, use_lion_optim = self._get_optim_cls()
+        optim_type = self.train_config.optim_config.optim_type
+        optimizer_cls = self._get_optim_cls()
 
         betas = self.train_config.optim_config.betas
         weight_decay = self.train_config.optim_config.weight_decay
 
         if betas is None:
-            betas = (0.95, 0.98) if use_lion_optim else (0.9, 0.999)
+            betas = (0.95, 0.98) if optim_type == 'lion' else (0.9, 0.999)
 
         if weight_decay is None:
-            weight_decay = 0.015 if use_lion_optim else 0.01
+            weight_decay = 0.015 if optim_type == 'lion' else 0.01
 
         no_decay_name_list = ["bias", "norm.weight"]
         decay_params = []
@@ -357,7 +358,6 @@ class BaseTrainer:
 
     def _get_optim_cls(self):
         optimizer = None
-        use_lion_optim = self.train_config.optim_config.optim_type == 'lion'
 
         if (self.train_config.optim_config.auto_optimize_optimizer
                 and isinstance(TrainerTools().parallel, DsParallel)
@@ -398,7 +398,7 @@ class BaseTrainer:
             else:
                 optimizer = torch.optim.AdamW
 
-        return optimizer, use_lion_optim
+        return optimizer
 
     def _init_lr_scheduler(self, initial_lr: float, optimizer) -> LRScheduler:
         if self.train_config.optim_config.enable_lr_scheduler:

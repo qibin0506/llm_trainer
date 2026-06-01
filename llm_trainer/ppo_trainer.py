@@ -209,7 +209,8 @@ class PPOTrainer(BaseTrainer):
         return model, optim
 
     def _config_optim(self, model, initial_lr):
-        optimizer_cls, use_lion_optim = self._get_optim_cls()
+        optim_type = self.train_config.optim_config.optim_type
+        optimizer_cls = self._get_optim_cls()
 
         policy_config = self.train_config.optim_config
         value_config = self.ppo_config.value_optim_config if self.ppo_config.value_optim_config else policy_config
@@ -221,10 +222,10 @@ class PPOTrainer(BaseTrainer):
             current_weight_decay = config.weight_decay
 
             if current_betas is None:
-                current_betas = (0.95, 0.98) if use_lion_optim else (0.9, 0.999)
+                current_betas = (0.95, 0.98) if optim_type == 'lion' else (0.9, 0.999)
 
             if current_weight_decay is None:
-                current_weight_decay = 0.015 if use_lion_optim else 0.01
+                current_weight_decay = 0.015 if optim_type == 'lion' else 0.01
 
             decay_params = []
             no_decay_params = []
@@ -258,8 +259,8 @@ class PPOTrainer(BaseTrainer):
         optimizer_grouped_parameters.extend(get_param_groups(model.policy_model, policy_config, "policy"))
         optimizer_grouped_parameters.extend(get_param_groups(model.value_model, value_config, "value"))
 
-        default_betas = policy_config.betas if policy_config.betas else ((0.95, 0.98) if use_lion_optim else (0.9, 0.999))
-        default_weight_decay = policy_config.weight_decay if policy_config.weight_decay else (0.015 if use_lion_optim else 0.01)
+        default_betas = policy_config.betas if policy_config.betas else ((0.95, 0.98) if optim_type == 'lion' else (0.9, 0.999))
+        default_weight_decay = policy_config.weight_decay if policy_config.weight_decay else (0.015 if optim_type == 'lion' else 0.01)
 
         return optimizer_cls(
             optimizer_grouped_parameters,

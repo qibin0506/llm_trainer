@@ -703,6 +703,13 @@ class PPOTrainer(BaseTrainer):
         return ppo_stats
 
     def train(self):
+        global_steps_since_last_save = 0
+        global_steps_since_last_eval = 0
+
+        micro_batches_per_rollout = self.train_config.batch_size / self.ppo_config.ppo_batch_size
+        updates_per_rollout = (self.ppo_config.ppo_epochs * micro_batches_per_rollout) / self.gradient_accumulation_steps
+        global_steps_per_rollout = max(1, int(updates_per_rollout))
+
         for epoch in range(self.resume_epoch, self.train_config.n_epochs):
             file_count = len(self.train_config.file_dataset)
             start_file_idx = self.resume_file_idx if epoch == self.resume_epoch else 0
@@ -715,10 +722,7 @@ class PPOTrainer(BaseTrainer):
                     sampler_kwargs=self.sampler_kwargs
                 )
 
-                last_save_batch = 0
-                last_eval_batch = 0
                 batch_count_per_file = len(train_data_loader)
-
                 TrainerTools().parallel.on_epoch_start(epoch)
                 self._on_file_start(epoch, file_path)
 
@@ -731,16 +735,15 @@ class PPOTrainer(BaseTrainer):
                 data_iterator = iter(train_data_loader)
                 if skip_batches > 0:
                     data_iterator = islice(data_iterator, skip_batches, None)
-                    last_save_batch = skip_batches
-                    last_eval_batch = skip_batches
 
                 for batch, batch_data in enumerate(data_iterator):
                     batch = skip_batches + batch
-
                     rollout_data = self._generate_rollout_data(batch_data)
 
                     try:
                         ppo_stats = self._ppo_learning_phase(rollout_data)
+                        global_steps_since_last_save += global_steps_per_rollout
+                        global_steps_since_last_eval += global_steps_per_rollout
 
                         stats_tensor = torch.tensor([
                             ppo_stats['loss'],
@@ -790,7 +793,7 @@ class PPOTrainer(BaseTrainer):
                             }
                         )
 
-                        if (batch + 1 - last_save_batch) >= self.train_config.save_interval:
+                        if 0 < self.train_config.save_interval <= global_steps_since_last_save:
                             save_checkpoint(
                                 model=self.train_model,
                                 optimizer=self.optimizer,
@@ -802,11 +805,11 @@ class PPOTrainer(BaseTrainer):
                                 batch_idx=batch + 1,
                                 lr_scheduler=self.lr_scheduler
                             )
-                            last_save_batch = batch + 1
+                            global_steps_since_last_save %= self.train_config.save_interval
 
-                        if (batch + 1 - last_eval_batch) >= self.train_config.eval_interval:
+                        if 0 < self.train_config.eval_interval <= global_steps_since_last_eval:
                             self._on_batch_end(tag=f'epoch:{epoch}/batch:{batch}')
-                            last_eval_batch = batch + 1
+                            global_steps_since_last_eval %= self.train_config.eval_interval
 
                         del rollout_data
                     except Exception as e:

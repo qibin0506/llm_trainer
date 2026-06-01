@@ -160,7 +160,8 @@ class DPOTrainer(BaseTrainer):
         rejected_reward_accumulation = 0.0
         reward_margin_accumulation = 0.0
         reward_accuracy_accumulation = 0.0
-
+        global_steps_since_last_save = 0
+        global_steps_since_last_eval = 0
         batches_accumulated = 0
 
         nll_loss_coef = self.dpo_config.nll_loss_coef
@@ -179,10 +180,7 @@ class DPOTrainer(BaseTrainer):
                     sampler_kwargs=self.sampler_kwargs
                 )
 
-                last_save_batch = 0
-                last_eval_batch = 0
                 batch_count_per_file = len(train_data_loader)
-
                 TrainerTools().parallel.on_epoch_start(epoch)
                 self._on_file_start(epoch, file_path)
 
@@ -195,8 +193,6 @@ class DPOTrainer(BaseTrainer):
                 data_iterator = iter(train_data_loader)
                 if skip_batches > 0:
                     data_iterator = islice(data_iterator, skip_batches, None)
-                    last_save_batch = skip_batches
-                    last_eval_batch = skip_batches
 
                 for batch, batch_data in enumerate(data_iterator):
                     batch = skip_batches + batch
@@ -291,6 +287,8 @@ class DPOTrainer(BaseTrainer):
 
                         if need_update_step:
                             self._update_step()
+                            global_steps_since_last_save += 1
+                            global_steps_since_last_eval += 1
 
                             avg_total_loss, avg_dpo_loss, \
                             avg_aux_loss, avg_nll_loss, avg_ce_loss, \
@@ -345,7 +343,7 @@ class DPOTrainer(BaseTrainer):
                             reward_accuracy_accumulation = 0.0
                             batches_accumulated = 0
 
-                            if (batch + 1 - last_save_batch) >= self.train_config.save_interval:
+                            if 0 < self.train_config.save_interval <= global_steps_since_last_save:
                                 save_checkpoint(model=self.train_model, optimizer=self.optimizer)
                                 save_steps(
                                     epoch=epoch,
@@ -353,11 +351,11 @@ class DPOTrainer(BaseTrainer):
                                     batch_idx=batch + 1,
                                     lr_scheduler=self.lr_scheduler
                                 )
-                                last_save_batch = batch + 1
+                                global_steps_since_last_save = 0
 
-                            if (batch + 1 - last_eval_batch) >= self.train_config.eval_interval:
+                            if 0 < self.train_config.eval_interval <= global_steps_since_last_eval:
                                 self._on_batch_end(tag=f'epoch:{epoch}/batch:{batch}')
-                                last_eval_batch = batch + 1
+                                global_steps_since_last_eval = 0
                     except Exception as e:
                         self._on_exception(e, epoch, batch)
 

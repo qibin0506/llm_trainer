@@ -314,8 +314,6 @@ class BaseTrainer:
 
     def _config_optim(self, model, initial_lr):
         optim_type = self.train_config.optim_config.optim_type
-        optimizer_cls = self._get_optim_cls()
-
         betas = self.train_config.optim_config.betas
         weight_decay = self.train_config.optim_config.weight_decay
 
@@ -325,18 +323,67 @@ class BaseTrainer:
         if weight_decay is None:
             weight_decay = 0.015 if optim_type == 'lion' else 0.01
 
+        # ds模式，使用配置方式使用muon
+        if optim_type == 'muon' and self.is_ds:
+            from .optim import get_muon_args
+            muon_momentum, muon_nesterov, muon_ns_steps = get_muon_args(self.train_config.optim_config)
+
+            if self.parallel_kwargs is not None:
+                self.parallel_kwargs["optimizer"] = {
+                    "type": "Muon",
+                    "params": {
+                        "lr": initial_lr,
+                        "muon_lr": initial_lr * self.train_config.optim_config.muon_lr_multiplier,
+                        "adam_lr": initial_lr,
+                        "weight_decay": weight_decay,
+                        "betas": betas,
+                        "momentum": muon_momentum,
+                        "nesterov": muon_nesterov,
+                        "ns_steps": muon_ns_steps
+                    }
+                }
+                if 'zero_optimization' in self.parallel_kwargs:
+                    offload_opt = self.parallel_kwargs['zero_optimization'].get('offload_optimizer', {})
+                    if offload_opt.get('device') == 'nvme':
+                        self.parallel_kwargs['zero_optimization']['save_muon_momentum_buffer_in_memory'] = True
+            return None
+
         no_decay_name_list = ["bias", "norm.weight"]
         decay_params = []
         no_decay_params = []
+        muon_params = []
+        use_muon = optim_type == 'muon' and hasattr(torch.optim, 'Muon')
+        if optim_type == 'muon' and not use_muon and TrainerTools().parallel.is_main_process:
+            Logger.std_log(
+                "WARNING: optim_type is set to 'muon', but torch.optim.Muon is not found. Falling back to AdamW!")
 
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
 
-            if any(nd in name for nd in no_decay_name_list):
-                no_decay_params.append(param)
+            if use_muon and param.ndim >= 2 and 'embed' not in name and 'lm_head' not in name:
+                muon_params.append(param)
             else:
-                decay_params.append(param)
+                if any(nd in name for nd in no_decay_name_list):
+                    no_decay_params.append(param)
+                else:
+                    decay_params.append(param)
+
+        if use_muon:
+            from .optim import MuonAdamW, get_muon_args
+            muon_momentum, muon_nesterov, muon_ns_steps = get_muon_args(self.train_config.optim_config)
+            return MuonAdamW(
+                muon_params,
+                decay_params,
+                no_decay_params,
+                initial_lr,
+                self.train_config.optim_config.muon_lr_multiplier,
+                betas,
+                weight_decay,
+                muon_momentum,
+                muon_nesterov,
+                muon_ns_steps
+            )
 
         optimizer_grouped_parameters = [
             {
@@ -349,6 +396,7 @@ class BaseTrainer:
             },
         ]
 
+        optimizer_cls = self._get_optim_cls()
         return optimizer_cls(
             optimizer_grouped_parameters,
             lr=initial_lr,
@@ -373,7 +421,6 @@ class BaseTrainer:
                             optimizer = deepspeed.ops.lion.DeepSpeedCPULion
                         else:
                             optimizer = deepspeed.ops.adam.DeepSpeedCPUAdam
-                            use_lion_optim = False
                             if TrainerTools().parallel.is_main_process:
                                 Logger.std_log(
                                     'When set offload_optimizer, lion optim is unsupported, so set optim to adam!!!!!')

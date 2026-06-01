@@ -210,12 +210,47 @@ class PPOTrainer(BaseTrainer):
 
     def _config_optim(self, model, initial_lr):
         optim_type = self.train_config.optim_config.optim_type
-        optimizer_cls = self._get_optim_cls()
-
         policy_config = self.train_config.optim_config
         value_config = self.ppo_config.value_optim_config if self.ppo_config.value_optim_config else policy_config
 
+        default_betas = policy_config.betas if policy_config.betas else ((0.95, 0.98) if optim_type == 'lion' else (0.9, 0.999))
+        default_weight_decay = policy_config.weight_decay if policy_config.weight_decay else (0.015 if optim_type == 'lion' else 0.01)
+
+        # ds模式，使用配置方式使用muon
+        if optim_type == 'muon' and self.is_ds:
+            from .optim import get_muon_args
+            muon_momentum, muon_nesterov, muon_ns_steps = get_muon_args(self.train_config.optim_config)
+            if self.ppo_config.value_optim_config is not None and TrainerTools().parallel.is_main_process:
+                Logger.std_log(
+                    "WARN: When using 'muon' optimizer with DeepSpeed in PPO, `value_optim_config` is completely ignored. "
+                    "Both Policy and Value models will share the learning rate and config from `optim_config`."
+                )
+
+            if self.parallel_kwargs is not None:
+                self.parallel_kwargs["optimizer"] = {
+                    "type": "Muon",
+                    "params": {
+                        "lr": policy_config.initial_lr,
+                        "muon_lr": policy_config.initial_lr * self.train_config.optim_config.muon_lr_multiplier,
+                        "adam_lr": policy_config.initial_lr,
+                        "weight_decay": default_weight_decay,
+                        "betas": default_betas,
+                        "momentum": muon_momentum,
+                        "nesterov": muon_nesterov,
+                        "ns_steps": muon_ns_steps
+                    }
+                }
+                if 'zero_optimization' in self.parallel_kwargs:
+                    offload_opt = self.parallel_kwargs['zero_optimization'].get('offload_optimizer', {})
+                    if offload_opt.get('device') == 'nvme':
+                        self.parallel_kwargs['zero_optimization']['save_muon_momentum_buffer_in_memory'] = True
+            return None
+
         no_decay_name_list = ["bias", "norm.weight"]
+        use_muon = optim_type == 'muon' and hasattr(torch.optim, 'Muon')
+        if optim_type == 'muon' and not use_muon and TrainerTools().parallel.is_main_process:
+            Logger.std_log(
+                "WARNING: optim_type is set to 'muon', but torch.optim.Muon is not found. Falling back to AdamW!")
 
         def get_param_groups(module, config, name_prefix):
             current_betas = config.betas
@@ -229,16 +264,21 @@ class PPOTrainer(BaseTrainer):
 
             decay_params = []
             no_decay_params = []
+            muon_params = []
 
             for name, param in module.named_parameters():
                 if not param.requires_grad:
                     continue
-                if any(nd in name for nd in no_decay_name_list):
-                    no_decay_params.append(param)
-                else:
-                    decay_params.append(param)
 
-            return [
+                if use_muon and param.ndim >= 2 and 'embed' not in name and 'lm_head' not in name:
+                    muon_params.append(param)
+                else:
+                    if any(nd in name for nd in no_decay_name_list):
+                        no_decay_params.append(param)
+                    else:
+                        decay_params.append(param)
+
+            return muon_params, [
                 {
                     "params": decay_params,
                     "weight_decay": current_weight_decay,
@@ -255,13 +295,34 @@ class PPOTrainer(BaseTrainer):
                 }
             ]
 
-        optimizer_grouped_parameters = []
-        optimizer_grouped_parameters.extend(get_param_groups(model.policy_model, policy_config, "policy"))
-        optimizer_grouped_parameters.extend(get_param_groups(model.value_model, value_config, "value"))
+        policy_muon_params, policy_groups = get_param_groups(model.policy_model, policy_config, "policy")
+        value_muon_params, value_groups = get_param_groups(model.value_model, value_config, "value")
 
-        default_betas = policy_config.betas if policy_config.betas else ((0.95, 0.98) if optim_type == 'lion' else (0.9, 0.999))
-        default_weight_decay = policy_config.weight_decay if policy_config.weight_decay else (0.015 if optim_type == 'lion' else 0.01)
+        if use_muon:
+            from .optim import PPOMuonAdamW, get_muon_args
+            p_muon_momentum, p_muon_nesterov, p_muon_ns_steps = get_muon_args(policy_config)
+            v_muon_momentum, v_muon_nesterov, v_muon_ns_steps = get_muon_args(value_config)
+            p_weight_decay = policy_config.weight_decay if policy_config.weight_decay is not None else default_weight_decay
+            v_weight_decay = value_config.weight_decay if value_config.weight_decay is not None else default_weight_decay
 
+            return PPOMuonAdamW(
+                policy_config,
+                value_config,
+                policy_muon_params,
+                value_muon_params,
+                policy_groups + value_groups,
+                p_weight_decay=p_weight_decay,
+                v_weight_decay=v_weight_decay,
+                p_momentum=p_muon_momentum,
+                p_nesterov=p_muon_nesterov,
+                p_ns_steps=p_muon_ns_steps,
+                v_momentum=v_muon_momentum,
+                v_nesterov=v_muon_nesterov,
+                v_ns_steps=v_muon_ns_steps,
+            )
+
+        optimizer_grouped_parameters = policy_groups + value_groups
+        optimizer_cls = self._get_optim_cls()
         return optimizer_cls(
             optimizer_grouped_parameters,
             lr=policy_config.initial_lr,
@@ -270,6 +331,16 @@ class PPOTrainer(BaseTrainer):
         )
 
     def _init_lr_scheduler(self, initial_lr: float, optimizer) -> LRScheduler:
+        if self.train_config.optim_config.optim_type == 'muon':
+            if self.is_ds or hasattr(torch.optim, 'Muon'):
+                if self.ppo_config.value_optim_config is not None and not self.is_ds and TrainerTools().parallel.is_main_process:
+                    Logger.std_log(
+                        "WARN: When using 'muon' optimizer (without DeepSpeed) in PPO, `value_optim_config` scheduler settings are ignored. "
+                        "Policy and Value models will share the LR scheduler curve from `optim_config`."
+                    )
+
+                return super()._init_lr_scheduler(initial_lr, optimizer)
+
         policy_config = self.train_config.optim_config
         value_config = self.ppo_config.value_optim_config
 

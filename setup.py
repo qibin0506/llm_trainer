@@ -20,6 +20,6 @@ setup(
         'packaging',
         'deepspeed',
         'numpy',
-        'transformers',
+        'nano_tokenizer',
     ],
 )

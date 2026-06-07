@@ -1,13 +1,11 @@
 import os
-import warnings
-from typing import List, Dict, Union
-from transformers import AutoTokenizer
 import torch
-
+from typing import List, Dict, Union
+from nano_tokenizer import NanoTokenizer
 
 class Tokenizer:
     def __init__(self):
-        self.tokenizer = AutoTokenizer.from_pretrained(os.environ['TOKEN_DIR'])
+        self.tokenizer = NanoTokenizer(os.environ['TOKEN_DIR'])
 
         self.text_end = '</s>'
 
@@ -44,77 +42,40 @@ class Tokenizer:
         self.system = self.tokenizer.convert_tokens_to_ids(self.text_system)
         self.image = self.tokenizer.convert_tokens_to_ids(self.text_image)
 
-        self.vocab_size = len(self.tokenizer)
+        self.vocab_size = self.tokenizer.get_vocab_size()
 
-    def encode(
-            self,
-            text: str,
-            unsqueeze: bool = False,
-            covert_tensor: bool = False
-    ) -> Union[torch.Tensor, List[int]]:
+    def encode(self, text: str) -> List[int]:
         # [x,x,x]
-        encoded = self.tokenizer.encode(text, add_special_tokens=False)
+        return self.tokenizer.encode(text)
 
-        if unsqueeze:
-            # tensor: [[x,x,x]]
-            return torch.tensor(encoded, dtype=torch.long).unsqueeze(0)
-        else:
-            # tensor: # [x,x,x]
-            if covert_tensor:
-                return torch.tensor(encoded, dtype=torch.long)
+    def batch_encode(self, text: List[str], padding = False) -> List[List[int]]:
+        pad_id = self.pad if self.pad is not None else 0
+        return self.tokenizer.batch_encode(
+            text, padding, False, pad_id, self.text_pad
+        )
 
-            return encoded
+    def decode(self, token: Union[torch.Tensor, List[int]]) -> str:
+        if isinstance(token, torch.Tensor):
+            token = token.view(-1).cpu().tolist()
 
-    def batch_encode(
-            self,
-            text: List[str],
-            padding = False,
-            truncation = False,
-            covert_tensor: bool = False,
-            return_attention_mask: bool = False
-    ) -> Union[torch.Tensor, List[List[int]]]:
-        encoded = self.tokenizer(
-            text,
-            padding=padding,
-            truncation=truncation,
-            return_attention_mask=return_attention_mask
-        )['input_ids']
+        return self.tokenizer.decode(token)
 
-        if covert_tensor:
-            encoded = torch.tensor(encoded, dtype=torch.long)
+    def batch_decode(self, tokens: Union[torch.Tensor, List[int], List[List[int]]]) -> List[str]:
+        if isinstance(tokens, torch.Tensor):
+            if tokens.dim() == 1:
+                tokens = tokens.unsqueeze(0)
+            tokens = tokens.cpu().tolist()
+        elif isinstance(tokens, list) and len(tokens) > 0 and not isinstance(tokens[0], list):
+            tokens = [tokens]
 
-        return encoded
-
-    def decode(
-            self,
-            token: Union[torch.Tensor, List[int]],
-            skip_special_tokens: bool = False
-    ) -> str:
-        return self.tokenizer.decode(token, skip_special_tokens=skip_special_tokens)
-
-    def batch_decode(
-            self,
-            tokens: Union[torch.Tensor, List[int], List[List[int]]],
-            skip_special_tokens: bool = False
-    ) -> List[str]:
-        return self.tokenizer.batch_decode(tokens, skip_special_tokens=skip_special_tokens)
-
-    def encode_to_token(self, text: str, unsqueeze=True, covert_tensor=True):
-        warnings.warn('encode_to_token is deprecated. Please use `encode` instead.')
-        return self.encode(text, unsqueeze, covert_tensor)
-
-    def decode_to_text(self, token: torch.Tensor, skip_special_tokens: bool = False) -> str:
-        warnings.warn('decode_to_text is deprecated. Please use `decode` instead.')
-        return self.decode(token.squeeze(0), skip_special_tokens)
+        return self.tokenizer.batch_decode(tokens)
 
     def apply_chat_template(
             self,
             conversations: List[Dict[str, str]],
             tokenizer: bool = True,
-            add_answer_tag_for_assistant: bool = True,
-            unsqueeze=False,
-            covert_tensor=False
-    ):
+            add_answer_tag_for_assistant: bool = True
+    ) -> Union[str, List[int]]:
         """
             [
                 {"role":"system", "content":"system prompt"},
@@ -141,7 +102,7 @@ class Tokenizer:
                 chat_template = f"{chat_template}{support_roles[role]}{content}{self.text_end}"
 
         if tokenizer:
-            return self.encode(chat_template, unsqueeze, covert_tensor)
+            return self.encode(chat_template)
 
         return chat_template
 

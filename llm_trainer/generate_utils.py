@@ -310,7 +310,8 @@ def _streaming_generate(
     if isinstance(prompt, torch.Tensor):
         encoded_tokens = prompt.to(device)
     else:
-        encoded_tokens = TrainerTools().tokenizer.encode(prompt, unsqueeze=True, covert_tensor=True).to(device)
+        encoded_tokens = torch.tensor(TrainerTools().tokenizer.encode(prompt),
+                                      dtype=torch.long, device=device).unsqueeze(0)
 
     generate_text_iterator = _generate(
         model=model,

@@ -730,7 +730,7 @@ class BaseTrainer:
             eval_pixel_values = None
 
         if self.generation_service is not None:
-            tokens = TrainerTools().tokenizer.encode(eval_prompt, unsqueeze=True, covert_tensor=True)
+            tokens = torch.tensor(TrainerTools().tokenizer.encode(eval_prompt), dtype=torch.long).unsqueeze(0)
             response_ids = self.generation_service(
                 self.train_model, tokens, self.train_config.eval_config,
                 'eval', eval_pixel_values, tokens_per_image
@@ -746,7 +746,7 @@ class BaseTrainer:
                     eval_model = self._check_eval_model(eval_model)
                     eval_model.eval()
 
-                    tokens = TrainerTools().tokenizer.encode(eval_prompt, unsqueeze=True, covert_tensor=True)
+                    tokens = torch.tensor(TrainerTools().tokenizer.encode(eval_prompt), dtype=torch.long).unsqueeze(0)
                     max_new_tokens = max(self.train_config.eval_config.max_seq_len - tokens.shape[1], 0)
 
                     gen_result = generate(

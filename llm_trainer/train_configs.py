@@ -294,6 +294,7 @@ class GenerateConfig:
     repetition_penalty: Optional[float] = 1.0
     exclude_penalty_tokens: Optional[List[int]] = None
     suppress_tokens: Optional[List[int]] = None
+    auto_prefix_cache: bool = True
 
 
 @dataclass(kw_only=True)

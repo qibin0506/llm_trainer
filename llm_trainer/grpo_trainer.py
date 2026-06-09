@@ -293,7 +293,8 @@ class GRPOTrainer(BaseTrainer):
                         exclude_penalty_tokens=self.grpo_config.generate_config.exclude_penalty_tokens,
                         device=device,
                         suppress_tokens=self.grpo_config.generate_config.suppress_tokens,
-                        return_logits=False
+                        return_logits=False,
+                        auto_prefix_cache=self.grpo_config.generate_config.auto_prefix_cache
                     )
 
                 completion_ids = outputs[:, prompt_len:]

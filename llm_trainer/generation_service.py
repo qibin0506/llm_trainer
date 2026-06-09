@@ -122,6 +122,7 @@ class SyncCentralGenerationService(GenerationServiceBase):
                         suppress_tokens=config.suppress_tokens,
                         device=self.generation_device,
                         return_logits=False,
+                        auto_prefix_cache=config.auto_prefix_cache
                     )
 
                     prompt_len = chunk_prompts.shape[1]
@@ -311,6 +312,7 @@ class ParallelGenerationService(GenerationServiceBase):
                 suppress_tokens=config.suppress_tokens,
                 device=self.generation_device,
                 return_logits=False,
+                auto_prefix_cache=config.auto_prefix_cache
             )
 
             prompt_len = chunk_prompts.shape[1]

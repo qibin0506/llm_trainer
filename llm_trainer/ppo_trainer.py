@@ -461,7 +461,8 @@ class PPOTrainer(BaseTrainer):
                         exclude_penalty_tokens=self.ppo_config.generate_config.exclude_penalty_tokens,
                         suppress_tokens=self.ppo_config.generate_config.suppress_tokens,
                         device=device,
-                        return_logits=False
+                        return_logits=False,
+                        auto_prefix_cache=self.ppo_config.generate_config.auto_prefix_cache
                     )
 
             completion_ids = full_ids[:, prompt_len:]

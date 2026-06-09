@@ -9,6 +9,20 @@ from .utils import (
 )
 
 
+def _find_longest_common_prefix(tokens: torch.Tensor) -> int:
+    if tokens.shape[0] <= 1:
+        return tokens.shape[1]
+
+    first_row = tokens[0]
+    match_mask = (tokens == first_row)
+    all_match = match_mask.all(dim=0)
+
+    if all_match.all():
+        return tokens.shape[1]
+
+    return (~all_match).long().argmax().item()
+
+
 def _repetition_penalty_warper(
         logits: torch.Tensor,
         input_ids: torch.Tensor,
@@ -166,8 +180,6 @@ def _generate(
     :param suppress_tokens: 要抑制的tokens
     :param device:
     """
-    use_kv_cache = True
-
     special_tokens = list(TrainerTools().tokenizer.get_special_tokens_dict().values())
     if exclude_penalty_tokens is not None:
         special_tokens.extend(exclude_penalty_tokens)
@@ -188,11 +200,9 @@ def _generate(
     batch_size = tokens.shape[0]
     prompt_len = tokens.shape[1]
 
-    kv_cache: Optional[KVCache] = None
-    if use_kv_cache:
-        # Prompt Length + Max Generation Length
-        total_capacity = prompt_len + max_new_tokens
-        kv_cache = KVCache(max_capacity=total_capacity)
+    # Prompt Length + Max Generation Length
+    total_capacity = prompt_len + max_new_tokens
+    kv_cache = KVCache(max_capacity=total_capacity)
 
     if pixel_values is not None:
         pixel_values = pixel_values.to(device)
@@ -226,7 +236,7 @@ def _generate(
                     current_tokens,
                     attention_mask=current_attention_mask,
                     past_key_values=kv_cache,
-                    use_cache=use_kv_cache,
+                    use_cache=True,
                     pixel_values=pixel_values
                 )
 
@@ -275,12 +285,7 @@ def _generate(
             yield next_token, False
 
             full_sequence_buffer[:, prompt_len + i] = next_token.squeeze(-1)
-            if use_kv_cache:
-                current_tokens = next_token
-            else:
-                # 如果不用 KV Cache，模型需要每次传入前文全量 Tokens
-                # 直接通过切片获取全局 Buffer，这里也不会触发显存拷贝！
-                current_tokens = full_sequence_buffer[:, :prompt_len + i + 1]
+            current_tokens = next_token
 
             full_attention_mask[:, prompt_len + i] = 1
             if next_token.item() == TrainerTools().tokenizer.end:
@@ -427,9 +432,9 @@ def batch_generate(
         tokens_per_image: int = -1,
         suppress_tokens: Optional[List[int]] = None,
         device: Union[str, torch.device, int],
-        return_logits: bool = False
+        return_logits: bool = False,
+        auto_prefix_cache: bool = False
 ):
-    use_kv_cache = True
     end_token = TrainerTools().tokenizer.end
     pad_token_id = TrainerTools().tokenizer.pad
 
@@ -444,6 +449,9 @@ def batch_generate(
     if pixel_values is not None:
         pixel_values = pixel_values.to(device)
 
+    if tokens.dtype != torch.long:
+        tokens = tokens.long()
+
     orig_tokens = tokens.clone()
     full_attention_mask = attention_mask.clone()
 
@@ -454,7 +462,7 @@ def batch_generate(
     prompt_len = orig_tokens.shape[1]
 
     group_size = 1
-    if use_kv_cache and pixel_values is None and batch_size > 1:
+    if pixel_values is None and batch_size > 1:
         for i in range(1, batch_size):
             if torch.equal(orig_tokens[0], orig_tokens[i]):
                 group_size += 1
@@ -468,11 +476,9 @@ def batch_generate(
             if not torch.equal(unique_t.repeat_interleave(group_size, dim=0), orig_tokens):
                 group_size = 1
 
-    kv_cache: Optional[KVCache] = None
-    if use_kv_cache:
-        # Prompt Length + Max Generation Length
-        total_capacity = prompt_len + max_new_tokens
-        kv_cache = KVCache(max_capacity=total_capacity)
+    # Prompt Length + Max Generation Length
+    total_capacity = prompt_len + max_new_tokens
+    kv_cache = KVCache(max_capacity=total_capacity)
 
     # 直接分配一个涵盖 全局 (Prompt + Generate) 的终极 Buffer
     full_sequence_buffer = torch.full(
@@ -489,37 +495,49 @@ def batch_generate(
         dtype=attention_mask.dtype,
         device=device
     )
+
     full_attention_mask_buffer[:, :prompt_len] = attention_mask
-
     done = torch.zeros(batch_size, dtype=torch.bool, device=device)
-    current_tokens = tokens
 
+    prefilled_len = 0
+    if auto_prefix_cache and pixel_values is None and batch_size > 1:
+        common_len = _find_longest_common_prefix(orig_tokens)
+        common_len = min(common_len, prompt_len - 1)
+
+        if common_len > 0:
+            prefix_tokens = orig_tokens[0:1, :common_len]
+            prefix_mask = full_attention_mask_buffer[0:1, :common_len]
+            prefix_pos = position_ids[0:1, :common_len]
+
+            with torch.inference_mode(), autocast(TrainerTools().parallel.device_type):
+                model(
+                    prefix_tokens,
+                    attention_mask=prefix_mask,
+                    position_ids=prefix_pos,
+                    past_key_values=kv_cache,
+                    use_cache=True,
+                    pixel_values=None
+                )
+            prefilled_len = common_len
+
+    current_tokens = tokens
     padded_logits = None
     actual_gen_len = 0
-
     pad_token_tensor = torch.tensor(pad_token_id, device=device, dtype=torch.long)
 
     with torch.inference_mode():
         for i in range(max_new_tokens):
             if done.all():
                 break
-
             actual_gen_len = i + 1
 
-            if current_tokens.dtype != torch.long:
-                current_tokens = current_tokens.long()
-
-            current_attention_mask = full_attention_mask_buffer[:, :prompt_len + i]
-
-            if kv_cache is None:
-                current_position_ids = calc_position_ids(current_attention_mask)
+            if i == 0:
+                current_tokens = orig_tokens[:, prefilled_len:]
+                current_position_ids = position_ids[:, prefilled_len:prompt_len]
+                current_attention_mask = full_attention_mask_buffer[:, :prompt_len]
             else:
-                if i == 0:
-                    current_position_ids = position_ids
-                else:
-                    # current_position_ids = position_ids[:, -1:] + 1
-                    # position_ids = torch.cat((position_ids, current_position_ids), dim=-1)
-                    current_position_ids = current_attention_mask.sum(dim=-1, keepdim=True).long() - 1
+                current_attention_mask = full_attention_mask_buffer[:, :prompt_len + i]
+                current_position_ids = current_attention_mask.sum(dim=-1, keepdim=True).long() - 1
 
             with autocast(TrainerTools().parallel.device_type):
                 if i == 0 and group_size > 1:
@@ -532,7 +550,7 @@ def batch_generate(
                         attention_mask=unique_attention_mask,
                         position_ids=unique_position_ids,
                         past_key_values=kv_cache,
-                        use_cache=use_kv_cache,
+                        use_cache=True,
                         pixel_values=None
                     )
 
@@ -543,7 +561,7 @@ def batch_generate(
                         attention_mask=current_attention_mask,
                         position_ids=current_position_ids,
                         past_key_values=kv_cache,
-                        use_cache=use_kv_cache,
+                        use_cache=True,
                         pixel_values=pixel_values
                     )
                     logits = result['logits']
@@ -599,10 +617,7 @@ def batch_generate(
             )
 
             full_sequence_buffer[:, prompt_len + i] = next_token.squeeze(-1)
-            if use_kv_cache:
-                current_tokens = next_token
-            else:
-                current_tokens = full_sequence_buffer[:, :prompt_len + i + 1]
+            current_tokens = next_token
 
             new_mask = (~done).long().to(full_attention_mask_buffer.dtype)
             full_attention_mask_buffer[:, prompt_len + i] = new_mask

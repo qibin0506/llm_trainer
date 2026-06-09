@@ -60,13 +60,16 @@ class Tokenizer:
 
         return self.tokenizer.decode(token)
 
-    def batch_decode(self, tokens: Union[torch.Tensor, List[int], List[List[int]]]) -> List[str]:
+    def batch_decode(self, tokens: Union[torch.Tensor, List[int], List[List[int]], List[torch.Tensor]]) -> List[str]:
         if isinstance(tokens, torch.Tensor):
             if tokens.dim() == 1:
                 tokens = tokens.unsqueeze(0)
             tokens = tokens.cpu().tolist()
-        elif isinstance(tokens, list) and len(tokens) > 0 and not isinstance(tokens[0], list):
-            tokens = [tokens]
+        elif isinstance(tokens, list) and len(tokens) > 0:
+            if isinstance(tokens[0], torch.Tensor):
+                tokens = [t.view(-1).cpu().tolist() for t in tokens]
+            elif not isinstance(tokens[0], list):
+                tokens = [tokens]
 
         return self.tokenizer.batch_decode(tokens)
 

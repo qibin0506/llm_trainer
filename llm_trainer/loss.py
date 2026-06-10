@@ -65,20 +65,45 @@ class DPOLoss(nn.Module):
             self,
             beta: float,
             label_smoothing: float = 0.0,
-            ipo: bool = False
+            ipo: bool = False,
+            loss_type: str = 'dpo',
+            simpo_gamma: float = 0.5
     ):
         super().__init__()
         self.beta = beta
         self.label_smoothing = label_smoothing
         self.ipo = ipo
+        self.loss_type = loss_type
+        self.simpo_gamma = simpo_gamma
 
     def forward(
             self,
             policy_chosen_logps: torch.Tensor,
             policy_reject_logps: torch.Tensor,
             ref_chosen_logps: torch.Tensor,
-            ref_reject_logps: torch.Tensor
+            ref_reject_logps: torch.Tensor,
+            policy_chosen_means: Optional[torch.Tensor] = None,
+            policy_reject_means: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
+        if self.loss_type == 'orpo':
+            # ORPO: Odds Ratio Preference Optimization
+            # Odds = P / (1 - P) => log(Odds) = log(P) - log(1 - P)
+            p_chosen = torch.exp(policy_chosen_means.float()).clamp(min=1e-6, max=1 - 1e-6)
+            log_odds_chosen = torch.log(p_chosen / (1 - p_chosen))
+
+            p_reject = torch.exp(policy_reject_means.float()).clamp(min=1e-6, max=1 - 1e-6)
+            log_odds_rejected = torch.log(p_reject / (1 - p_reject))
+
+            log_odds_ratio = log_odds_chosen - log_odds_rejected
+            losses = -F.logsigmoid(self.beta * log_odds_ratio)
+            return losses.mean()
+
+        if self.loss_type == 'simpo':
+            # SimPO: Simple Preference Optimization
+            reward_diff = self.beta * (policy_chosen_means.float() - policy_reject_means.float())
+            losses = -F.logsigmoid(reward_diff - self.simpo_gamma)
+            return losses.mean()
+
         policy_chosen_logps = policy_chosen_logps.float()
         policy_reject_logps = policy_reject_logps.float()
         ref_chosen_logps = ref_chosen_logps.float()

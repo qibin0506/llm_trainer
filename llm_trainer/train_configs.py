@@ -340,18 +340,22 @@ class DPOConfig:
         ref_model_weights_path (Optional[str]): 参考模型 (Reference Model) 的初始化权重路径。
         mask_prompt (`bool`): 是否在 Chosen 和 Rejected 数据中屏蔽掉 Prompt 部分的损失。
         gradient_accumulation_steps (`int`): 梯度累积步数。
+        loss_type (`str`): 偏好对齐算法，支持 'dpo', 'orpo', 'simpo'。
         loss_beta (`float`): DPO 的 KL 散度约束强度参数 (通常为 0.1)。值越大，模型越紧贴参考模型。
         loss_label_smoothing (`float`): DPO Loss 的标签平滑系数 (c-DPO 变体)。
         loss_ipo (`bool`): 是否采用 IPO (Identity Preference Optimization) 的 Loss 形式。
-        nll_loss_coef (`Optional[float]`): 加入辅助的负对数似然 (NLL) 损失权重，缓解 DPO 生成质量退化。
+        nll_loss_coef (`Optional[float]`): 加入辅助的负对数似然 (NLL) 损失权重，缓解 DPO 生成质量退化。ORPO 必须设置此项 (通常为 1.0)
+        simpo_gamma (`float`): SimPO 算法独有的 Target Reward Margin 参数 (建议 0.5~2.0)。
     """
     ref_model_weights_path: Optional[str] = None
     mask_prompt: bool = True
     gradient_accumulation_steps: int = 1
+    loss_type: str = 'dpo'
     loss_beta: float
     loss_label_smoothing: float = 0.0
     loss_ipo: bool = False
     nll_loss_coef: Optional[float] = None
+    simpo_gamma: float = 0.5
 
 
 @dataclass(kw_only=True)

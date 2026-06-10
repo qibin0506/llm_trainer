@@ -68,7 +68,14 @@ class DPOTrainer(BaseTrainer):
         self.ref_model = self._init_ref_model()
         self.criterion = self._init_loss()
 
+        if self.dpo_config.loss_type == 'orpo' and (self.dpo_config.nll_loss_coef is None or self.dpo_config.nll_loss_coef == 0.0):
+            if TrainerTools().parallel.is_main_process:
+                Logger.std_log("WARN: ORPO highly recommends using an NLL (SFT) loss. Please set `nll_loss_coef` (e.g., 1.0) in DPOConfig!")
+
     def _init_ref_model(self):
+        if self.dpo_config.loss_type in ['orpo', 'simpo']:
+            return None
+
         parallel_kwargs = self._init_ref_model_args(self.train_config.model_config)
         with self._new_model_context(parallel_kwargs):
             ref_model = self._new_model(self.train_config)
@@ -98,7 +105,9 @@ class DPOTrainer(BaseTrainer):
         return DPOLoss(
             beta=self.dpo_config.loss_beta,
             label_smoothing=self.dpo_config.loss_label_smoothing,
-            ipo=self.dpo_config.loss_ipo
+            ipo=self.dpo_config.loss_ipo,
+            loss_type=self.dpo_config.loss_type,
+            simpo_gamma=self.dpo_config.simpo_gamma
         )
 
     def _convert_train_args(self) -> Tuple[dict, dict, dict]:
@@ -214,11 +223,17 @@ class DPOTrainer(BaseTrainer):
                         concat_attention_masks = torch.concat([chosen_attention_masks, rejected_attention_masks], dim=0)
 
                         with autocast(TrainerTools().parallel.device_type):
-                            with torch.no_grad():
-                                ref_outputs = self.ref_model(concat_inputs, attention_mask=concat_attention_masks)
-                                ref_logprobs_sums, _, _ = self._logprobs(ref_outputs['logits'], concat_labels)
+                            if self.ref_model is not None:
+                                with torch.no_grad():
+                                    ref_outputs = self.ref_model(concat_inputs, attention_mask=concat_attention_masks)
+                                    ref_logprobs_sums, _, _ = self._logprobs(ref_outputs['logits'], concat_labels)
+                                    del ref_outputs
 
-                                del ref_outputs
+                                    ref_chosen_logps = ref_logprobs_sums[:chosen_inputs.shape[0]]
+                                    ref_rejected_logps = ref_logprobs_sums[chosen_inputs.shape[0]:]
+                            else:
+                                ref_chosen_logps = None
+                                ref_rejected_logps = None
 
                             policy_outputs = self.train_model(concat_inputs, attention_mask=concat_attention_masks)
                             policy_logprobs_sums, policy_logprobs_means, policy_mask_sums = self._logprobs(policy_outputs['logits'], concat_labels)
@@ -229,8 +244,8 @@ class DPOTrainer(BaseTrainer):
                             policy_chosen_logps = policy_logprobs_sums[:chosen_inputs.shape[0]]
                             policy_rejected_logps = policy_logprobs_sums[chosen_inputs.shape[0]:]
 
-                            ref_chosen_logps = ref_logprobs_sums[:chosen_inputs.shape[0]]
-                            ref_rejected_logps = ref_logprobs_sums[chosen_inputs.shape[0]:]
+                            policy_chosen_means = policy_logprobs_means[:chosen_inputs.shape[0]]
+                            policy_rejected_means = policy_logprobs_means[chosen_inputs.shape[0]:]
 
                             nll_loss = -policy_logprobs_means[:chosen_inputs.shape[0]].mean()
 
@@ -240,10 +255,12 @@ class DPOTrainer(BaseTrainer):
 
                             # calc loss
                             loss = self.criterion(
-                                policy_chosen_logps,
-                                policy_rejected_logps,
-                                ref_chosen_logps,
-                                ref_rejected_logps
+                                policy_chosen_logps=policy_chosen_logps,
+                                policy_reject_logps=policy_rejected_logps,
+                                ref_chosen_logps=ref_chosen_logps,
+                                ref_reject_logps=ref_rejected_logps,
+                                policy_chosen_means=policy_chosen_means,
+                                policy_reject_means=policy_rejected_means
                             )
 
                             if aux_loss is not None:
@@ -257,8 +274,20 @@ class DPOTrainer(BaseTrainer):
                                 nll_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
 
                             with torch.no_grad():
-                                chosen_rewards = beta * (policy_chosen_logps.detach() - ref_chosen_logps)
-                                rejected_rewards = beta * (policy_rejected_logps.detach() - ref_rejected_logps)
+                                if self.dpo_config.loss_type == 'orpo':
+                                    p_c = torch.exp(policy_chosen_means.float()).clamp(min=1e-6, max=1 - 1e-6)
+                                    p_r = torch.exp(policy_rejected_means.float()).clamp(min=1e-6, max=1 - 1e-6)
+                                    # Odds
+                                    chosen_rewards = torch.log(p_c / (1 - p_c))
+                                    rejected_rewards = torch.log(p_r / (1 - p_r))
+                                elif self.dpo_config.loss_type == 'simpo':
+                                    chosen_rewards = beta * policy_chosen_means
+                                    rejected_rewards = beta * policy_rejected_means
+                                else:
+                                    # DPO Margin = Beta * (Policy_logps - Ref_logps)
+                                    chosen_rewards = beta * (policy_chosen_logps.detach() - ref_chosen_logps)
+                                    rejected_rewards = beta * (policy_rejected_logps.detach() - ref_rejected_logps)
+
                                 reward_margin = chosen_rewards - rejected_rewards
                                 reward_accuracy = (chosen_rewards > rejected_rewards).float()
 
@@ -321,7 +350,7 @@ class DPOTrainer(BaseTrainer):
                                 },
                                 values={
                                     'loss/total': avg_total_loss,
-                                    'loss/dpo': avg_dpo_loss,
+                                    f'loss/{self.dpo_config.loss_type}': avg_dpo_loss,
                                     'loss/moe_aux': avg_aux_loss,
                                     'loss/nll': avg_nll_loss,
                                     'metrics/ppl': round(perplexity, 4) if avg_ce_loss > 0 else float('inf'),
@@ -379,6 +408,8 @@ class DPOTrainer(BaseTrainer):
                     del rejected_attention_masks
                     del policy_chosen_logps
                     del policy_rejected_logps
+                    del policy_chosen_means
+                    del policy_rejected_means
                     del ref_chosen_logps
                     del ref_rejected_logps
                     del chosen_rewards

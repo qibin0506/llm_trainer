@@ -275,11 +275,11 @@ class DPOTrainer(BaseTrainer):
 
                             with torch.no_grad():
                                 if self.dpo_config.loss_type == 'orpo':
-                                    p_c = torch.exp(policy_chosen_means.float()).clamp(min=1e-6, max=1 - 1e-6)
-                                    p_r = torch.exp(policy_rejected_means.float()).clamp(min=1e-6, max=1 - 1e-6)
+                                    p_c = torch.clamp(policy_chosen_means.float(), max=-1e-6)
+                                    p_r = torch.clamp(policy_rejected_means.float(), max=-1e-6)
                                     # Odds
-                                    chosen_rewards = torch.log(p_c / (1 - p_c))
-                                    rejected_rewards = torch.log(p_r / (1 - p_r))
+                                    chosen_rewards = p_c - torch.log1p(-torch.exp(p_c))
+                                    rejected_rewards = p_r - torch.log1p(-torch.exp(p_r))
                                 elif self.dpo_config.loss_type == 'simpo':
                                     chosen_rewards = beta * policy_chosen_means
                                     rejected_rewards = beta * policy_rejected_means

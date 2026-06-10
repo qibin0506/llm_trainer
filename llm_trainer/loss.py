@@ -88,14 +88,14 @@ class DPOLoss(nn.Module):
         if self.loss_type == 'orpo':
             # ORPO: Odds Ratio Preference Optimization
             # Odds = P / (1 - P) => log(Odds) = log(P) - log(1 - P)
-            p_chosen = torch.exp(policy_chosen_means.float()).clamp(min=1e-6, max=1 - 1e-6)
-            log_odds_chosen = torch.log(p_chosen / (1 - p_chosen))
+            p_chosen = torch.clamp(policy_chosen_means.float(), max=-1e-6)
+            log_odds_chosen = p_chosen - torch.log1p(-torch.exp(p_chosen))
 
-            p_reject = torch.exp(policy_reject_means.float()).clamp(min=1e-6, max=1 - 1e-6)
-            log_odds_rejected = torch.log(p_reject / (1 - p_reject))
+            p_reject = torch.clamp(policy_reject_means.float(), max=-1e-6)
+            log_odds_rejected = p_reject - torch.log1p(-torch.exp(p_reject))
 
             log_odds_ratio = log_odds_chosen - log_odds_rejected
-            losses = -F.logsigmoid(self.beta * log_odds_ratio)
+            losses = self.beta * -F.logsigmoid(log_odds_ratio)
             return losses.mean()
 
         if self.loss_type == 'simpo':

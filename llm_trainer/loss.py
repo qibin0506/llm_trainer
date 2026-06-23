@@ -19,10 +19,14 @@ class LMLoss(nn.Module):
     def forward(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         # logits shape (batch, seq_len, vocab_size)
         # labels shape (batch, seq_len)
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
 
-        logits = shift_logits.reshape(-1, logits.shape[-1])
+        # shift_logits = logits[..., :-1, :].contiguous()
+        # shift_labels = labels[..., 1:].contiguous()
+        # logits = shift_logits.reshape(-1, logits.shape[-1])
+        # targets = shift_labels.reshape(-1)
+
+        shift_labels = F.pad(labels[..., 1:], (0, 1), value=self.ignore_index)
+        logits = logits.reshape(-1, logits.shape[-1])
         targets = shift_labels.reshape(-1)
 
         ce_loss = F.cross_entropy(

@@ -323,6 +323,9 @@ class RLDataset(Dataset):
         else:
             prompt_tensor = torch.tensor(question).long()
 
+        if prompt_tensor.numel() > 0 and prompt_tensor[-1] != TrainerTools().tokenizer.assistant:
+            prompt_tensor = torch.cat([prompt_tensor, torch.tensor([TrainerTools().tokenizer.assistant], dtype=prompt_tensor.dtype)])
+
         if answer is not None:
             if isinstance(answer, np.ndarray):
                 answer_tensor = torch.from_numpy(answer.astype(np.int64))

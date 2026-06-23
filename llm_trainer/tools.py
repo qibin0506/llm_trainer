@@ -123,6 +123,7 @@ def compute_lr_scheduler_steps(
         all_data_size: int,
         batch_size: int,
         gradient_accumulation_steps: int,
+        warmup_rate: float,
         **kwargs
 ):
     world_size = TrainerTools().parallel.world_size
@@ -158,7 +159,7 @@ def compute_lr_scheduler_steps(
         train_batch_per_world = dataloader_batches_per_gpu / gradient_accumulation_steps
 
     train_batch_per_world = math.floor(train_batch_per_world)
-    warmup_iters = int(0.1 * train_batch_per_world)
+    warmup_iters = int(warmup_rate * train_batch_per_world)
 
     max_warmup_iters = kwargs.get('max_warmup_iters', -1)
     if max_warmup_iters > -1:

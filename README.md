@@ -4,7 +4,7 @@
 
 ## ✨ 核心特性
 
-*   **全生命周期对齐**：完整支持 Pretrain、SFT、DPO (直接偏好优化)、PPO (近端策略优化) 以及最新的 **GRPO (组相对策略优化)**。
+*   **全生命周期对齐**：完整支持 Pretrain、SFT、DPO（及其SimPO、ORPO变体）、PPO (近端策略优化) 以及GRPO (及其GSPO、BNPO、DR_GRPO、CISPO、DAPO、LUSPO、SAPO、VESPO变体)。
 *   **极致显存与通信优化**：深度集成 DeepSpeed ZeRO-1/2/3。原生支持 **ZeRO-Infinity (NVMe Offload)** 突破 CPU 内存限制，内置 **ZeRO++ (QWZ/HPZ/QGZ)** 极大压缩多机多卡通信带宽。
 *   **原生多模态 (VLM) 支持**：支持图片 Tag 解析与 Pixel Value 动态映射，可一键冻结 LLM 底座仅微调 Projector 投影层。
 *   **工业级 RLHF 容错机制**：内置 PPO/GRPO Reward 截断与白化、`ignore_unused_parameters` 防治计算图断裂、KL 散度动态约束等高阶稳定性保障。

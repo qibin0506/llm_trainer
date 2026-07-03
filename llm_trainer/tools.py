@@ -1,6 +1,7 @@
 import os
 import math
 from abc import ABC, abstractmethod
+from typing import Optional
 
 from .tokenizer import Tokenizer
 from .parallel import DsParallel, NoneParallel
@@ -170,19 +171,53 @@ def compute_lr_scheduler_steps(
     return warmup_iters, cosine_annealing_batches
 
 
-def save_ds_weights_to_safetensors(input_path: str, output_path: str):
+def save_ds_weights_to_safetensors(input_path: str, output_path: str, dtype: Optional[str] = None):
+    import torch
     from safetensors.torch import save_file
     from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
 
+    target_dtype = None
+    if dtype is not None:
+        dtype_str = dtype.lower()
+        if dtype_str in ['fp16', 'float16']:
+            target_dtype = torch.float16
+        elif dtype_str in ['bf16', 'bfloat16']:
+            target_dtype = torch.bfloat16
+        elif dtype_str in ['fp32', 'float32']:
+            target_dtype = torch.float32
+
     state_dict = get_fp32_state_dict_from_zero_checkpoint(input_path)
-    clean_dict = {k: v.clone().contiguous() for k, v in state_dict.items()}
+
+    if target_dtype is not None:
+        clean_dict = {k: v.to(target_dtype).clone().contiguous() for k, v in state_dict.items()}
+    else:
+        clean_dict = {k: v.clone().contiguous() for k, v in state_dict.items()}
+
     save_file(clean_dict, output_path)
 
 
-def save_pt_weights_to_safetensors(input_path: str, output_path: str):
+def save_pt_weights_to_safetensors(input_path: str, output_path: str, dtype: Optional[str] = None):
     import torch
     from safetensors.torch import save_file
 
+    target_dtype = None
+    if dtype is not None:
+        dtype_str = dtype.lower()
+        if dtype_str in ['fp16', 'float16']:
+            target_dtype = torch.float16
+        elif dtype_str in ['bf16', 'bfloat16']:
+            target_dtype = torch.bfloat16
+        elif dtype_str in ['fp32', 'float32']:
+            target_dtype = torch.float32
+
     state_dict = torch.load(input_path, map_location="cpu", weights_only=True)
-    clean_dict = {k: v.clone().contiguous() for k, v in state_dict.items()}
+
+    if isinstance(state_dict, dict) and "model_state_dict" in state_dict:
+        state_dict = state_dict["model_state_dict"]
+
+    if target_dtype is not None:
+        clean_dict = {k: v.to(target_dtype).clone().contiguous() for k, v in state_dict.items()}
+    else:
+        clean_dict = {k: v.clone().contiguous() for k, v in state_dict.items()}
+
     save_file(clean_dict, output_path)

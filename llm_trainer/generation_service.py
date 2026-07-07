@@ -61,8 +61,8 @@ class SyncCentralGenerationService(GenerationServiceBase):
     def __call__(
             self,
             model: torch.nn.Module,
-            prompts: torch.Tensor,
-            config: GenerateConfig,
+            prompt_ids: torch.Tensor,
+            generate_config: GenerateConfig,
             task_type: str,
             pixel_values: Optional[torch.Tensor] = None,
             tokens_per_image: Optional[int] = -1
@@ -76,7 +76,7 @@ class SyncCentralGenerationService(GenerationServiceBase):
             gc.collect()
             empty_cache()
 
-        local_prompts = prompts.cpu().tolist()
+        local_prompts = prompt_ids.cpu().tolist()
         gathered_prompts = [None for _ in range(self.world_size)]
 
         if self.world_size > 1:
@@ -101,7 +101,7 @@ class SyncCentralGenerationService(GenerationServiceBase):
                 target_prompts_tensor = torch.tensor(target_prompts, dtype=torch.long, device=self.generation_device)
                 attention_mask = (target_prompts_tensor != TrainerTools().tokenizer.pad).long()
 
-                max_new_tokens = max(config.max_seq_len - target_prompts_tensor.shape[1], 1)
+                max_new_tokens = max(generate_config.max_seq_len - target_prompts_tensor.shape[1], 1)
                 completions = []
                 actual_chunk_size = len(target_prompts_tensor) if self.chunk_size <= 0 else self.chunk_size
 
@@ -114,15 +114,15 @@ class SyncCentralGenerationService(GenerationServiceBase):
                         tokens=chunk_prompts,
                         attention_mask=chunk_mask,
                         max_new_tokens=max_new_tokens,
-                        temperature=config.temperature,
-                        top_k=config.top_k,
-                        top_p=config.top_p,
-                        repetition_penalty=config.repetition_penalty,
-                        exclude_penalty_tokens=config.exclude_penalty_tokens,
-                        suppress_tokens=config.suppress_tokens,
+                        temperature=generate_config.temperature,
+                        top_k=generate_config.top_k,
+                        top_p=generate_config.top_p,
+                        repetition_penalty=generate_config.repetition_penalty,
+                        exclude_penalty_tokens=generate_config.exclude_penalty_tokens,
+                        suppress_tokens=generate_config.suppress_tokens,
                         device=self.generation_device,
                         return_logits=False,
-                        auto_prefix_cache=config.auto_prefix_cache
+                        auto_prefix_cache=generate_config.auto_prefix_cache
                     )
 
                     prompt_len = chunk_prompts.shape[1]
@@ -234,8 +234,8 @@ class ParallelGenerationService(GenerationServiceBase):
     def _eval(
             self,
             model: torch.nn.Module,
-            prompts: torch.Tensor,
-            config: GenerateConfig,
+            prompt_ids: torch.Tensor,
+            generate_config: GenerateConfig,
             task_type: str,
             pixel_values: Optional[torch.Tensor] = None,
             tokens_per_image: Optional[int] = -1
@@ -248,24 +248,24 @@ class ParallelGenerationService(GenerationServiceBase):
             gc.collect()
             empty_cache()
 
-            max_new_tokens = max(config.max_seq_len - prompts.shape[1], 1)
+            max_new_tokens = max(generate_config.max_seq_len - prompt_ids.shape[1], 1)
             out_ids = generate(
                 self.gen_model,
-                prompt=prompts,
+                prompt=prompt_ids,
                 max_new_tokens=max_new_tokens,
-                temperature=config.temperature,
-                top_k=config.top_k,
-                top_p=config.top_p,
-                repetition_penalty=config.repetition_penalty,
-                exclude_penalty_tokens=config.exclude_penalty_tokens,
-                suppress_tokens=config.suppress_tokens,
+                temperature=generate_config.temperature,
+                top_k=generate_config.top_k,
+                top_p=generate_config.top_p,
+                repetition_penalty=generate_config.repetition_penalty,
+                exclude_penalty_tokens=generate_config.exclude_penalty_tokens,
+                suppress_tokens=generate_config.suppress_tokens,
                 pixel_values=pixel_values,
                 tokens_per_image=tokens_per_image,
                 device=self.generation_device,
                 return_token=True
             )
 
-            prompt_len = prompts.shape[1]
+            prompt_len = prompt_ids.shape[1]
             return [out_ids[prompt_len:].cpu().tolist()]
 
         return None
@@ -273,8 +273,8 @@ class ParallelGenerationService(GenerationServiceBase):
     def _generate(
             self,
             model: torch.nn.Module,
-            prompts: torch.Tensor,
-            config: GenerateConfig,
+            prompt_ids: torch.Tensor,
+            generate_config: GenerateConfig,
             task_type: str,
             pixel_values: Optional[torch.Tensor] = None,
             tokens_per_image: Optional[int] = -1
@@ -286,12 +286,12 @@ class ParallelGenerationService(GenerationServiceBase):
         gc.collect()
         empty_cache()
 
-        local_prompts_tensor = prompts.to(self.generation_device)
+        local_prompts_tensor = prompt_ids.to(self.generation_device)
         if local_prompts_tensor.numel() == 0:
             return []
 
         attention_mask = (local_prompts_tensor != TrainerTools().tokenizer.pad).long()
-        max_new_tokens = max(config.max_seq_len - local_prompts_tensor.shape[1], 1)
+        max_new_tokens = max(generate_config.max_seq_len - local_prompts_tensor.shape[1], 1)
         completions = []
         actual_chunk_size = len(local_prompts_tensor) if self.chunk_size <= 0 else self.chunk_size
 
@@ -304,15 +304,15 @@ class ParallelGenerationService(GenerationServiceBase):
                 tokens=chunk_prompts,
                 attention_mask=chunk_mask,
                 max_new_tokens=max_new_tokens,
-                temperature=config.temperature,
-                top_k=config.top_k,
-                top_p=config.top_p,
-                repetition_penalty=config.repetition_penalty,
-                exclude_penalty_tokens=config.exclude_penalty_tokens,
-                suppress_tokens=config.suppress_tokens,
+                temperature=generate_config.temperature,
+                top_k=generate_config.top_k,
+                top_p=generate_config.top_p,
+                repetition_penalty=generate_config.repetition_penalty,
+                exclude_penalty_tokens=generate_config.exclude_penalty_tokens,
+                suppress_tokens=generate_config.suppress_tokens,
                 device=self.generation_device,
                 return_logits=False,
-                auto_prefix_cache=config.auto_prefix_cache
+                auto_prefix_cache=generate_config.auto_prefix_cache
             )
 
             prompt_len = chunk_prompts.shape[1]
@@ -323,13 +323,13 @@ class ParallelGenerationService(GenerationServiceBase):
     def __call__(
             self,
             model: torch.nn.Module,
-            prompts: torch.Tensor,
-            config: GenerateConfig,
+            prompt_ids: torch.Tensor,
+            generate_config: GenerateConfig,
             task_type: str,
             pixel_values: Optional[torch.Tensor] = None,
             tokens_per_image: Optional[int] = -1
     ) -> List[List[int]]:
         if task_type == 'eval':
-            return self._eval(model, prompts, config, task_type, pixel_values, tokens_per_image)
+            return self._eval(model, prompt_ids, generate_config, task_type, pixel_values, tokens_per_image)
 
-        return self._generate(model, prompts, config, task_type, pixel_values, tokens_per_image)
+        return self._generate(model, prompt_ids, generate_config, task_type, pixel_values, tokens_per_image)

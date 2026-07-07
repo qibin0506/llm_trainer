@@ -1,4 +1,4 @@
-from typing import Tuple, List, Optional, Callable
+from typing import Tuple, List, Optional
 import gc
 import math
 import torch
@@ -12,7 +12,7 @@ from .tools import TrainerTools
 from .log import Logger
 from .train_configs import (
     TrainConfig,
-    GenerateConfig
+    GenerationService
 )
 from .utils import (
     autocast,
@@ -41,22 +41,13 @@ class DPOTrainer(BaseTrainer):
 
         generation_service:
             - 外部自定义生成服务接口。
-            - 签名:
-                1. model (torch.nn.Module): 传入的正在执行训练的模型实例（可能已被 DeepSpeed 封装）。
-                2. prompts (torch.Tensor): 待生成的一组 Prompt 文本。Shape: [batch_size]。
-                3. config (GenerateConfig): 生成解码控制配置（如 temp, top_p, top_k 等）。
-                4. task_type (str): 调用任务上下文类型，如 'eval', 'ppo', 'grpo'。
-                5. pixel_values (Optional[torch.Tensor]): VLM 多模态特征张量。Shape: [batch_size, channels, height, width] 或 [batch_size * num_images, channels, height, width]。
-                6. tokens_per_image (Optional[int]): 每个图片标签对应的虚拟 Token 数值标量。
-            - 返回值:
-                - List[List[int]]: 外层列表长度为 [batch_size * group_size]，内层为生成的 Completion Token ID 序列（不应包含 Prompt）。
     """
     def __init__(
             self,
             *,
             train_config: TrainConfig,
             eval_prompts: List[str],
-            generation_service: Optional[Callable[[torch.nn.Module, torch.Tensor, GenerateConfig, str, Optional[torch.Tensor], Optional[int]], List[List[int]]]] = None,
+            generation_service: Optional[GenerationService] = None,
     ):
         self.dpo_config = train_config.dpo_config
         super().__init__(

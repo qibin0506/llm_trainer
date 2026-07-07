@@ -1,4 +1,4 @@
-from typing import Tuple, List, Callable, Optional
+from typing import Tuple, List, Optional
 import gc
 import torch
 import torch.distributed as dist
@@ -14,7 +14,9 @@ from .log import Logger
 from .partition_utils import unwrap_model_for_generation
 from .train_configs import (
     TrainConfig,
-    GenerateConfig
+    RewardFun,
+    GenerationService,
+    PtxBuilder
 )
 from .utils import (
     autocast,
@@ -40,32 +42,12 @@ class GRPOTrainer(BaseTrainer):
 
         reward_func:
             - 基于 Rule 规则或 RM 模型的奖励打分函数。
-            - 签名:
-                1. prompts (List[torch.Tensor]): 长度为 [B * group_size] 的列表。内层 Tensor 形状为 [prompt_len]，为左填充对齐前的原始 prompt ids。
-                2. complete_ids (torch.Tensor): 形状为 [B * group_size, max_completion_len] 的 CPU Tensor，为当前 Rollout 阶段并行生成的各句 Completion IDs。
-                3. answer_ids (List[Optional[torch.Tensor]]): 长度为 [B * group_size] 的列表。内层 Tensor 形状为 [answer_len] 或 None，表示真值（用于匹配或指标判定）。
-            - 返回值:
-                - List[float]: 长度为 [B * group_size] 的一维列表，返回每个生成句子的标量奖励值。
 
         generation_service:
             - 外部自定义生成服务接口
-            - 签名:
-                1. model (torch.nn.Module): 传入的正在执行训练的模型实例（可能已被 DeepSpeed 封装）。
-                2. prompts (torch.Tensor): 待生成的一组 Prompt 文本。Shape: [batch_size]。
-                3. config (GenerateConfig): 生成解码控制配置（如 temp, top_p, top_k 等）。
-                4. task_type (str): 调用任务上下文类型，如 'eval', 'ppo', 'grpo'。
-                5. pixel_values (Optional[torch.Tensor]): VLM 多模态特征张量。Shape: [batch_size, channels, height, width] 或 [batch_size * num_images, channels, height, width]。
-                6. tokens_per_image (Optional[int]): 每个图片标签对应的虚拟 Token 数值标量。
-            - 返回值:
-                - List[List[int]]: 外层列表长度为 [batch_size * group_size]，内层为生成的 Completion Token ID 序列（不应包含 Prompt）。
 
         ptx_builder:
             - 构建预训练校准数据集 (PTX Data Mixture) 的回调函数，用以缓解强化学习阶段的灾难性遗忘。
-            - 签名:
-                1. prompts (List[torch.Tensor]): 长度为 [B] 的列表，内层 Tensor 形状为 [prompt_len]，对应训练批次下的 Prompts。
-                2. answers (List[torch.Tensor]): 长度为 [B] 的列表，内层 Tensor 形状为 [answer_len]，对应训练批次下的真值 Answers。
-            - 返回值:
-                - List[torch.Tensor]: 长度为 [B] 的拼接后（Prompt + Answer）完整句子 Token 张量列表。每个 Tensor 形状为 [seq_len]。
 
         eval_prompts:
             - 评估测试的提示词列表。
@@ -75,9 +57,9 @@ class GRPOTrainer(BaseTrainer):
             self,
             *,
             train_config: TrainConfig,
-            reward_func: Callable[[List[torch.Tensor], torch.Tensor, List[Optional[torch.Tensor]]], List[float]],
-            generation_service: Optional[Callable[[torch.nn.Module, torch.Tensor, GenerateConfig, str, Optional[torch.Tensor], Optional[int]], List[List[int]]]] = None,
-            ptx_builder: Optional[Callable[[List[torch.Tensor], List[torch.Tensor]], List[torch.Tensor]]] = None,
+            reward_func: RewardFun,
+            generation_service: Optional[GenerationService] = None,
+            ptx_builder: Optional[PtxBuilder] = None,
             eval_prompts: List[str]
     ):
         self.grpo_config = train_config.grpo_config
@@ -231,13 +213,13 @@ class GRPOTrainer(BaseTrainer):
         return advantages.unsqueeze(1)  # Add dimension for token-wise operations
 
     def _generate_rollout_data(self, batch_data: List[dict]):
-        prompts = [item["prompt"] for item in batch_data]
-        answers = [item["answer"] for item in batch_data]
+        prompt_ids = [item["prompt"] for item in batch_data]
+        gt_answer_ids = [item["answer"] for item in batch_data]
         group_size = self.grpo_config.group_size
 
         # for PTX
         if self.grpo_config.ptx_coef > 0.0 and self.ptx_builder is not None:
-            ptx_data = self.ptx_builder(prompts, answers)
+            ptx_data = self.ptx_builder(prompt_ids, gt_answer_ids)
             ptx_data = [{'inputs': t} if t is not None else None for t in ptx_data]
         else:
             ptx_data = []
@@ -246,13 +228,13 @@ class GRPOTrainer(BaseTrainer):
         pad_token_id = TrainerTools().tokenizer.pad
         device = TrainerTools().parallel.device
 
-        prompt_ids = left_pad_sequence(prompts, padding_value=pad_token_id)
-        prompt_ids = prompt_ids.to(device)
-        prompt_len = prompt_ids.shape[1]
+        padded_prompt_ids = left_pad_sequence(prompt_ids, padding_value=pad_token_id)
+        padded_prompt_ids = padded_prompt_ids.to(device)
+        prompt_len = padded_prompt_ids.shape[1]
 
         # [batch*group_size, max_prompt_len]
-        prompt_ids = prompt_ids.repeat_interleave(group_size, 0)
-        prompt_masks = self._calc_attention_mask(prompt_ids)
+        padded_prompt_ids = padded_prompt_ids.repeat_interleave(group_size, 0)
+        prompt_masks = self._calc_attention_mask(padded_prompt_ids)
 
         max_new_tokens = self.grpo_config.generate_config.max_seq_len - prompt_len
         if max_new_tokens <= 0:
@@ -264,7 +246,7 @@ class GRPOTrainer(BaseTrainer):
         with torch.no_grad():
             if self.generation_service is not None:
                 completion_ids_list = self.generation_service(
-                    self.train_model, prompt_ids, self.grpo_config.generate_config, 'grpo', None, None
+                    self.train_model, padded_prompt_ids, self.grpo_config.generate_config, 'grpo', None, None
                 )
 
                 padded_completions = []
@@ -283,7 +265,7 @@ class GRPOTrainer(BaseTrainer):
                 with unwrap_model_for_generation(self.train_model) as unwrapped_model:
                     outputs, _ = batch_generate(
                         model=unwrapped_model,
-                        tokens=prompt_ids,
+                        tokens=padded_prompt_ids,
                         attention_mask=prompt_masks,
                         max_new_tokens=max_new_tokens,
                         temperature=self.grpo_config.generate_config.temperature,
@@ -300,7 +282,7 @@ class GRPOTrainer(BaseTrainer):
                 completion_ids = outputs[:, prompt_len:]
 
             completion_mask = completion_ids != pad_token_id
-            input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+            input_ids = torch.cat([padded_prompt_ids, completion_ids], dim=1)
             attention_mask = torch.cat([prompt_masks, completion_mask], dim=1)
 
             with autocast(TrainerTools().parallel.device_type):
@@ -316,8 +298,8 @@ class GRPOTrainer(BaseTrainer):
             else:
                 ref_log_probs = None
 
-        repeated_prompts = [p for p in prompts for _ in range(group_size)]
-        repeated_answers = [a for a in answers for _ in range(group_size)]
+        repeated_prompt_ids = [p for p in prompt_ids for _ in range(group_size)]
+        repeated_gt_answer_ids = [a for a in gt_answer_ids for _ in range(group_size)]
         if len(ptx_data) > 0:
             repeated_ptx_data = [d for d in ptx_data for _ in range(group_size)]
         else:
@@ -325,7 +307,7 @@ class GRPOTrainer(BaseTrainer):
 
         # [batch*group_size]
         rewards = torch.tensor(
-            self.reward_func(repeated_prompts, completion_ids.cpu(), repeated_answers),
+            self.reward_func(repeated_prompt_ids, completion_ids.cpu(), repeated_gt_answer_ids),
             dtype=torch.float32,
             device=TrainerTools().parallel.device
         )

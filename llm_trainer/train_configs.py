@@ -1,4 +1,4 @@
-from typing import Optional, Union, Callable, List, Tuple
+from typing import Optional, Union, List, Tuple, Protocol
 from dataclasses import dataclass, field
 
 import torch
@@ -264,12 +264,12 @@ class KDConfig:
     基于 Logits 级别的知识蒸馏 (Knowledge Distillation) 配置。
 
     Args:
-        teacher_logits_provider (`Callable[[torch.Tensor, torch.Tensor], torch.Tensor]`):
+        teacher_logits_provider:
             外部提供的回调函数，用于获取 Teacher 模型针对当前 Batch 生成的软标签 (Logits)。
         kd_coef (`float`, default=0.4):
             知识蒸馏 Loss 的融合占比。总 Loss = kd_coef * distil_loss + (1 - kd_coef) * task_loss。
     """
-    teacher_logits_provider: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+    teacher_logits_provider: "TeacherLogitsProvider"
     kd_coef: float = 0.4
 
 
@@ -320,14 +320,14 @@ class SFTConfig:
         gradient_accumulation_steps (`int`): 梯度累积步数。
         kd_config (`Optional[KDConfig]`): 知识蒸馏相关配置。
         image_tags_file_dataset (`Optional[FileDataset]`): 多模态 SFT 场景下提供对应数据集的图像 Tag 映射。
-        pixel_values_provider (`Optional[Callable]`): VLM 训练时，根据 image_tag 提供图像像素矩阵的回调。
+        pixel_values_provider (`Optional[PixelValuesProvider]`): VLM 训练时，根据 image_tag 提供图像像素矩阵的回调。
         freeze_llm_model (`bool`): VLM 微调中是否冻结底座大模型，仅微调 Projector 投影层。
     """
     mask_prompt: bool = True
     gradient_accumulation_steps: int = 1
     kd_config: Optional[KDConfig] = None
     image_tags_file_dataset: Optional[FileDataset] = None
-    pixel_values_provider: Optional[Callable[[list[str]], torch.Tensor]] = None
+    pixel_values_provider: Optional["PixelValuesProvider"] = None
     freeze_llm_model: bool = False
 
 
@@ -503,3 +503,81 @@ class TrainConfig:
             self.ds_config.activation_checkpointing = DsActivationCheckpointingConfig()
         elif not self.gradient_checkpointing and self.ds_config is not None and self.ds_config.activation_checkpointing is not None:
             self.gradient_checkpointing = True
+
+
+class RewardFun(Protocol):
+    def __call__(
+            self,
+            prompt_ids: List[torch.Tensor],
+            completion_ids: torch.Tensor,
+            gt_answer_ids: List[Optional[torch.Tensor]]
+    ) -> List[float]:
+        """
+        计算奖励分数。
+
+        Args:
+            prompt_ids: 长度为 [N] 的列表。内层 Tensor 形状为 [prompt_len]，为对齐前的原始 prompt ids。
+            completion_ids: 形状为 [N, max_completion_len] 的 CPU Tensor，为当前生成的 Completion IDs。
+            gt_answer_ids: 长度为 [N] 的列表。表示真值（用于匹配或指标判定）。
+
+        Note:
+            - 在 PPO 训练中，N 通常等于 batch_size (B)。
+            - 在 GRPO 训练中，N 通常等于 batch_size * group_size。
+
+        Returns:
+            长度为 [N] 的一维列表，返回每个生成句子的标量奖励值。
+        """
+        ...
+
+
+class GenerationService(Protocol):
+    def __call__(
+            self,
+            model: torch.nn.Module,
+            prompt_ids: torch.Tensor,
+            generate_config: GenerateConfig,
+            task_type: str,
+            pixel_values: Optional[torch.Tensor],
+            tokens_per_image: Optional[int]
+    ) -> List[List[int]]:
+        """
+        外部自定义生成服务接口。
+
+        Args:
+            model (torch.nn.Module): 传入的正在执行训练的模型实例（可能已被 DeepSpeed 封装）。
+            prompt_ids (torch.Tensor): 待生成的一组 Prompt 文本。Shape: [batch_size]。
+            generate_config (GenerateConfig): 生成解码控制配置（如 temp, top_p, top_k 等）。
+            task_type (str): 调用任务上下文类型，如 'eval', 'ppo', 'grpo'。
+            pixel_values (Optional[torch.Tensor]): VLM 多模态特征张量。Shape: [batch_size, channels, height, width] 或 [batch_size * num_images, channels, height, width]。
+            tokens_per_image (Optional[int]): 每个图片标签对应的虚拟 Token 数值标量。
+
+        Returns:
+            外层列表长度为 [batch_size * group_size]，内层为生成的 Completion Token ID 序列（不应包含 Prompt）。
+        """
+        ...
+
+
+class PtxBuilder(Protocol):
+    def __call__(
+            self,
+            prompt_ids: List[torch.Tensor],
+            gt_answer_ids: List[torch.Tensor]
+    ) -> List[torch.Tensor]:
+        """
+        构建预训练校准数据集 (PTX Data Mixture) 的回调函数，用以缓解强化学习阶段的灾难性遗忘。
+
+        Args:
+            prompt_ids (List[torch.Tensor]): 长度为 [B] 的列表，内层 Tensor 形状为 [prompt_len]，对应训练批次下的 Prompts。
+            gt_answer_ids (List[torch.Tensor]): 长度为 [B] 的列表，内层 Tensor 形状为 [answer_len]，对应训练批次下的真值 Answers。
+
+        Returns:
+            长度为 [B] 的拼接后（Prompt + Answer）完整句子 Token 张量列表。每个 Tensor 形状为 [seq_len]。
+        """
+        ...
+
+class TeacherLogitsProvider(Protocol):
+    def __call__(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor: ...
+
+
+class PixelValuesProvider(Protocol):
+    def __call__(self, image_tags: List[str]) -> torch.Tensor: ...

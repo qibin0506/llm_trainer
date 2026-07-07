@@ -362,11 +362,12 @@ class PPOTrainer(BaseTrainer):
         completion_mask = completion_mask.float()
 
         gamma, lam = self.ppo_config.gamma, self.ppo_config.lam
-        advantages_reversed = []
+        advantages = torch.zeros_like(rewards)
         last_gae_lam = 0
         seq_len = rewards.size(1)
 
         values = values * completion_mask
+
         for t in reversed(range(seq_len)):
             if t == seq_len - 1:
                 next_values = torch.where(dones, 0.0, last_values)
@@ -375,9 +376,8 @@ class PPOTrainer(BaseTrainer):
 
             delta = rewards[:, t] + gamma * next_values - values[:, t]
             last_gae_lam = delta + gamma * lam * last_gae_lam * completion_mask[:, t]
-            advantages_reversed.append(last_gae_lam)
+            advantages[:, t] = last_gae_lam
 
-        advantages = torch.stack(advantages_reversed[::-1], dim=1)
         returns = advantages + values
 
         return advantages * completion_mask, returns * completion_mask

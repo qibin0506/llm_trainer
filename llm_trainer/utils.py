@@ -602,7 +602,7 @@ def _selective_log_softmax(logits, index) -> torch.Tensor:
     return per_token_logps
 
 
-def _mask_prompt(labels):
+def _mask_prompt(sequences: torch.Tensor) -> torch.Tensor:
     """
     Mask 掉 Prompt 部分以及固定的模版标签，只保留模型需要生成的真正内容。
     策略：
@@ -625,8 +625,8 @@ def _mask_prompt(labels):
     assistant_id = tokenizer.assistant
     ignore_index = -100
 
-    for i in range(labels.shape[0]):
-        row = labels[i]
+    for i in range(sequences.shape[0]):
+        row = sequences[i]
         seq_len = len(row)
 
         # 1. 找到所有 Prompt 开始 (system/user) 和结束 (end) 的位置
@@ -670,7 +670,7 @@ def _mask_prompt(labels):
             next_s_idx = torch.searchsorted(starts, mask_end, right=True).item()
             start_idx_ptr = next_s_idx
 
-    return labels
+    return sequences
 
 
 def _zero_pad_sequences(

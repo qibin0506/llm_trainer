@@ -1,4 +1,4 @@
-from typing import Optional, Union, List, Tuple, Protocol
+from typing import Optional, Union, List, Tuple, Protocol, Dict, Any
 from dataclasses import dataclass, field
 
 import torch
@@ -539,7 +539,7 @@ class GenerationService(Protocol):
             task_type: str,
             pixel_values: Optional[torch.Tensor],
             tokens_per_image: Optional[int]
-    ) -> List[List[int]]:
+    ) -> Union[List[List[int]], Dict[str, Any]]:
         """
         外部自定义生成服务接口。
 
@@ -552,7 +552,14 @@ class GenerationService(Protocol):
             tokens_per_image (Optional[int]): 每个图片标签对应的虚拟 Token 数值标量。
 
         Returns:
-            外层列表长度为 [batch_size * group_size]，内层为生成的 Completion Token ID 序列（不应包含 Prompt）。
+             Union[List[List[int]], Dict[str, Any]]:
+                - **标准单轮场景 (List[List[int]])**:
+                    外层列表长度为 [batch_size]，内层为生成的 Completion Token ID 序列（不含 Prompt）。
+                - **扩展/多轮交互场景 (Dict[str, Any])**:
+                    包含以下 key 的字典：
+                    - 'completions' (List[List[int]]): 包含完整交互轨迹的 Token ID 序列。
+                    - 'dones' (Optional[List[bool]]): 每个样本最终的环境终止状态标志。
+                    - 'generation_masks' (Optional[List[List[bool]]]): 精确标记哪些 Token 是模型生成的 (True) 以及哪些是环境反馈的 (False)。
         """
         ...
 

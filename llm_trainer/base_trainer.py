@@ -722,10 +722,11 @@ class BaseTrainer:
 
         if self.generation_service is not None:
             tokens = torch.tensor(TrainerTools().tokenizer.encode(eval_prompt), dtype=torch.long).unsqueeze(0)
-            response_ids = self.generation_service(
+            service_output = self.generation_service(
                 self.train_model, tokens, self.train_config.eval_config,
                 'eval', eval_pixel_values, tokens_per_image
             )
+            response_ids = service_output['completions']
 
             if TrainerTools().parallel.is_main_process and response_ids:
                 gen_text = TrainerTools().tokenizer.decode(response_ids[0])

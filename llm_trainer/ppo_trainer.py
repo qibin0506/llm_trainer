@@ -417,19 +417,17 @@ class PPOTrainer(BaseTrainer):
                     'ppo', None, None
                 )
 
-                if isinstance(service_output, dict):
-                    completion_ids_list = service_output['completions']
-                    dones_list = service_output.get('dones', None)
-                    gen_masks_list = service_output.get('generation_masks', None)
+                completion_ids_list = service_output['completions']
+                dones_list = service_output.get('dones', None)
+                gen_masks_list = service_output.get('generation_masks', None)
 
-                    if dones_list is not None:
-                        dones = torch.tensor(dones_list, dtype=torch.bool, device=device)
-                    else:
-                        dones = None
+                if gen_masks_list is not None:
+                    assert len(gen_masks_list) == len(completion_ids_list)
+
+                if dones_list is not None:
+                    dones = torch.tensor(dones_list, dtype=torch.bool, device=device)
                 else:
-                    completion_ids_list = service_output
                     dones = None
-                    gen_masks_list = None
 
                 padded_completions = []
                 padded_gen_masks = []
@@ -542,7 +540,13 @@ class PPOTrainer(BaseTrainer):
 
                     env_rewards_tensor = (env_rewards_tensor - raw_reward_mean) / batch_std
 
-            last_token_indices = completion_pad_mask.sum(dim=1) - 1
+            gen_indices = torch.where(
+                loss_mask,
+                torch.arange(completion_ids.size(1), device=device).unsqueeze(0),
+                torch.tensor(-1, device=device)
+            )
+
+            last_token_indices = gen_indices.max(dim=1).values
             valid_indices_mask = last_token_indices >= 0
 
             if valid_indices_mask.any():
@@ -652,7 +656,7 @@ class PPOTrainer(BaseTrainer):
                         value_mean = (mb_values * mb_completion_pad_mask).sum() / mb_completion_pad_mask.sum().clamp(min=1.0)
                         return_mean = (mb_returns * mb_completion_pad_mask).sum() / mb_completion_pad_mask.sum().clamp(min=1.0)
                         value_error = value_mean - return_mean
-                        completion_len = mb_completion_pad_mask.sum(dim=-1).float().mean()
+                        completion_len = mb_loss_mask.sum(dim=-1).float().mean()
 
                     if policy_output['aux_loss'] is not None:
                         aux_loss = policy_output['aux_loss'].to(loss.dtype)

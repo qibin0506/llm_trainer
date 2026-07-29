@@ -252,12 +252,11 @@ class GRPOTrainer(BaseTrainer):
                     'grpo', None, None
                 )
 
-                if isinstance(service_output, dict):
-                    completion_ids_list = service_output['completions']
-                    gen_masks_list = service_output.get('generation_masks', None)
-                else:
-                    completion_ids_list = service_output
-                    gen_masks_list = None
+                completion_ids_list = service_output['completions']
+                gen_masks_list = service_output.get('generation_masks', None)
+
+                if gen_masks_list is not None:
+                    assert len(gen_masks_list) == len(completion_ids_list)
 
                 padded_completions = []
                 padded_gen_masks = []
@@ -340,7 +339,7 @@ class GRPOTrainer(BaseTrainer):
         return {
             'input_ids': input_ids.detach(),
             'attention_mask': attention_mask.detach(),
-            'completion_mask': loss_mask.detach(),
+            'loss_mask': loss_mask.detach(),
             'old_log_probs': old_log_probs.detach(),
             'ref_log_probs': ref_log_probs.detach() if ref_log_probs is not None else None,
             'completion_ids': completion_ids.detach(),
@@ -355,7 +354,7 @@ class GRPOTrainer(BaseTrainer):
 
         input_ids = rollout_data['input_ids']
         attention_mask = rollout_data['attention_mask']
-        completion_mask = rollout_data['completion_mask']
+        loss_mask = rollout_data['loss_mask']
         old_log_probs = rollout_data['old_log_probs']
         ref_log_probs = rollout_data['ref_log_probs']
         completion_ids = rollout_data['completion_ids']
@@ -388,8 +387,8 @@ class GRPOTrainer(BaseTrainer):
 
                 mb_input_ids = input_ids[mini_batch_indices]
                 mb_attention_mask = attention_mask[mini_batch_indices]
-                mb_completion_mask = completion_mask[mini_batch_indices]
-                actual_completion_len = mb_completion_mask.sum(dim=-1).float().mean().item()
+                mb_loss_mask = loss_mask[mini_batch_indices]
+                actual_completion_len = mb_loss_mask.sum(dim=-1).float().mean().item()
                 mb_old_log_probs = old_log_probs[mini_batch_indices]
                 mb_ref_log_probs = ref_log_probs[mini_batch_indices] if ref_log_probs is not None else None
                 mb_completion_ids = completion_ids[mini_batch_indices]
@@ -404,14 +403,14 @@ class GRPOTrainer(BaseTrainer):
                         log_probs=log_probs,
                         old_log_probs=mb_old_log_probs,
                         ref_log_probs=mb_ref_log_probs,
-                        completion_mask=mb_completion_mask,
+                        completion_mask=mb_loss_mask,
                         advantages=mb_advantages,
                         completion_len=actual_completion_len
                     )
 
                     with torch.no_grad():
                         fp32_log_probs = log_probs.float()
-                        fp32_mask = mb_completion_mask.float()
+                        fp32_mask = mb_loss_mask.float()
 
                         entropy = -(fp32_log_probs * fp32_mask).sum() / fp32_mask.sum().clamp(min=1.0)
                         completion_len = fp32_mask.sum(dim=-1).mean()

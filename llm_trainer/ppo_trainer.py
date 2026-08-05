@@ -374,6 +374,8 @@ class PPOTrainer(BaseTrainer):
                 next_values = torch.where(dones, 0.0, last_values)
             else:
                 next_values = values[:, t + 1]
+                is_truncated_end = (completion_mask[:, t] == 1) & (completion_mask[:, t + 1] == 0) & (~dones)
+                next_values = torch.where(is_truncated_end, last_values, next_values)
 
             delta = rewards[:, t] + gamma * next_values - values[:, t]
             last_gae_lam = delta + gamma * lam * last_gae_lam * completion_mask[:, t]

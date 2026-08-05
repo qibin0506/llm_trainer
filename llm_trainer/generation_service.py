@@ -548,6 +548,8 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
                         unpadded_prompt,
                         torch.tensor(valid_new_tokens + feedback_tokens, dtype=torch.long, device=device)
                     ])
+                    if next_prompt.size(0) > generate_config.max_seq_len:
+                        next_prompt = next_prompt[:generate_config.max_seq_len]
                     next_prompts_list[idx] = next_prompt
 
                     if is_done or turn == self.max_turns - 1 or next_prompt.size(0) >= generate_config.max_seq_len:

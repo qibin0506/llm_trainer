@@ -34,7 +34,8 @@ from .utils import (
     disable_dropout_in_model,
     calc_position_ids,
     RunningMeanStd,
-    empty_cache
+    empty_cache,
+    _mask_prompt
 )
 from .checkpoint import (
     save_checkpoint,
@@ -373,6 +374,8 @@ class PPOTrainer(BaseTrainer):
                 next_values = torch.where(dones, 0.0, last_values)
             else:
                 next_values = values[:, t + 1]
+                is_truncated_end = (completion_mask[:, t] == 1) & (completion_mask[:, t + 1] == 0) & (~dones)
+                next_values = torch.where(is_truncated_end, last_values, next_values)
 
             delta = rewards[:, t] + gamma * next_values - values[:, t]
             last_gae_lam = delta + gamma * lam * last_gae_lam * completion_mask[:, t]
@@ -390,13 +393,11 @@ class PPOTrainer(BaseTrainer):
         prompt_ids = [item["prompt"] for item in batch_data]
         gt_answer_ids = [item["answer"] for item in batch_data]
 
-        # for PTX
         if self.ppo_config.ptx_coef > 0.0 and self.ptx_builder is not None:
             ptx_data = self.ptx_builder(prompt_ids, gt_answer_ids)
             ptx_data = [{'inputs': t} if t is not None else None for t in ptx_data]
         else:
             ptx_data = []
-        # end
 
         padded_prompt_ids = left_pad_sequence(prompt_ids, padding_value=pad_token_id)
         padded_prompt_ids = padded_prompt_ids.to(device)
@@ -406,28 +407,53 @@ class PPOTrainer(BaseTrainer):
         max_new_tokens = self.ppo_config.generate_config.max_seq_len - prompt_len
         if max_new_tokens <= 0:
             raise ValueError(
-                f"Prompt length ({prompt_len}) >= max_seq_len ({self.ppo_config.generate_config.max_seq_len}). "
-                f"Cannot generate any tokens. Please increase max_seq_len or reduce dataset_block_size."
+                f"Prompt length ({prompt_len}) >= max_seq_len ({self.ppo_config.generate_config.max_seq_len})."
             )
+
+        external_gen_mask = None
 
         with torch.no_grad():
             if self.generation_service is not None:
-                completion_ids_list = self.generation_service(
-                    self.train_model, padded_prompt_ids, self.ppo_config.generate_config, 'ppo', None, None
+                service_output = self.generation_service(
+                    self.train_model, padded_prompt_ids, self.ppo_config.generate_config,
+                    'ppo', None, None
                 )
 
+                completion_ids_list = service_output['completions']
+                dones_list = service_output.get('dones', None)
+                gen_masks_list = service_output.get('generation_masks', None)
+
+                if gen_masks_list is not None:
+                    assert len(gen_masks_list) == len(completion_ids_list)
+
+                if dones_list is not None:
+                    dones = torch.tensor(dones_list, dtype=torch.bool, device=device)
+                else:
+                    dones = None
+
                 padded_completions = []
+                padded_gen_masks = []
                 max_comp_len = max((len(c) for c in completion_ids_list), default=0)
                 if max_comp_len == 0:
                     max_comp_len = 1
                 max_comp_len = min(max_comp_len, max_new_tokens)
 
-                for comp in completion_ids_list:
+                for idx, comp in enumerate(completion_ids_list):
                     comp = comp[:max_comp_len]
                     pad_len = max_comp_len - len(comp)
                     padded_completions.append(comp + [pad_token_id] * pad_len)
 
+                    if gen_masks_list is not None and idx < len(gen_masks_list):
+                        g_mask = gen_masks_list[idx][:max_comp_len]
+                        padded_gen_masks.append(g_mask + [False] * pad_len)
+
                 completion_ids = torch.tensor(padded_completions, dtype=torch.long, device=device)
+                if padded_gen_masks:
+                    external_gen_mask = torch.tensor(padded_gen_masks, dtype=torch.bool, device=device)
+
+                if dones is None:
+                    dones = torch.any(completion_ids == eos_token_id, dim=1)
+
                 full_ids = torch.cat([padded_prompt_ids, completion_ids], dim=1)
             else:
                 with unwrap_model_for_generation(self.train_model) as unwrapped_model:
@@ -447,7 +473,9 @@ class PPOTrainer(BaseTrainer):
                         auto_prefix_cache=self.ppo_config.generate_config.auto_prefix_cache
                     )
 
-            completion_ids = full_ids[:, prompt_len:]
+                completion_ids = full_ids[:, prompt_len:]
+                dones = torch.any(completion_ids == eos_token_id, dim=1)
+
             full_attention_mask = self._calc_attention_mask(full_ids)
             full_position_ids = calc_position_ids(full_attention_mask)
 
@@ -477,15 +505,20 @@ class PPOTrainer(BaseTrainer):
             ref_log_probs_completion = log_softmax(ref_logits_completion, completion_ids)
             del ref_outputs, ref_logits_full, ref_logits_completion
 
-            dones = torch.any(completion_ids == eos_token_id, dim=1)
             rewards = torch.zeros_like(completion_ids, dtype=torch.float32, device=device)
-            completion_mask = (completion_ids != pad_token_id)
+            completion_pad_mask = (completion_ids != pad_token_id)
+
+            if external_gen_mask is not None:
+                loss_mask = completion_pad_mask & external_gen_mask
+            else:
+                temp_ids = _mask_prompt(completion_ids.clone())
+                loss_mask = completion_pad_mask & (temp_ids != -100)
 
             if self.ppo_config.kl_beta > 0.0:
                 logr = ref_log_probs_completion.float() - old_log_probs.float()
                 kl = -logr if self.ppo_config.kl_estimator == "k1" else (logr.exp() - 1) - logr
                 kl_rewards = -self.ppo_config.kl_beta * kl
-                rewards += kl_rewards.to(rewards.dtype) * completion_mask
+                rewards += kl_rewards.to(rewards.dtype) * loss_mask
 
             env_rewards_tensor = torch.tensor(
                 self.reward_func(prompt_ids, completion_ids.cpu(), gt_answer_ids),
@@ -509,7 +542,13 @@ class PPOTrainer(BaseTrainer):
 
                     env_rewards_tensor = (env_rewards_tensor - raw_reward_mean) / batch_std
 
-            last_token_indices = completion_mask.sum(dim=1) - 1
+            gen_indices = torch.where(
+                loss_mask,
+                torch.arange(completion_ids.size(1), device=device).unsqueeze(0),
+                torch.tensor(-1, device=device)
+            )
+
+            last_token_indices = gen_indices.max(dim=1).values
             valid_indices_mask = last_token_indices >= 0
 
             if valid_indices_mask.any():
@@ -527,6 +566,8 @@ class PPOTrainer(BaseTrainer):
             'env_rewards': raw_reward_mean.detach(),
             'dones': dones.detach(),
             'ptx_data': ptx_data,
+            'loss_mask': loss_mask.detach(),
+            'completion_pad_mask': completion_pad_mask.detach(),
         }
 
     def _ppo_learning_phase(self, rollout_data: dict):
@@ -538,6 +579,9 @@ class PPOTrainer(BaseTrainer):
         dones: torch.Tensor = rollout_data['dones']
         ptx_data = rollout_data['ptx_data']
 
+        loss_mask = rollout_data['loss_mask']
+        completion_pad_mask = rollout_data['completion_pad_mask']
+
         prompt_len = prompt_ids.shape[1]
         batch_size = prompt_ids.shape[0]
 
@@ -545,18 +589,16 @@ class PPOTrainer(BaseTrainer):
         last_values = old_values[:, -1]
         assert values_for_gae.shape[1] == completion_ids.shape[1]
 
-        completion_mask: torch.Tensor = (completion_ids != TrainerTools().tokenizer.pad)
-
         if self.ppo_config.whiten_rewards:
-            rewards = masked_whiten(rewards, completion_mask, shift_mean=False)
-            rewards = torch.masked_fill(rewards, ~completion_mask, 0.0)
+            rewards = masked_whiten(rewards, loss_mask, shift_mean=False)
+            rewards = torch.masked_fill(rewards, ~loss_mask, 0.0)
 
         advantages, returns = self._compute_advantages_and_returns(
-            rewards, values_for_gae, last_values, completion_mask, dones
+            rewards, values_for_gae, last_values, completion_pad_mask, dones
         )
 
-        advantages_whitened = masked_whiten(advantages, completion_mask, shift_mean=True)
-        advantages_whitened = torch.masked_fill(advantages_whitened, ~completion_mask, 0.0)
+        advantages_whitened = masked_whiten(advantages, loss_mask, shift_mean=True)
+        advantages_whitened = torch.masked_fill(advantages_whitened, ~loss_mask, 0.0)
 
         input_ids = torch.cat((prompt_ids, completion_ids), dim=1)
         attention_mask = self._calc_attention_mask(input_ids)
@@ -581,7 +623,8 @@ class PPOTrainer(BaseTrainer):
                 mb_input_ids = input_ids[mini_batch_indices]
                 mb_attention_mask = attention_mask[mini_batch_indices]
                 mb_completion_ids = completion_ids[mini_batch_indices]
-                mb_completion_mask = completion_mask[mini_batch_indices]
+                mb_loss_mask = loss_mask[mini_batch_indices]
+                mb_completion_pad_mask = completion_pad_mask[mini_batch_indices]
                 mb_old_log_probs = old_log_probs[mini_batch_indices]
                 mb_values = values_for_gae[mini_batch_indices]
                 mb_returns = returns[mini_batch_indices]
@@ -607,14 +650,15 @@ class PPOTrainer(BaseTrainer):
                         old_values=mb_values,
                         returns=mb_returns,
                         advantages=mb_advantages,
-                        mask=mb_completion_mask
+                        mask=mb_loss_mask,
+                        value_mask=mb_completion_pad_mask
                     )
 
                     with torch.no_grad():
-                        value_mean = (mb_values * mb_completion_mask).sum() / mb_completion_mask.sum().clamp(min=1.0)
-                        return_mean = (mb_returns * mb_completion_mask).sum() / mb_completion_mask.sum().clamp(min=1.0)
+                        value_mean = (mb_values * mb_completion_pad_mask).sum() / mb_completion_pad_mask.sum().clamp(min=1.0)
+                        return_mean = (mb_returns * mb_completion_pad_mask).sum() / mb_completion_pad_mask.sum().clamp(min=1.0)
                         value_error = value_mean - return_mean
-                        completion_len = mb_completion_mask.sum(dim=-1).float().mean()
+                        completion_len = mb_loss_mask.sum(dim=-1).float().mean()
 
                     if policy_output['aux_loss'] is not None:
                         aux_loss = policy_output['aux_loss'].to(loss.dtype)

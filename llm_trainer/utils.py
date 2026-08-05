@@ -234,7 +234,7 @@ def repeat_image_tok(
     # tokens_per_image=3 -> <image>...xxxx -> <image><image><image>...xxx
     image_tok = TrainerTools().tokenizer.image
     mask = (tokens == image_tok)
-    if not mask.any():
+    if not mask.any() or tokens_per_image <= 1:
         return tokens, attention_mask
 
     # 计算每个位置的重复次数：默认为1，image token 位置为 tokens_per_image
@@ -602,7 +602,7 @@ def _selective_log_softmax(logits, index) -> torch.Tensor:
     return per_token_logps
 
 
-def _mask_prompt(labels):
+def _mask_prompt(sequences: torch.Tensor) -> torch.Tensor:
     """
     Mask 掉 Prompt 部分以及固定的模版标签，只保留模型需要生成的真正内容。
     策略：
@@ -625,57 +625,48 @@ def _mask_prompt(labels):
     assistant_id = tokenizer.assistant
     ignore_index = -100
 
-    for i in range(labels.shape[0]):
-        row = labels[i]
+    cpu_seqs = sequences.cpu().tolist()
+
+    for i in range(len(cpu_seqs)):
+        row = cpu_seqs[i]
         seq_len = len(row)
 
-        # 1. 找到所有 Prompt 开始 (system/user) 和结束 (end) 的位置
-        # 使用 view(-1) 确保是一维 Tensor
-        starts = torch.nonzero((row == system_id) | (row == user_id)).view(-1)
-        ends = torch.nonzero(row == end_id).view(-1)
+        starts = [idx for idx, val in enumerate(row) if val == system_id or val == user_id]
+        ends = [idx for idx, val in enumerate(row) if val == end_id]
 
-        if starts.numel() == 0:
+        if not starts:
             continue
 
-        # 2. 迭代处理每个 Prompt 区间
-        # 使用指针跳跃式处理，而不是逐个 token 扫描
         start_idx_ptr = 0
         while start_idx_ptr < len(starts):
-            # 获取当前 Prompt 的起始位置
-            s_pos = starts[start_idx_ptr].item()
+            s_pos = starts[start_idx_ptr]
+            e_pos = -1
 
-            # 在 ends 中查找第一个大于 s_pos 的结束符位置
-            # searchsorted 返回的是插入位置，保证顺序
-            e_idx = torch.searchsorted(ends, s_pos, right=True).item()
+            for e in ends:
+                if e > s_pos:
+                    e_pos = e
+                    break
 
-            if e_idx >= len(ends):
-                # 如果找不到结束符，说明句子被截断了 (Truncated)
-                # 按照原有逻辑，Mask 掉从 start 到最后的所有内容
-                row[s_pos:] = ignore_index
+            if e_pos == -1:
+                sequences[i, s_pos:] = ignore_index
                 break
 
-            e_pos = ends[e_idx].item()
             mask_end = e_pos
-
-            # 3. 检查 </s> 后面是否紧跟 <assistant>
-            # 如果是，Mask 范围需要延伸到 <assistant>
             if e_pos + 1 < seq_len and row[e_pos + 1] == assistant_id:
                 mask_end = e_pos + 1
 
-            # 4. 执行 Mask 操作 (利用切片赋值，速度极快)
-            row[s_pos: mask_end + 1] = ignore_index
+            sequences[i, s_pos: mask_end + 1] = ignore_index
+            next_s_idx = start_idx_ptr + 1
 
-            # 5. 寻找下一个 Prompt 开始位置
-            # 直接跳过当前 Mask 区域内的所有 start token (处理嵌套或连续 start 的情况)
-            next_s_idx = torch.searchsorted(starts, mask_end, right=True).item()
+            while next_s_idx < len(starts) and starts[next_s_idx] <= mask_end:
+                next_s_idx += 1
+
             start_idx_ptr = next_s_idx
 
-    return labels
+    return sequences
 
 
-def _zero_pad_sequences(
-    sequences: list[torch.Tensor], side: str = "left"
-) -> torch.Tensor:
+def _zero_pad_sequences(sequences: list[torch.Tensor], side: str = "left") -> torch.Tensor:
     assert side in ("left", "right")
     max_len = max(seq.size(0) for seq in sequences)
     padded_sequences = []

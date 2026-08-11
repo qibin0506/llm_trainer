@@ -219,7 +219,7 @@ class GRPOTrainer(BaseTrainer):
         # Compute mean and standard deviation for each prompt group
         # [batch]
         group_means = rewards_by_group.mean(dim=1)
-        group_stds = rewards_by_group.std(dim=1)
+        group_stds = torch.nan_to_num(rewards_by_group.std(dim=1, unbiased=False), nan=0.0)
 
         # Expand the means and stds to match the original flat rewards tensor shape
         # [batch*group_size]

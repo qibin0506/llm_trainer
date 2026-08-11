@@ -366,24 +366,81 @@ class PPOTrainer(BaseTrainer):
         advantages = torch.zeros_like(rewards)
         last_gae_lam = 0
         seq_len = rewards.size(1)
-
         values = values * completion_mask
 
         for t in reversed(range(seq_len)):
             if t == seq_len - 1:
                 next_values = torch.where(dones, 0.0, last_values)
+                next_non_terminal = torch.zeros_like(dones, dtype=torch.float)
             else:
-                next_values = values[:, t + 1]
-                is_truncated_end = (completion_mask[:, t] == 1) & (completion_mask[:, t + 1] == 0) & (~dones)
-                next_values = torch.where(is_truncated_end, last_values, next_values)
+                is_padding_next = (completion_mask[:, t + 1] == 0.0)
+                next_values_if_end = torch.where(dones, 0.0, last_values)
+                next_values = torch.where(is_padding_next, next_values_if_end, values[:, t + 1])
+                next_non_terminal = completion_mask[:, t + 1]
 
             delta = rewards[:, t] + gamma * next_values - values[:, t]
-            last_gae_lam = delta + gamma * lam * last_gae_lam * completion_mask[:, t]
+            last_gae_lam = delta + gamma * lam * last_gae_lam * next_non_terminal
             advantages[:, t] = last_gae_lam
 
         returns = advantages + values
-
         return advantages * completion_mask, returns * completion_mask
+
+    def _chunked_compute_log_probs_and_values(
+            self,
+            model,
+            input_ids,
+            attention_mask,
+            prompt_len,
+            completion_ids,
+            chunk_size
+    ):
+        all_log_probs = []
+        all_values = []
+        for i in range(0, input_ids.size(0), chunk_size):
+            chunk_input_ids = input_ids[i: i + chunk_size]
+            chunk_attention_mask = attention_mask[i: i + chunk_size]
+            chunk_completion_ids = completion_ids[i: i + chunk_size]
+            chunk_position_ids = calc_position_ids(chunk_attention_mask)
+
+            policy_output, value_output = model(
+                chunk_input_ids,
+                attention_mask=chunk_attention_mask,
+                position_ids=chunk_position_ids,
+                forward_type='both'
+            )
+
+            log_probs = log_softmax(policy_output['logits'][:, prompt_len - 1: -1], chunk_completion_ids)
+            all_log_probs.append(log_probs)
+            all_values.append(value_output[0])
+
+        return torch.cat(all_log_probs, dim=0), torch.cat(all_values, dim=0)
+
+    def _chunked_compute_ref_log_probs(
+            self,
+            model,
+            input_ids,
+            attention_mask,
+            prompt_len,
+            completion_ids,
+            chunk_size
+    ):
+        all_log_probs = []
+        for i in range(0, input_ids.size(0), chunk_size):
+            chunk_input_ids = input_ids[i: i + chunk_size]
+            chunk_attention_mask = attention_mask[i: i + chunk_size]
+            chunk_completion_ids = completion_ids[i: i + chunk_size]
+            chunk_position_ids = calc_position_ids(chunk_attention_mask)
+
+            outputs = model(
+                chunk_input_ids,
+                attention_mask=chunk_attention_mask,
+                position_ids=chunk_position_ids
+            )
+
+            log_probs = log_softmax(outputs['logits'][:, prompt_len - 1: -1], chunk_completion_ids)
+            all_log_probs.append(log_probs)
+
+        return torch.cat(all_log_probs, dim=0)
 
     def _generate_rollout_data(self, batch_data: List[dict]) -> dict:
         device = TrainerTools().parallel.device
@@ -477,33 +534,29 @@ class PPOTrainer(BaseTrainer):
                 dones = torch.any(completion_ids == eos_token_id, dim=1)
 
             full_attention_mask = self._calc_attention_mask(full_ids)
-            full_position_ids = calc_position_ids(full_attention_mask)
+            chunk_size = self.ppo_config.ppo_batch_size
 
             with autocast(TrainerTools().parallel.device_type):
-                policy_output, (value_output, _) = self.train_model(
+                old_log_probs, value_output = self._chunked_compute_log_probs_and_values(
+                    self.train_model,
                     full_ids,
-                    attention_mask=full_attention_mask,
-                    position_ids=full_position_ids,
-                    forward_type='both'
+                    full_attention_mask,
+                    prompt_len,
+                    completion_ids,
+                    chunk_size
                 )
 
-                logits_full = policy_output['logits']
-                logits_completion = logits_full[:, prompt_len - 1: -1]
-                old_log_probs = log_softmax(logits_completion, completion_ids)
-
-            del policy_output, logits_full, logits_completion
-
-            with autocast(TrainerTools().parallel.device_type):
-                ref_outputs = self.ref_model(
-                    full_ids,
-                    attention_mask=full_attention_mask,
-                    position_ids=full_position_ids
-                )
-                ref_logits_full = ref_outputs['logits']
-
-            ref_logits_completion = ref_logits_full[:, prompt_len - 1: -1]
-            ref_log_probs_completion = log_softmax(ref_logits_completion, completion_ids)
-            del ref_outputs, ref_logits_full, ref_logits_completion
+                if self.ref_model is not None:
+                    ref_log_probs_completion = self._chunked_compute_ref_log_probs(
+                        self.ref_model,
+                        full_ids,
+                        full_attention_mask,
+                        prompt_len,
+                        completion_ids,
+                        chunk_size
+                    )
+                else:
+                    ref_log_probs_completion = None
 
             rewards = torch.zeros_like(completion_ids, dtype=torch.float32, device=device)
             completion_pad_mask = (completion_ids != pad_token_id)

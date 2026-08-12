@@ -20,7 +20,7 @@
     * [5. 组相对策略优化 (GRPO Trainer & 前沿变体)](#5-组相对策略优化-grpo-trainer--前沿变体)
 7. [自定义生成服务 (Generation Services)](#-自定义生成服务-generation-services)
 8. [实用工具 (Tools & Utilities)](#-实用工具-tools--utilities)
-9. [附录：全量参数配置详解](#-实用工具-tools--utilities)
+9. [附录：全量参数配置详解](#-附录：全量参数配置详解)
 
 ---
 
@@ -482,11 +482,8 @@ policy_state_dict = extract_policy_weights_from_ppo(model_config, ppo_checkpoint
 ---
 
 
-# 📖 附录：`train_configs.py` 全量参数配置详解
+# 📖 附录：全量参数配置详解
 
-本附录详细列出了框架中 `train_configs.py` 定义的所有 Dataclass 配置项、数据类型、默认值及其具体含义。
-
----
 
 ## 1. 全局训练主配置 (`TrainConfig`)
 

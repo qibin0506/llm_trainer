@@ -1,0 +1,986 @@
+from typing import Tuple, List, Union, Optional
+import gc
+import torch
+import torch.distributed as dist
+from torch.utils.data import Dataset
+import torch.nn as nn
+from itertools import islice
+
+from llm_model import (
+    LlmModel,
+    VlmModel
+)
+
+from .base_trainer import BaseTrainer
+from .dataset import RLDataset
+from .loss import PPOLoss
+from .tools import TrainerTools
+from .generate_utils import batch_generate
+from .partition_utils import unwrap_model_for_generation
+from .log import Logger
+from .loss import LMLoss
+from .train_configs import (
+    TrainConfig,
+    RewardFun,
+    GenerationService,
+    PtxBuilder
+)
+from .utils import (
+    autocast,
+    left_pad_sequence,
+    get_sft_collate_fn,
+    log_softmax,
+    masked_whiten,
+    disable_dropout_in_model,
+    calc_position_ids,
+    RunningMeanStd,
+    empty_cache,
+    _mask_prompt
+)
+from .checkpoint import (
+    save_checkpoint,
+    save_steps,
+    load_checkpoint
+)
+from .scheduler import (
+    LRScheduler,
+    WarmupCosineAnnealingLRScheduler,
+    CompositeLRScheduler,
+    NoneLRScheduler
+)
+
+
+class ValueModel(nn.Module):
+    def __init__(self, base_model: Union[LlmModel, VlmModel]):
+        super().__init__()
+        self.base_model = base_model
+        self.value_head = nn.Linear(base_model.config.hidden_size, 1, bias=True)
+        self.value_head.weight.data.normal_(mean=0.0, std=0.01)
+        self.value_head.bias.data.zero_()
+
+    def forward(self, *args, **kwargs) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        outputs = self.base_model(*args, **kwargs)
+        # [batch_size, seq_len, hidden_size]
+        last_hidden_state = outputs['hidden_states']
+        # [batch_size, seq_len, 1]
+        values = self.value_head(last_hidden_state)
+        # [batch_size, seq_len]
+        return values.squeeze(-1), outputs['aux_loss']
+
+
+class PolicyAndValueModelWrapper(nn.Module):
+    def __init__(self, policy_model: nn.Module, value_model: nn.Module):
+        super().__init__()
+        self.policy_model = policy_model
+        self.value_model = value_model
+
+    def forward(self, *args, forward_type='both', **kwargs):
+        if forward_type == 'policy':
+            return self.policy_model(*args, **kwargs), None
+
+        if forward_type == 'value':
+            return None, self.value_model(*args, **kwargs)
+
+        return self.policy_model(*args, **kwargs), self.value_model(*args, **kwargs)
+
+
+class PPOTrainer(BaseTrainer):
+    """
+    PPOTrainer
+
+    Args:
+        train_config:
+            - 全局训练配置，必须包含 ppo_config。
+
+        reward_func:
+            - 奖励函数，支持返回 1D 标量 (List[float]) 或 2D 逐 Token 稠密序列 (List[List[float]])。
+
+        generation_service:
+            - 外部自定义生成服务接口
+
+        ptx_builder:
+            - 构建预训练混合数据 (PTX Data Mixture) 的回调函数。
+
+        eval_prompts:
+            - 评估测试的提示词列表。
+            - [num_eval_prompts] 长度的字符串列表。
+    """
+    def __init__(
+            self,
+            *,
+            train_config: TrainConfig,
+            reward_func: RewardFun,
+            generation_service: Optional[GenerationService] = None,
+            ptx_builder: Optional[PtxBuilder] = None,
+            eval_prompts: List[str]
+    ):
+        self.ppo_config = train_config.ppo_config
+        self.reward_normalizer = None
+        if self.ppo_config.normalize_rewards:
+            if self.ppo_config.normalize_method == 'RunningMeanStd':
+                self.reward_normalizer = RunningMeanStd(shape=()).to(TrainerTools().parallel.device)
+
+            if self.ppo_config.whiten_rewards:
+                self.ppo_config.whiten_rewards = False
+                if TrainerTools().parallel.is_main_process:
+                    Logger.std_log('WARN: ppo_config.normalize_rewards is enabled, ppo_config.whiten_rewards must be disabled.')
+
+        super().__init__(
+            train_config=train_config,
+            eval_prompts=eval_prompts,
+            generation_service=generation_service,
+            gradient_accumulation_steps=self.ppo_config.gradient_accumulation_steps
+        )
+
+        ppo_batch_size = self.ppo_config.ppo_batch_size
+        assert train_config.batch_size % (ppo_batch_size * self.gradient_accumulation_steps) == 0,\
+            'batch_size % (ppo_batch_size * gradient_accumulation_steps) must be zero!'
+
+        self.reward_func = reward_func
+        self.ptx_builder = ptx_builder
+        self.ref_model = self._init_ref_model()
+        self.criterion, self.ptx_criterion = self._init_loss()
+
+    def _init_train_model_and_optim(self, initial_lr: float):
+        with self._new_model_context(self.parallel_kwargs):
+            policy_model = self._new_model(self.train_config)
+            value_model = ValueModel(self._new_model(self.train_config))
+
+        if self.train_config.gradient_checkpointing:
+            if self.is_ds:
+                import deepspeed
+                policy_model.gradient_checkpointing_enable(checkpoint_func=deepspeed.checkpointing.checkpoint)
+                value_model.base_model.gradient_checkpointing_enable(checkpoint_func=deepspeed.checkpointing.checkpoint)
+            else:
+                policy_model.gradient_checkpointing_enable()
+                value_model.base_model.gradient_checkpointing_enable()
+
+        train_model = PolicyAndValueModelWrapper(policy_model, value_model)
+
+        if TrainerTools().parallel.is_main_process:
+            for name, model in zip(['policy', 'value'], [policy_model, value_model]):
+                total_params = sum(getattr(p, 'ds_numel', p.numel()) for p in model.parameters())
+                Logger.std_log(f"Total number of parameters: {total_params:,}")
+
+                trainable_params = sum(getattr(p, 'ds_numel', p.numel()) for p in model.parameters() if p.requires_grad)
+                Logger.std_log(f"Trainable number of parameters: {trainable_params:,}")
+
+                total_size_bytes = total_params * 4
+                total_size_mb = total_size_bytes / (1024 * 1024)
+                Logger.std_log(f"Total size of the model: {total_size_mb:.2f} MB")
+
+        if self.train_config.init_weights_path is not None:
+            self._load_external_weights(
+                train_model,
+                self.train_config.init_weights_path,
+                prefixes=['policy_model.', 'value_model.base_model.']
+            )
+
+        if self.ppo_config.value_model_weights_path is not None:
+            self._load_external_weights(
+                train_model,
+                self.ppo_config.value_model_weights_path,
+                prefixes=['value_model.']
+            )
+
+        model, optim = TrainerTools().parallel.process(
+            model=train_model,
+            optimizer=self._config_optim(train_model, initial_lr),
+            kwargs=self.parallel_kwargs
+        )
+
+        return model, optim
+
+    def _config_optim(self, model, initial_lr):
+        optim_type = self.train_config.optim_config.optim_type
+        optimizer_cls = self._get_optim_cls()
+
+        policy_config = self.train_config.optim_config
+        value_config = self.ppo_config.value_optim_config if self.ppo_config.value_optim_config else policy_config
+
+        no_decay_name_list = ["bias", "norm.weight"]
+
+        def get_param_groups(module, config, name_prefix):
+            current_betas = config.betas
+            current_weight_decay = config.weight_decay
+
+            if current_betas is None:
+                current_betas = (0.95, 0.98) if optim_type == 'lion' else (0.9, 0.999)
+
+            if current_weight_decay is None:
+                current_weight_decay = 0.015 if optim_type == 'lion' else 0.01
+
+            decay_params = []
+            no_decay_params = []
+
+            for name, param in module.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if any(nd in name for nd in no_decay_name_list):
+                    no_decay_params.append(param)
+                else:
+                    decay_params.append(param)
+
+            return [
+                {
+                    "params": decay_params,
+                    "weight_decay": current_weight_decay,
+                    "lr": config.initial_lr,
+                    "betas": current_betas,
+                    "name": f"{name_prefix}_decay"
+                },
+                {
+                    "params": no_decay_params,
+                    "weight_decay": 0.0,
+                    "lr": config.initial_lr,
+                    "betas": current_betas,
+                    "name": f"{name_prefix}_no_decay"
+                }
+            ]
+
+        optimizer_grouped_parameters = []
+        optimizer_grouped_parameters.extend(get_param_groups(model.policy_model, policy_config, "policy"))
+        optimizer_grouped_parameters.extend(get_param_groups(model.value_model, value_config, "value"))
+
+        default_betas = policy_config.betas if policy_config.betas else ((0.95, 0.98) if optim_type == 'lion' else (0.9, 0.999))
+        default_weight_decay = policy_config.weight_decay if policy_config.weight_decay else (0.015 if optim_type == 'lion' else 0.01)
+
+        return optimizer_cls(
+            optimizer_grouped_parameters,
+            lr=policy_config.initial_lr,
+            betas=default_betas,
+            weight_decay=default_weight_decay
+        )
+
+    def _init_lr_scheduler(self, initial_lr: float, optimizer) -> LRScheduler:
+        policy_config = self.train_config.optim_config
+        value_config = self.ppo_config.value_optim_config
+
+        schedulers = []
+
+        def create_scheduler(config, group_indices, need_log):
+            real_initial_lr = initial_lr if config is None else config.initial_lr
+            if config is not None and config.enable_lr_scheduler:
+                warmup_iters = config.warmup_iters
+                min_lr = config.min_lr
+                max_lr = config.max_lr
+                cosine_annealing_period = config.cosine_annealing_period
+                cosine_annealing_period_mul = config.cosine_annealing_period_mul
+
+                return WarmupCosineAnnealingLRScheduler(
+                    optimizer=optimizer,
+                    warmup_iters=warmup_iters,
+                    initial_lr=real_initial_lr,
+                    min_lr=min_lr,
+                    max_lr=max_lr,
+                    cosine_annealing_period=cosine_annealing_period,
+                    cosine_annealing_period_mul=cosine_annealing_period_mul,
+                    param_group_indices=group_indices,
+                    need_log=TrainerTools().parallel.is_main_process and need_log
+                )
+            else:
+                return NoneLRScheduler(real_initial_lr)
+
+        schedulers.append(create_scheduler(policy_config, [0, 1], True))
+        schedulers.append(create_scheduler(value_config, [2, 3], False))
+
+        return CompositeLRScheduler(schedulers)
+
+    def _init_ref_model(self):
+        parallel_kwargs = self._init_ref_model_args(self.train_config.model_config)
+        with self._new_model_context(parallel_kwargs):
+            ref_model = self._new_model(self.train_config)
+
+        ref_model.eval()
+        for param in ref_model.parameters():
+            param.requires_grad = False
+
+        if self.ppo_config.ref_model_weights_path is not None:
+            self._load_external_weights(ref_model, self.ppo_config.ref_model_weights_path)
+
+        ref_model, _ = TrainerTools().parallel.process(
+            model=ref_model,
+            optimizer=None,
+            kwargs=parallel_kwargs,
+            save_instance=False
+        )
+
+        return ref_model
+
+    def _new_model(self, train_config: TrainConfig):
+        model = super()._new_model(train_config)
+        disable_dropout_in_model(model)
+        return model
+
+    def _init_loss(self):
+        ppo_criterion = PPOLoss(
+            clip_eps=self.ppo_config.clip_eps,
+            vf_coef=self.ppo_config.vf_coef
+        )
+
+        ptx_criterion = None
+        if self.ppo_config.ptx_coef > 0.0:
+            assert self.ptx_builder is not None
+            ptx_criterion = LMLoss()
+
+        return ppo_criterion, ptx_criterion
+
+    def _load_train_model_checkpoint(self):
+        load_checkpoint(
+            self.train_model,
+            optimizer=self.optimizer,
+            device=TrainerTools().parallel.device,
+            extra_module=self.reward_normalizer
+        )
+
+    def _convert_train_args(self) -> Tuple[dict, dict, dict]:
+        parallel_kwargs, data_loader_kwargs, sampler_kwargs = super()._convert_train_args()
+
+        if parallel_kwargs:
+            parallel_kwargs['train_micro_batch_size_per_gpu'] = self.ppo_config.ppo_batch_size
+
+        data_loader_kwargs.update({"collate_fn": lambda x: x})
+        return parallel_kwargs, data_loader_kwargs, sampler_kwargs
+
+    def _create_dataset(self, file_idx) -> Tuple[Dataset, str]:
+        file_path = self.train_config.file_dataset[file_idx]
+        return RLDataset(file_path), file_path
+
+    def _check_eval_model(self, eval_model):
+        return eval_model.policy_model
+
+    def _compute_advantages_and_returns(
+            self,
+            rewards: torch.Tensor,
+            values: torch.Tensor,
+            last_values: torch.Tensor,
+            completion_mask: torch.Tensor,
+            dones: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        rewards = rewards.float()
+        values = values.float()
+        last_values = last_values.float()
+        completion_mask = completion_mask.float()
+
+        gamma, lam = self.ppo_config.gamma, self.ppo_config.lam
+        advantages = torch.zeros_like(rewards)
+        last_gae_lam = 0
+        seq_len = rewards.size(1)
+        values = values * completion_mask
+
+        for t in reversed(range(seq_len)):
+            if t == seq_len - 1:
+                # 序列最末尾 step：若 dones=True 则置 0.0，否则使用修正后的 last_values
+                next_values = torch.where(dones, 0.0, last_values)
+                next_non_terminal = torch.zeros_like(dones, dtype=torch.float)
+            else:
+                # 判断下一个 token 是否已经是 padding
+                is_padding_next = (completion_mask[:, t + 1] == 0.0)
+                # 如果下一 token 是 pad，说明当前 t 就是该样本的最后有效 token
+                next_values_if_end = torch.where(dones, 0.0, last_values)
+                next_values = torch.where(is_padding_next, next_values_if_end, values[:, t + 1])
+                next_non_terminal = completion_mask[:, t + 1]
+
+            delta = rewards[:, t] + gamma * next_values - values[:, t]
+            last_gae_lam = delta + gamma * lam * last_gae_lam * next_non_terminal
+            advantages[:, t] = last_gae_lam
+
+        returns = advantages + values
+        return advantages * completion_mask, returns * completion_mask
+
+    def _chunked_compute_log_probs_and_values(
+            self,
+            model,
+            input_ids,
+            attention_mask,
+            prompt_len,
+            completion_ids,
+            chunk_size
+    ):
+        all_log_probs = []
+        all_values = []
+        for i in range(0, input_ids.size(0), chunk_size):
+            chunk_input_ids = input_ids[i: i + chunk_size]
+            chunk_attention_mask = attention_mask[i: i + chunk_size]
+            chunk_completion_ids = completion_ids[i: i + chunk_size]
+            chunk_position_ids = calc_position_ids(chunk_attention_mask)
+
+            policy_output, value_output = model(
+                chunk_input_ids,
+                attention_mask=chunk_attention_mask,
+                position_ids=chunk_position_ids,
+                forward_type='both'
+            )
+
+            log_probs = log_softmax(policy_output['logits'][:, prompt_len - 1: -1], chunk_completion_ids)
+            all_log_probs.append(log_probs)
+            all_values.append(value_output[0])
+
+        return torch.cat(all_log_probs, dim=0), torch.cat(all_values, dim=0)
+
+    def _chunked_compute_ref_log_probs(
+            self,
+            model,
+            input_ids,
+            attention_mask,
+            prompt_len,
+            completion_ids,
+            chunk_size
+    ):
+        all_log_probs = []
+        for i in range(0, input_ids.size(0), chunk_size):
+            chunk_input_ids = input_ids[i: i + chunk_size]
+            chunk_attention_mask = attention_mask[i: i + chunk_size]
+            chunk_completion_ids = completion_ids[i: i + chunk_size]
+            chunk_position_ids = calc_position_ids(chunk_attention_mask)
+
+            outputs = model(
+                chunk_input_ids,
+                attention_mask=chunk_attention_mask,
+                position_ids=chunk_position_ids
+            )
+
+            log_probs = log_softmax(outputs['logits'][:, prompt_len - 1: -1], chunk_completion_ids)
+            all_log_probs.append(log_probs)
+
+        return torch.cat(all_log_probs, dim=0)
+
+    def _generate_rollout_data(self, batch_data: List[dict]) -> dict:
+        device = TrainerTools().parallel.device
+        pad_token_id = TrainerTools().tokenizer.pad
+        eos_token_id = TrainerTools().tokenizer.end
+
+        prompt_ids = [item["prompt"] for item in batch_data]
+        gt_answer_ids = [item["answer"] for item in batch_data]
+
+        if self.ppo_config.ptx_coef > 0.0 and self.ptx_builder is not None:
+            ptx_data = self.ptx_builder(prompt_ids, gt_answer_ids)
+            ptx_data = [{'inputs': t} if t is not None else None for t in ptx_data]
+        else:
+            ptx_data = []
+
+        padded_prompt_ids = left_pad_sequence(prompt_ids, padding_value=pad_token_id)
+        padded_prompt_ids = padded_prompt_ids.to(device)
+        prompt_masks = self._calc_attention_mask(padded_prompt_ids)
+        prompt_len = padded_prompt_ids.shape[1]
+
+        max_new_tokens = self.ppo_config.generate_config.max_seq_len - prompt_len
+        if max_new_tokens <= 0:
+            raise ValueError(
+                f"Prompt length ({prompt_len}) >= max_seq_len ({self.ppo_config.generate_config.max_seq_len})."
+            )
+
+        external_gen_mask = None
+
+        with torch.no_grad():
+            if self.generation_service is not None:
+                service_output = self.generation_service(
+                    self.train_model, padded_prompt_ids, self.ppo_config.generate_config,
+                    'ppo', None, None
+                )
+
+                completion_ids_list = service_output['completions']
+                dones_list = service_output.get('dones', None)
+                gen_masks_list = service_output.get('generation_masks', None)
+
+                if gen_masks_list is not None:
+                    assert len(gen_masks_list) == len(completion_ids_list)
+
+                if dones_list is not None:
+                    dones = torch.tensor(dones_list, dtype=torch.bool, device=device)
+                else:
+                    dones = None
+
+                padded_completions = []
+                padded_gen_masks = []
+                max_comp_len = max((len(c) for c in completion_ids_list), default=0)
+                if max_comp_len == 0:
+                    max_comp_len = 1
+                max_comp_len = min(max_comp_len, max_new_tokens)
+
+                for idx, comp in enumerate(completion_ids_list):
+                    comp = comp[:max_comp_len]
+                    pad_len = max_comp_len - len(comp)
+                    padded_completions.append(comp + [pad_token_id] * pad_len)
+
+                    if gen_masks_list is not None and idx < len(gen_masks_list):
+                        g_mask = gen_masks_list[idx][:max_comp_len]
+                        padded_gen_masks.append(g_mask + [False] * pad_len)
+
+                completion_ids = torch.tensor(padded_completions, dtype=torch.long, device=device)
+                if padded_gen_masks:
+                    external_gen_mask = torch.tensor(padded_gen_masks, dtype=torch.bool, device=device)
+
+                if dones is None:
+                    dones = torch.any(completion_ids == eos_token_id, dim=1)
+
+                full_ids = torch.cat([padded_prompt_ids, completion_ids], dim=1)
+            else:
+                with unwrap_model_for_generation(self.train_model) as unwrapped_model:
+                    full_ids, _ = batch_generate(
+                        model=unwrapped_model.policy_model,
+                        tokens=padded_prompt_ids,
+                        attention_mask=prompt_masks,
+                        max_new_tokens=max_new_tokens,
+                        temperature=self.ppo_config.generate_config.temperature,
+                        top_k=self.ppo_config.generate_config.top_k,
+                        top_p=self.ppo_config.generate_config.top_p,
+                        repetition_penalty=self.ppo_config.generate_config.repetition_penalty,
+                        exclude_penalty_tokens=self.ppo_config.generate_config.exclude_penalty_tokens,
+                        suppress_tokens=self.ppo_config.generate_config.suppress_tokens,
+                        device=device,
+                        return_logits=False,
+                        auto_prefix_cache=self.ppo_config.generate_config.auto_prefix_cache
+                    )
+
+                completion_ids = full_ids[:, prompt_len:]
+                dones = torch.any(completion_ids == eos_token_id, dim=1)
+
+            full_attention_mask = self._calc_attention_mask(full_ids)
+            chunk_size = self.ppo_config.ppo_batch_size
+
+            with autocast(TrainerTools().parallel.device_type):
+                old_log_probs, value_output = self._chunked_compute_log_probs_and_values(
+                    self.train_model,
+                    full_ids,
+                    full_attention_mask,
+                    prompt_len,
+                    completion_ids,
+                    chunk_size
+                )
+
+                if self.ref_model is not None:
+                    ref_log_probs_completion = self._chunked_compute_ref_log_probs(
+                        self.ref_model,
+                        full_ids,
+                        full_attention_mask,
+                        prompt_len,
+                        completion_ids,
+                        chunk_size
+                    )
+                else:
+                    ref_log_probs_completion = None
+
+            rewards = torch.zeros_like(completion_ids, dtype=torch.float32, device=device)
+            completion_pad_mask = (completion_ids != pad_token_id)
+
+            if external_gen_mask is not None:
+                loss_mask = completion_pad_mask & external_gen_mask
+            else:
+                temp_ids = _mask_prompt(completion_ids.clone())
+                loss_mask = completion_pad_mask & (temp_ids != -100)
+
+            if self.ppo_config.kl_beta > 0.0 and ref_log_probs_completion is not None:
+                logr = ref_log_probs_completion.float() - old_log_probs.float()
+                kl = -logr if self.ppo_config.kl_estimator == "k1" else (logr.exp() - 1) - logr
+                kl_rewards = -self.ppo_config.kl_beta * kl
+                rewards += kl_rewards.to(rewards.dtype) * loss_mask
+
+            raw_env_rewards = self.reward_func(prompt_ids, completion_ids.cpu(), gt_answer_ids)
+            if isinstance(raw_env_rewards, torch.Tensor):
+                env_rewards_tensor = raw_env_rewards.to(device=device, dtype=torch.float32)
+            else:
+                env_rewards_tensor = torch.tensor(raw_env_rewards, device=device, dtype=torch.float32)
+
+            if env_rewards_tensor.dim() == 2:
+                # 2D 逐 Token / 分步稠密序列奖励 [batch_size, seq_len]
+                assert env_rewards_tensor.shape == completion_ids.shape, (
+                    f"2D dense reward shape {env_rewards_tensor.shape} must match completion_ids shape {completion_ids.shape}"
+                )
+
+                if self.ppo_config.missing_eos_penalty is not None:
+                    gen_indices = torch.where(
+                        loss_mask,
+                        torch.arange(completion_ids.size(1), device=device).unsqueeze(0),
+                        torch.tensor(-1, device=device)
+                    )
+                    last_token_indices = gen_indices.max(dim=1).values
+                    missing_eos_mask = ~dones & (last_token_indices >= 0)
+                    if missing_eos_mask.any():
+                        m_batch = torch.arange(padded_prompt_ids.size(0), device=device)[missing_eos_mask]
+                        m_last = last_token_indices[missing_eos_mask]
+                        env_rewards_tensor[m_batch, m_last] -= self.ppo_config.missing_eos_penalty
+
+                # 屏蔽非生成 / Padding 位置的噪声，精确注入到各 Token
+                env_rewards_masked = env_rewards_tensor * loss_mask.float()
+                raw_reward_mean = env_rewards_masked.sum(dim=1).mean()
+
+                if self.ppo_config.normalize_rewards:
+                    if self.reward_normalizer:
+                        # 仅提取 valid token 的 reward 更新 RunningMeanStd
+                        valid_rewards = env_rewards_masked[loss_mask]
+                        self.reward_normalizer.update(valid_rewards)
+                        env_rewards_masked = self.reward_normalizer(env_rewards_masked, shift_mean=False) * loss_mask.float()
+                    else:
+                        valid_rewards = env_rewards_masked[loss_mask]
+                        if valid_rewards.numel() > 1:
+                            batch_std = valid_rewards.std()
+                            if not torch.isnan(batch_std) and batch_std > 1e-8:
+                                env_rewards_masked = (env_rewards_masked / batch_std) * loss_mask.float()
+
+                rewards += env_rewards_masked
+
+            elif env_rewards_tensor.dim() == 1:
+                # 1D 轨迹级标量奖励 [batch_size]
+                if self.ppo_config.missing_eos_penalty is not None:
+                    env_rewards_tensor[~dones] -= self.ppo_config.missing_eos_penalty
+
+                raw_reward_mean = env_rewards_tensor.mean()
+
+                if self.ppo_config.normalize_rewards:
+                    if self.reward_normalizer:
+                        self.reward_normalizer.update(env_rewards_tensor)
+                        env_rewards_tensor = self.reward_normalizer(env_rewards_tensor)
+                    else:
+                        batch_std = env_rewards_tensor.std()
+                        if torch.isnan(batch_std) or batch_std < 1e-8:
+                            batch_std = 1.0
+                        env_rewards_tensor = (env_rewards_tensor - raw_reward_mean) / batch_std
+
+                gen_indices = torch.where(
+                    loss_mask,
+                    torch.arange(completion_ids.size(1), device=device).unsqueeze(0),
+                    torch.tensor(-1, device=device)
+                )
+
+                last_token_indices = gen_indices.max(dim=1).values
+                valid_indices_mask = last_token_indices >= 0
+
+                if valid_indices_mask.any():
+                    valid_batch_indices = torch.arange(padded_prompt_ids.size(0), device=device)[valid_indices_mask]
+                    valid_last_token_indices = last_token_indices[valid_indices_mask]
+                    valid_env_rewards = env_rewards_tensor[valid_indices_mask]
+                    rewards[valid_batch_indices, valid_last_token_indices] += valid_env_rewards
+            else:
+                raise ValueError(f"Unsupported reward dimension: {env_rewards_tensor.dim()}, expected 1 or 2.")
+
+        return {
+            'prompt_ids': padded_prompt_ids.detach(),
+            'completion_ids': completion_ids.detach(),
+            'old_log_probs': old_log_probs.detach(),
+            'values': value_output.detach(),
+            'rewards': rewards.detach(),
+            'env_rewards': raw_reward_mean.detach(),
+            'dones': dones.detach(),
+            'ptx_data': ptx_data,
+            'loss_mask': loss_mask.detach(),
+            'completion_pad_mask': completion_pad_mask.detach(),
+        }
+
+    def _ppo_learning_phase(self, rollout_data: dict):
+        prompt_ids: torch.Tensor = rollout_data['prompt_ids']
+        completion_ids: torch.Tensor = rollout_data['completion_ids']
+        old_log_probs: torch.Tensor = rollout_data['old_log_probs']
+        old_values: torch.Tensor = rollout_data['values']
+        rewards: torch.Tensor = rollout_data['rewards']
+        dones: torch.Tensor = rollout_data['dones']
+        ptx_data = rollout_data['ptx_data']
+
+        loss_mask = rollout_data['loss_mask']
+        completion_pad_mask = rollout_data['completion_pad_mask']
+
+        prompt_len = prompt_ids.shape[1]
+        batch_size = prompt_ids.shape[0]
+
+        values_for_gae = old_values[:, prompt_len - 1: -1]
+        assert values_for_gae.shape[1] == completion_ids.shape[1]
+
+        # completion_pad_mask 统计每行有效 token 数量 K (范围 1 ~ max_comp_len)
+        valid_lengths = completion_pad_mask.sum(dim=-1).clamp(min=1)  # [batch_size]
+        last_token_pos_in_full = prompt_len + valid_lengths - 1  # [batch_size]
+
+        # 提取有效末尾位置对应的 Value，作为真实的未终止状态截断引导值
+        batch_indices = torch.arange(batch_size, device=prompt_ids.device)
+        last_values = old_values[batch_indices, last_token_pos_in_full]  # [batch_size]
+
+        if self.ppo_config.whiten_rewards:
+            rewards = masked_whiten(rewards, loss_mask, shift_mean=False)
+            rewards = torch.masked_fill(rewards, ~loss_mask, 0.0)
+
+        advantages, returns = self._compute_advantages_and_returns(
+            rewards, values_for_gae, last_values, completion_pad_mask, dones
+        )
+
+        advantages_whitened = masked_whiten(advantages, loss_mask, shift_mean=True)
+        advantages_whitened = torch.masked_fill(advantages_whitened, ~loss_mask, 0.0)
+
+        input_ids = torch.cat((prompt_ids, completion_ids), dim=1)
+        attention_mask = self._calc_attention_mask(input_ids)
+
+        ppo_stats = {
+            "loss": 0.0, "moe_aux_loss": 0.0, "actor_loss": 0.0,
+            "value_loss": 0.0, 'ptx_loss': 0.0, 'ptx_aux_loss': 0.0,
+            "approx_kl": 0.0, "clip_frac": 0.0, "entropy": 0.0,
+            "completion_len": 0.0, "value_mean": 0.0, "return_mean": 0.0, "value_error": 0.0
+        }
+
+        ppo_batch_size = self.ppo_config.ppo_batch_size
+        total_micro_batches_processed = 0
+        has_ptx = self.ptx_criterion is not None and len(ptx_data) > 0
+
+        for ppo_epoch in range(self.ppo_config.ppo_epochs):
+            indices = torch.randperm(batch_size, device=TrainerTools().parallel.device)
+
+            for i in range(0, batch_size, ppo_batch_size):
+                mini_batch_indices = indices[i:i + ppo_batch_size]
+
+                mb_input_ids = input_ids[mini_batch_indices]
+                mb_attention_mask = attention_mask[mini_batch_indices]
+                mb_completion_ids = completion_ids[mini_batch_indices]
+                mb_loss_mask = loss_mask[mini_batch_indices]
+                mb_completion_pad_mask = completion_pad_mask[mini_batch_indices]
+                mb_old_log_probs = old_log_probs[mini_batch_indices]
+                mb_values = values_for_gae[mini_batch_indices]
+                mb_returns = returns[mini_batch_indices]
+                mb_advantages = advantages_whitened[mini_batch_indices]
+                mb_position_ids = calc_position_ids(mb_attention_mask)
+
+                with autocast(TrainerTools().parallel.device_type):
+                    policy_output, value_output = self.train_model(
+                        mb_input_ids,
+                        attention_mask=mb_attention_mask,
+                        position_ids=mb_position_ids
+                    )
+
+                    logits_completion = policy_output['logits'][:, prompt_len - 1: -1]
+                    current_log_probs = log_softmax(logits_completion, mb_completion_ids)
+                    current_values = value_output[0][:, prompt_len - 1: -1]
+                    value_aux_loss = value_output[1]
+
+                    loss, actor_loss, value_loss, approx_kl, clip_frac, entropy = self.criterion(
+                        log_probs=current_log_probs,
+                        old_log_probs=mb_old_log_probs,
+                        values=current_values,
+                        old_values=mb_values,
+                        returns=mb_returns,
+                        advantages=mb_advantages,
+                        mask=mb_loss_mask,
+                        value_mask=mb_completion_pad_mask
+                    )
+
+                    with torch.no_grad():
+                        value_mean = (mb_values * mb_completion_pad_mask).sum() / mb_completion_pad_mask.sum().clamp(min=1.0)
+                        return_mean = (mb_returns * mb_completion_pad_mask).sum() / mb_completion_pad_mask.sum().clamp(min=1.0)
+                        value_error = value_mean - return_mean
+                        completion_len = mb_loss_mask.sum(dim=-1).float().mean()
+
+                    if policy_output['aux_loss'] is not None:
+                        aux_loss = policy_output['aux_loss'].to(loss.dtype)
+                    else:
+                        aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
+
+                    if value_aux_loss is not None:
+                        aux_loss += value_aux_loss.to(loss.dtype)
+
+                    # ptx
+                    ptx_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
+                    ptx_aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
+                    if has_ptx:
+                        mb_ptx_data = [ptx_data[idx] for idx in mini_batch_indices if ptx_data[idx] is not None]
+                        if len(mb_ptx_data) > 0:
+                            pxt_collate_fn = get_sft_collate_fn(mask_prompt=True)
+                            px_fn_result = pxt_collate_fn(mb_ptx_data)
+                            mb_ptx_inputs = px_fn_result['inputs'].to(TrainerTools().parallel.device)
+                            mb_ptx_labels = px_fn_result['labels'].to(TrainerTools().parallel.device)
+
+                            mb_ptx_attention_mask = self._calc_attention_mask(mb_ptx_inputs)
+                            ptx_policy_output, _ = self.train_model(
+                                mb_ptx_inputs,
+                                forward_type='policy',
+                                attention_mask=mb_ptx_attention_mask,
+                            )
+                            ptx_logits = ptx_policy_output['logits']
+                            ptx_loss = self.ptx_criterion(ptx_logits, mb_ptx_labels)
+
+                            if ptx_policy_output['aux_loss'] is not None:
+                                ptx_aux_loss = ptx_policy_output['aux_loss'].to(ptx_loss.dtype)
+                    # end
+                ppo_loss_unscaled = loss + aux_loss
+                ptx_loss_unscaled = self.ppo_config.ptx_coef * ptx_loss + ptx_aux_loss
+
+                if self.is_ds:
+                    need_update_step = self.train_model.is_gradient_accumulation_boundary()
+                else:
+                    micro_batch_idx = i // ppo_batch_size
+                    need_update_step = ((micro_batch_idx + 1) % self.gradient_accumulation_steps == 0)
+
+                if has_ptx:
+                    self._backward_loss(ppo_loss_unscaled, self.gradient_accumulation_steps, step=False)
+                    self._backward_loss(ptx_loss_unscaled, self.gradient_accumulation_steps, step=True)
+                else:
+                    self._backward_loss(ppo_loss_unscaled, self.gradient_accumulation_steps)
+
+                ppo_stats["loss"] += (ppo_loss_unscaled + ptx_loss_unscaled).detach().item()
+                ppo_stats["moe_aux_loss"] += aux_loss.detach().item()
+                ppo_stats["actor_loss"] += actor_loss.detach().item()
+                ppo_stats["value_loss"] += value_loss.detach().item()
+                ppo_stats["ptx_loss"] += ptx_loss.detach().item()
+                ppo_stats["ptx_aux_loss"] += ptx_aux_loss.detach().item()
+                ppo_stats["approx_kl"] += approx_kl.detach().item()
+                ppo_stats["clip_frac"] += clip_frac.detach().item()
+                ppo_stats["entropy"] += entropy.detach().item()
+                ppo_stats["completion_len"] += completion_len.detach().item()
+                ppo_stats["value_mean"] += value_mean.detach().item()
+                ppo_stats["return_mean"] += return_mean.detach().item()
+                ppo_stats["value_error"] += value_error.detach().item()
+                total_micro_batches_processed += 1
+
+                if need_update_step:
+                    self._update_step()
+
+        if total_micro_batches_processed > 0:
+            for key in ppo_stats:
+                ppo_stats[key] /= total_micro_batches_processed
+
+        return ppo_stats
+
+    def train(self):
+        global_steps_since_last_save = 0
+        global_steps_since_last_eval = 0
+
+        micro_batches_per_rollout = self.train_config.batch_size / self.ppo_config.ppo_batch_size
+        updates_per_rollout = (self.ppo_config.ppo_epochs * micro_batches_per_rollout) / self.gradient_accumulation_steps
+        global_steps_per_rollout = max(1, int(updates_per_rollout))
+
+        for epoch in range(self.resume_epoch, self.train_config.n_epochs):
+            file_count = len(self.train_config.file_dataset)
+            start_file_idx = self.resume_file_idx if epoch == self.resume_epoch else 0
+
+            for file_idx in range(start_file_idx, file_count):
+                dataset, file_path = self._create_dataset(file_idx)
+                train_data_loader = TrainerTools().parallel.process_dataloader(
+                    dataset=dataset,
+                    data_loader_kwargs=self.data_loader_kwargs,
+                    sampler_kwargs=self.sampler_kwargs
+                )
+
+                batch_count_per_file = len(train_data_loader)
+                TrainerTools().parallel.on_epoch_start(epoch)
+                self._on_file_start(epoch, file_path)
+
+                skip_batches = 0
+                if epoch == self.resume_epoch and file_idx == self.resume_file_idx:
+                    skip_batches = self.resume_batch_idx
+                    if skip_batches > 0 and TrainerTools().parallel.is_main_process:
+                        Logger.std_log(f"Fast forwarding {skip_batches} batches in {file_path}...")
+
+                data_iterator = iter(train_data_loader)
+                if skip_batches > 0:
+                    data_iterator = islice(data_iterator, skip_batches, None)
+
+                for batch, batch_data in enumerate(data_iterator):
+                    batch = skip_batches + batch
+                    rollout_data = self._generate_rollout_data(batch_data)
+
+                    try:
+                        ppo_stats = self._ppo_learning_phase(rollout_data)
+                        global_steps_since_last_save += global_steps_per_rollout
+                        global_steps_since_last_eval += global_steps_per_rollout
+
+                        stats_tensor = torch.tensor([
+                            ppo_stats['loss'],
+                            ppo_stats['moe_aux_loss'],
+                            ppo_stats['actor_loss'],
+                            ppo_stats['value_loss'],
+                            ppo_stats["ptx_loss"],
+                            ppo_stats["ptx_aux_loss"],
+                            ppo_stats['approx_kl'],
+                            ppo_stats['clip_frac'],
+                            ppo_stats['entropy'],
+                            ppo_stats['completion_len'],
+                            ppo_stats['value_mean'],
+                            ppo_stats['return_mean'],
+                            ppo_stats['value_error'],
+                            rollout_data['env_rewards'].item()
+                        ], device=TrainerTools().parallel.device)
+
+                        if TrainerTools().parallel.parallel_train:
+                            if TrainerTools().parallel.device_type == 'mlu':
+                                dist.all_reduce(stats_tensor, op=dist.ReduceOp.SUM)
+                                stats_tensor.div_(TrainerTools().parallel.world_size)
+                            else:
+                                dist.all_reduce(stats_tensor, dist.ReduceOp.AVG)
+
+                        self._log(
+                            keys={
+                                'epoch': epoch,
+                                'file': f'{file_idx + 1}/{file_count}',
+                                'batch': f'{batch + 1}/{batch_count_per_file}'
+                            },
+                            values={
+                                'loss/total': stats_tensor[0].item(),
+                                'loss/moe_aux': stats_tensor[1].item(),
+                                'loss/actor': stats_tensor[2].item(),
+                                'loss/value': stats_tensor[3].item(),
+                                'loss/ptx': stats_tensor[4].item(),
+                                'loss/ptx_aux': stats_tensor[5].item(),
+                                'rl/approx_kl': stats_tensor[6].item(),
+                                'rl/clip_frac': stats_tensor[7].item(),
+                                'rl/entropy': stats_tensor[8].item(),
+                                'value/mean': stats_tensor[10].item(),
+                                'value/return': stats_tensor[11].item(),
+                                'value/error': stats_tensor[12].item(),
+                                'env/completion_len': stats_tensor[9].item(),
+                                'env/reward_total': stats_tensor[13].item()
+                            }
+                        )
+
+                        if 0 < self.train_config.save_interval <= global_steps_since_last_save:
+                            save_checkpoint(
+                                model=self.train_model,
+                                optimizer=self.optimizer,
+                                extra_module=self.reward_normalizer
+                            )
+                            save_steps(
+                                epoch=epoch,
+                                file_idx=file_idx,
+                                batch_idx=batch + 1,
+                                lr_scheduler=self.lr_scheduler
+                            )
+                            global_steps_since_last_save %= self.train_config.save_interval
+
+                        if 0 < self.train_config.eval_interval <= global_steps_since_last_eval:
+                            self._on_batch_end(tag=f'epoch:{epoch}/batch:{batch}')
+                            global_steps_since_last_eval %= self.train_config.eval_interval
+
+                        del rollout_data
+                    except Exception as e:
+                        self._on_exception(e, epoch, batch)
+
+                try:
+                    # 一个文件训练结束后，清理内存
+                    del train_data_loader
+                    del dataset
+                    del data_iterator
+                    del batch_data
+                    del ppo_stats
+                except UnboundLocalError: ...
+
+                if hasattr(TrainerTools().parallel, '_sampler'):
+                    TrainerTools().parallel._sampler = None
+
+                gc.collect()
+                empty_cache()
+
+            # end epoch
+
+            # reset resume state
+            self.resume_file_idx = 0
+            self.resume_batch_idx = 0
+
+            save_checkpoint(
+                model=self.train_model,
+                optimizer=self.optimizer,
+                extra_module=self.reward_normalizer
+            )
+            save_steps(
+                epoch=epoch + 1,
+                file_idx=0,
+                batch_idx=0,
+                lr_scheduler=self.lr_scheduler
+            )
+
+            TrainerTools().parallel.on_epoch_end(epoch)
+            self._on_epoch_end(tag=f'epoch:{epoch}')
+
+        TrainerTools().parallel.destroy()

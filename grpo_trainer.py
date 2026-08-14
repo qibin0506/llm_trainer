@@ -1,0 +1,668 @@
+from typing import Tuple, List, Optional
+import gc
+import torch
+import torch.distributed as dist
+from torch.utils.data import Dataset
+from itertools import islice
+
+from .base_trainer import BaseTrainer
+from .dataset import RLDataset
+from .loss import GRPOLoss, LMLoss
+from .tools import TrainerTools
+from .generate_utils import batch_generate
+from .log import Logger
+from .partition_utils import unwrap_model_for_generation
+from .train_configs import (
+    TrainConfig,
+    RewardFun,
+    GenerationService,
+    PtxBuilder
+)
+from .utils import (
+    autocast,
+    left_pad_sequence,
+    get_sft_collate_fn,
+    log_softmax,
+    disable_dropout_in_model,
+    calc_position_ids,
+    empty_cache,
+    _mask_prompt
+)
+from .checkpoint import (
+    save_checkpoint,
+    save_steps,
+)
+
+class GRPOTrainer(BaseTrainer):
+    """
+    GRPOTrainer
+
+    Args:
+        train_config:
+            - 全局训练配置，必须包含 grpo_config。
+
+        reward_func:
+            - 基于 Rule 规则或 RM 模型的奖励打分函数，支持 1D 标量或 2D 逐 Token 序列奖励。
+
+        generation_service:
+            - 外部自定义生成服务接口
+
+        ptx_builder:
+            - 构建预训练校准数据集 (PTX Data Mixture) 的回调函数，用以缓解强化学习阶段的灾难性遗忘。
+
+        eval_prompts:
+            - 评估测试的提示词列表。
+            - [num_eval_prompts] 长度的字符串列表。
+    """
+    def __init__(
+            self,
+            *,
+            train_config: TrainConfig,
+            reward_func: RewardFun,
+            generation_service: Optional[GenerationService] = None,
+            ptx_builder: Optional[PtxBuilder] = None,
+            eval_prompts: List[str]
+    ):
+        self.grpo_config = train_config.grpo_config
+        super().__init__(
+            train_config=train_config,
+            eval_prompts=eval_prompts,
+            generation_service=generation_service,
+            gradient_accumulation_steps=self.grpo_config.gradient_accumulation_steps
+        )
+
+        grpo_batch_size = self.grpo_config.grpo_batch_size
+        total_generated_seqs = train_config.batch_size * self.grpo_config.group_size
+        assert total_generated_seqs % (grpo_batch_size * self.gradient_accumulation_steps) == 0, \
+            '(batch_size * group_size) % (grpo_batch_size * gradient_accumulation_steps) must be zero!'
+
+        self.reward_func = reward_func
+        self.ptx_builder = ptx_builder
+        self.ref_model = self._init_ref_model()
+        self.criterion, self.ptx_criterion = self._init_loss()
+
+        if self.grpo_config.loss_type == "luspo" and self.grpo_config.loss_importance_sampling_level != "sequence":
+            if TrainerTools().parallel.is_main_process:
+                Logger.std_log(
+                    "WARN: When using 'luspo' loss, `loss_importance_sampling_level` should ideally "
+                    "be set to 'sequence' to properly mirror the Length-Bias mitigation setup from the LUSPO paper."
+                )
+
+        # 校验 VESPO 的配置冗余
+        if self.grpo_config.loss_type == "vespo" and self.grpo_config.loss_importance_sampling_level != "token":
+            if TrainerTools().parallel.is_main_process:
+                Logger.std_log(
+                    "WARN: VESPO computes sequence-level importance weights internally. "
+                    "Your `loss_importance_sampling_level` setting will be ignored for the Gamma weights computation."
+                )
+
+    def _init_ref_model(self):
+        # beta == 0，不需要ref_model
+        if self.grpo_config.loss_beta == 0.0:
+            return None
+
+        parallel_kwargs = self._init_ref_model_args(self.train_config.model_config)
+        with self._new_model_context(parallel_kwargs):
+            ref_model = self._new_model(self.train_config)
+
+        ref_model.eval()
+        for param in ref_model.parameters():
+            param.requires_grad = False
+
+        if self.grpo_config.ref_model_weights_path is not None:
+            self._load_external_weights(ref_model, self.grpo_config.ref_model_weights_path)
+
+        ref_model, _ = TrainerTools().parallel.process(
+            model=ref_model,
+            optimizer=None,
+            kwargs=parallel_kwargs,
+            save_instance=False
+        )
+
+        return ref_model
+
+    def _new_model(self, train_config: TrainConfig):
+        model = super()._new_model(train_config)
+        disable_dropout_in_model(model)
+        return model
+
+    def _init_loss(self):
+        grpo_criterion = GRPOLoss(
+            beta=self.grpo_config.loss_beta,
+            clip_eps_low=self.grpo_config.loss_clip_eps,
+            clip_eps_high=self.grpo_config.loss_clip_eps_high,
+            delta=self.grpo_config.loss_delta,
+            importance_sampling_level=self.grpo_config.loss_importance_sampling_level,
+            loss_type=self.grpo_config.loss_type,
+            sapo_temperature_pos=self.grpo_config.sapo_temperature_pos,
+            sapo_temperature_neg=self.grpo_config.sapo_temperature_neg,
+            vespo_k_pos=self.grpo_config.vespo_k_pos,
+            vespo_lambda_pos=self.grpo_config.vespo_lambda_pos,
+            vespo_k_neg=self.grpo_config.vespo_k_neg,
+            vespo_lambda_neg=self.grpo_config.vespo_lambda_neg,
+        )
+
+        ptx_criterion = None
+        if self.grpo_config.ptx_coef > 0.0:
+            assert self.ptx_builder is not None
+            ptx_criterion = LMLoss()
+
+        return grpo_criterion, ptx_criterion
+
+    def _convert_train_args(self) -> Tuple[dict, dict, dict]:
+        parallel_kwargs, data_loader_kwargs, sampler_kwargs = super()._convert_train_args()
+
+        if parallel_kwargs:
+            parallel_kwargs['train_micro_batch_size_per_gpu'] = self.grpo_config.grpo_batch_size
+
+        data_loader_kwargs.update({"collate_fn": lambda x: x})
+
+        return parallel_kwargs, data_loader_kwargs, sampler_kwargs
+
+    def _create_dataset(self, file_idx) -> Tuple[Dataset, str]:
+        file_path = self.train_config.file_dataset[file_idx]
+        return RLDataset(file_path), file_path
+
+    def _compute_completion_log_probs(
+            self,
+            model,
+            input_ids,
+            attention_mask,
+            prompt_len,
+            completion_ids
+    ):
+        position_ids = calc_position_ids(attention_mask)
+
+        # [batch_size, total_seq_len, vocab_size]
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids
+        )
+
+        logits_full = outputs['logits']
+        logits_completion = logits_full[:, prompt_len - 1: -1]
+
+        log_probs = log_softmax(logits_completion, completion_ids)
+        aux_loss = outputs['aux_loss']
+
+        del outputs, logits_full, logits_completion
+        return log_probs, aux_loss
+
+    def _chunked_compute_log_probs(
+            self,
+            model,
+            input_ids,
+            attention_mask,
+            prompt_len,
+            completion_ids,
+            chunk_size
+    ):
+        all_log_probs = []
+        for i in range(0, input_ids.size(0), chunk_size):
+            chunk_input_ids = input_ids[i: i + chunk_size]
+            chunk_attention_mask = attention_mask[i: i + chunk_size]
+            chunk_completion_ids = completion_ids[i: i + chunk_size]
+            log_probs, _ = self._compute_completion_log_probs(
+                model, chunk_input_ids, chunk_attention_mask, prompt_len, chunk_completion_ids
+            )
+            all_log_probs.append(log_probs)
+        return torch.cat(all_log_probs, dim=0)
+
+    def _compute_group_relative_advantages(self, rewards):
+        group_size = self.grpo_config.group_size
+
+        # Reshape rewards to group by prompt
+        # [batch, group_size]
+        rewards_by_group = rewards.view(-1, group_size)
+
+        # Compute mean and standard deviation for each prompt group
+        # [batch]
+        group_means = rewards_by_group.mean(dim=1)
+        group_stds = torch.nan_to_num(rewards_by_group.std(dim=1, unbiased=False), nan=0.0)
+
+        # Expand the means and stds to match the original flat rewards tensor shape
+        # [batch*group_size]
+        expanded_means = group_means.repeat_interleave(group_size)
+        expanded_stds = group_stds.repeat_interleave(group_size)
+
+        # Normalize rewards to get advantages
+        # [batch*group_size]
+        advantages = (rewards - expanded_means) / (expanded_stds + 1e-4)
+
+        # [batch*group_size, 1]
+        return advantages.unsqueeze(1)  # Add dimension for token-wise operations
+
+    def _generate_rollout_data(self, batch_data: List[dict]):
+        prompt_ids = [item["prompt"] for item in batch_data]
+        gt_answer_ids = [item["answer"] for item in batch_data]
+        group_size = self.grpo_config.group_size
+
+        # for PTX
+        if self.grpo_config.ptx_coef > 0.0 and self.ptx_builder is not None:
+            ptx_data = self.ptx_builder(prompt_ids, gt_answer_ids)
+            ptx_data = [{'inputs': t} if t is not None else None for t in ptx_data]
+        else:
+            ptx_data = []
+        # end
+
+        pad_token_id = TrainerTools().tokenizer.pad
+        device = TrainerTools().parallel.device
+
+        padded_prompt_ids = left_pad_sequence(prompt_ids, padding_value=pad_token_id)
+        padded_prompt_ids = padded_prompt_ids.to(device)
+        prompt_len = padded_prompt_ids.shape[1]
+
+        # [batch*group_size, max_prompt_len]
+        padded_prompt_ids = padded_prompt_ids.repeat_interleave(group_size, 0)
+        prompt_masks = self._calc_attention_mask(padded_prompt_ids)
+
+        max_new_tokens = self.grpo_config.generate_config.max_seq_len - prompt_len
+        if max_new_tokens <= 0:
+            raise ValueError(
+                f"Prompt length ({prompt_len}) >= max_seq_len ({self.grpo_config.generate_config.max_seq_len}). "
+                f"Cannot generate any tokens. Please increase max_seq_len or reduce dataset_block_size."
+            )
+
+        external_gen_mask = None
+        with torch.no_grad():
+            if self.generation_service is not None:
+                service_output = self.generation_service(
+                    self.train_model, padded_prompt_ids, self.grpo_config.generate_config,
+                    'grpo', None, None
+                )
+
+                completion_ids_list = service_output['completions']
+                gen_masks_list = service_output.get('generation_masks', None)
+
+                if gen_masks_list is not None:
+                    assert len(gen_masks_list) == len(completion_ids_list)
+
+                padded_completions = []
+                padded_gen_masks = []
+                max_comp_len = max((len(c) for c in completion_ids_list), default=0)
+                if max_comp_len == 0:
+                    max_comp_len = 1
+                max_comp_len = min(max_comp_len, max_new_tokens)
+
+                for idx, comp in enumerate(completion_ids_list):
+                    comp = comp[:max_comp_len]
+                    pad_len = max_comp_len - len(comp)
+                    padded_completions.append(comp + [pad_token_id] * pad_len)
+
+                    if gen_masks_list is not None and idx < len(gen_masks_list):
+                        g_mask = gen_masks_list[idx][:max_comp_len]
+                        padded_gen_masks.append(g_mask + [False] * pad_len)
+
+                completion_ids = torch.tensor(padded_completions, dtype=torch.long, device=device)
+                if padded_gen_masks:
+                    external_gen_mask = torch.tensor(padded_gen_masks, dtype=torch.bool, device=device)
+            else:
+                with unwrap_model_for_generation(self.train_model) as unwrapped_model:
+                    outputs, _ = batch_generate(
+                        model=unwrapped_model,
+                        tokens=padded_prompt_ids,
+                        attention_mask=prompt_masks,
+                        max_new_tokens=max_new_tokens,
+                        temperature=self.grpo_config.generate_config.temperature,
+                        top_k=self.grpo_config.generate_config.top_k,
+                        top_p=self.grpo_config.generate_config.top_p,
+                        repetition_penalty=self.grpo_config.generate_config.repetition_penalty,
+                        exclude_penalty_tokens=self.grpo_config.generate_config.exclude_penalty_tokens,
+                        device=device,
+                        suppress_tokens=self.grpo_config.generate_config.suppress_tokens,
+                        return_logits=False,
+                        auto_prefix_cache=self.grpo_config.generate_config.auto_prefix_cache
+                    )
+
+                completion_ids = outputs[:, prompt_len:]
+
+            completion_pad_mask = completion_ids != pad_token_id
+            if external_gen_mask is not None:
+                loss_mask = completion_pad_mask & external_gen_mask
+            else:
+                temp_ids = _mask_prompt(completion_ids.clone())
+                loss_mask = completion_pad_mask & (temp_ids != -100)
+
+            input_ids = torch.cat([padded_prompt_ids, completion_ids], dim=1)
+            attention_mask = torch.cat([prompt_masks, completion_pad_mask], dim=1)
+
+            chunk_size = self.grpo_config.grpo_batch_size
+            with autocast(TrainerTools().parallel.device_type):
+                old_log_probs, _ = self._chunked_compute_log_probs(
+                    self.train_model, input_ids, attention_mask, prompt_len, completion_ids, chunk_size
+                )
+
+            if self.ref_model:
+                with autocast(TrainerTools().parallel.device_type):
+                    ref_log_probs, _ = self._chunked_compute_log_probs(
+                        self.ref_model, input_ids, attention_mask, prompt_len, completion_ids, chunk_size
+                    )
+            else:
+                ref_log_probs = None
+
+        repeated_prompt_ids = [p for p in prompt_ids for _ in range(group_size)]
+        repeated_gt_answer_ids = [a for a in gt_answer_ids for _ in range(group_size)]
+        if len(ptx_data) > 0:
+            repeated_ptx_data = [d for d in ptx_data for _ in range(group_size)]
+        else:
+            repeated_ptx_data = []
+
+        raw_rewards = self.reward_func(repeated_prompt_ids, completion_ids.cpu(), repeated_gt_answer_ids)
+        if isinstance(raw_rewards, torch.Tensor):
+            rewards_tensor = raw_rewards.to(dtype=torch.float32, device=TrainerTools().parallel.device)
+        else:
+            rewards_tensor = torch.tensor(
+                raw_rewards,
+                dtype=torch.float32,
+                device=TrainerTools().parallel.device
+            )
+
+        if rewards_tensor.dim() == 2:
+            # 2D 逐 Token / 稠密序列奖励: [batch * group_size, seq_len]
+            assert rewards_tensor.shape == completion_ids.shape, (
+                f"2D dense reward shape {rewards_tensor.shape} must match completion_ids shape {completion_ids.shape}"
+            )
+            # 屏蔽非生成位置后求和，得到整条轨迹的累积得分
+            masked_rewards = rewards_tensor * loss_mask.float()
+            rewards = masked_rewards.sum(dim=-1)
+        elif rewards_tensor.dim() == 1:
+            # 1D 标量轨迹奖励: [batch * group_size]
+            rewards = rewards_tensor
+        else:
+            raise ValueError(f"Unsupported reward dimension: {rewards_tensor.dim()}, expected 1 or 2.")
+
+        advantages = self._compute_group_relative_advantages(rewards)
+
+        return {
+            'input_ids': input_ids.detach(),
+            'attention_mask': attention_mask.detach(),
+            'loss_mask': loss_mask.detach(),
+            'old_log_probs': old_log_probs.detach(),
+            'ref_log_probs': ref_log_probs.detach() if ref_log_probs is not None else None,
+            'completion_ids': completion_ids.detach(),
+            'advantages': advantages.detach(),
+            'rewards': rewards.detach(),
+            'ptx_data': repeated_ptx_data,
+        }
+
+    def _grpo_learning_phase(self, rollout_data: dict):
+        grpo_batch_size = self.grpo_config.grpo_batch_size
+        device = TrainerTools().parallel.device
+
+        input_ids = rollout_data['input_ids']
+        attention_mask = rollout_data['attention_mask']
+        loss_mask = rollout_data['loss_mask']
+        old_log_probs = rollout_data['old_log_probs']
+        ref_log_probs = rollout_data['ref_log_probs']
+        completion_ids = rollout_data['completion_ids']
+        advantages = rollout_data['advantages']
+        ptx_data = rollout_data['ptx_data']
+
+        total_samples = input_ids.shape[0]
+        prompt_len = input_ids.shape[1] - completion_ids.shape[1]
+
+        grpo_stats = {
+            "loss": 0.0,
+            "moe_aux_loss": 0.0,
+            "ptx_loss": 0.0,
+            "ptx_aux_loss": 0.0,
+            "approx_kl": 0.0,
+            "clip_frac": 0.0,
+            "entropy": 0.0,
+            "completion_len": 0.0,
+            "rewards": rollout_data['rewards'].mean().item(),
+        }
+
+        total_micro_batches_processed = 0
+        has_ptx = self.ptx_criterion is not None and len(ptx_data) > 0
+
+        for grpo_epoch in range(self.grpo_config.grpo_epochs):
+            indices = torch.randperm(total_samples, device=device)
+
+            for i in range(0, total_samples, grpo_batch_size):
+                mini_batch_indices = indices[i:i + grpo_batch_size]
+
+                mb_input_ids = input_ids[mini_batch_indices]
+                mb_attention_mask = attention_mask[mini_batch_indices]
+                mb_loss_mask = loss_mask[mini_batch_indices]
+                actual_completion_len = mb_loss_mask.sum(dim=-1).float().mean().item()
+                mb_old_log_probs = old_log_probs[mini_batch_indices]
+                mb_ref_log_probs = ref_log_probs[mini_batch_indices] if ref_log_probs is not None else None
+                mb_completion_ids = completion_ids[mini_batch_indices]
+                mb_advantages = advantages[mini_batch_indices]
+
+                with autocast(TrainerTools().parallel.device_type):
+                    log_probs, aux_loss = self._compute_completion_log_probs(
+                        self.train_model, mb_input_ids, mb_attention_mask, prompt_len, mb_completion_ids
+                    )
+
+                    loss, clip_frac = self.criterion(
+                        log_probs=log_probs,
+                        old_log_probs=mb_old_log_probs,
+                        ref_log_probs=mb_ref_log_probs,
+                        completion_mask=mb_loss_mask,
+                        advantages=mb_advantages,
+                        completion_len=actual_completion_len
+                    )
+
+                    with torch.no_grad():
+                        fp32_log_probs = log_probs.float()
+                        fp32_mask = mb_loss_mask.float()
+
+                        entropy = -(fp32_log_probs * fp32_mask).sum() / fp32_mask.sum().clamp(min=1.0)
+                        completion_len = fp32_mask.sum(dim=-1).mean()
+
+                    if aux_loss is not None:
+                        aux_loss = aux_loss.to(loss.dtype)
+                    else:
+                        aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
+
+                    # ptx
+                    ptx_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
+                    ptx_aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
+                    if has_ptx:
+                        mb_ptx_data = [ptx_data[idx] for idx in mini_batch_indices if ptx_data[idx] is not None]
+                        if len(mb_ptx_data) > 0:
+                            pxt_collate_fn = get_sft_collate_fn(mask_prompt=True)
+                            px_fn_result = pxt_collate_fn(mb_ptx_data)
+                            mb_ptx_inputs = px_fn_result['inputs'].to(TrainerTools().parallel.device)
+                            mb_ptx_labels = px_fn_result['labels'].to(TrainerTools().parallel.device)
+
+                            mb_ptx_attention_mask = self._calc_attention_mask(mb_ptx_inputs)
+                            ptx_output = self.train_model(
+                                mb_ptx_inputs,
+                                attention_mask=mb_ptx_attention_mask,
+                            )
+                            ptx_logits = ptx_output['logits']
+                            ptx_loss = self.ptx_criterion(ptx_logits, mb_ptx_labels)
+
+                            if ptx_output['aux_loss'] is not None:
+                                ptx_aux_loss = ptx_output['aux_loss'].to(ptx_loss.dtype)
+                    # end
+
+                    with torch.no_grad():
+                        if mb_ref_log_probs is not None:
+                            log_ratio = mb_ref_log_probs.float() - fp32_log_probs
+                            approx_kl = (torch.exp(log_ratio) - log_ratio - 1)
+                            approx_kl = (approx_kl * fp32_mask).sum() / fp32_mask.sum().clamp(min=1.0)
+                        else:
+                            approx_kl = torch.tensor(0.0, device=loss.device)
+
+                grpo_loss_unscaled = loss + aux_loss
+                ptx_loss_unscaled = self.grpo_config.ptx_coef * ptx_loss + ptx_aux_loss
+
+                if self.is_ds:
+                    need_update_step = self.train_model.is_gradient_accumulation_boundary()
+                else:
+                    micro_batch_idx = i // grpo_batch_size
+                    need_update_step = ((micro_batch_idx + 1) % self.gradient_accumulation_steps == 0)
+
+                if has_ptx:
+                    self._backward_loss(grpo_loss_unscaled, self.gradient_accumulation_steps, step=False)
+                    self._backward_loss(ptx_loss_unscaled, self.gradient_accumulation_steps, step=True)
+                else:
+                    self._backward_loss(grpo_loss_unscaled, self.gradient_accumulation_steps)
+
+                grpo_stats["loss"] += (grpo_loss_unscaled + ptx_loss_unscaled).detach().item()
+                grpo_stats["moe_aux_loss"] += aux_loss.detach().item()
+                grpo_stats["ptx_loss"] += ptx_loss.detach().item()
+                grpo_stats["ptx_aux_loss"] += ptx_aux_loss.detach().item()
+                grpo_stats["approx_kl"] += approx_kl.detach().item()
+                grpo_stats["clip_frac"] += clip_frac.detach().item()
+                grpo_stats["entropy"] += entropy.detach().item()
+                grpo_stats["completion_len"] += completion_len.detach().item()
+                total_micro_batches_processed += 1
+
+                if need_update_step:
+                    self._update_step()
+
+        if total_micro_batches_processed > 0:
+            for key in ["loss", "moe_aux_loss", "ptx_loss",
+                        "ptx_aux_loss", "approx_kl", "clip_frac",
+                        "entropy", "completion_len"]:
+                grpo_stats[key] /= total_micro_batches_processed
+
+        return grpo_stats
+
+    def train(self):
+        global_steps_since_last_save = 0
+        global_steps_since_last_eval = 0
+
+        micro_batches_per_rollout = (self.train_config.batch_size * self.grpo_config.group_size) / self.grpo_config.grpo_batch_size
+        updates_per_rollout = (self.grpo_config.grpo_epochs * micro_batches_per_rollout) / self.gradient_accumulation_steps
+        global_steps_per_rollout = max(1, int(updates_per_rollout))
+
+        for epoch in range(self.resume_epoch, self.train_config.n_epochs):
+            file_count = len(self.train_config.file_dataset)
+            start_file_idx = self.resume_file_idx if epoch == self.resume_epoch else 0
+
+            for file_idx in range(start_file_idx, file_count):
+                dataset, file_path = self._create_dataset(file_idx)
+
+                train_data_loader = TrainerTools().parallel.process_dataloader(
+                    dataset=dataset,
+                    data_loader_kwargs=self.data_loader_kwargs,
+                    sampler_kwargs=self.sampler_kwargs
+                )
+
+                batch_count_per_file = len(train_data_loader)
+                TrainerTools().parallel.on_epoch_start(epoch)
+                self._on_file_start(epoch, file_path)
+
+                skip_batches = 0
+                if epoch == self.resume_epoch and file_idx == self.resume_file_idx:
+                    skip_batches = self.resume_batch_idx
+                    if skip_batches > 0 and TrainerTools().parallel.is_main_process:
+                        Logger.std_log(f"Fast forwarding {skip_batches} batches in {file_path}...")
+
+                data_iterator = iter(train_data_loader)
+                if skip_batches > 0:
+                    data_iterator = islice(data_iterator, skip_batches, None)
+
+                for batch, batch_data in enumerate(data_iterator):
+                    batch = skip_batches + batch
+
+                    # start generate
+                    if TrainerTools().parallel.is_main_process:
+                        Logger.std_log(f'start generate for batch {batch + 1}/{batch_count_per_file}')
+
+                    # 生成数据
+                    rollout_data = self._generate_rollout_data(batch_data)
+                    # end generate
+
+                    try:
+                        if TrainerTools().parallel.is_main_process:
+                            Logger.std_log(f'start train for batch {batch + 1}/{batch_count_per_file}')
+
+                        grpo_stats = self._grpo_learning_phase(rollout_data)
+                        global_steps_since_last_save += global_steps_per_rollout
+                        global_steps_since_last_eval += global_steps_per_rollout
+
+                        stats_tensor = torch.tensor([
+                            grpo_stats['loss'],
+                            grpo_stats['moe_aux_loss'],
+                            grpo_stats["ptx_loss"],
+                            grpo_stats["ptx_aux_loss"],
+                            grpo_stats['approx_kl'],
+                            grpo_stats['clip_frac'],
+                            grpo_stats['entropy'],
+                            grpo_stats['completion_len'],
+                            grpo_stats['rewards']
+                        ], device=TrainerTools().parallel.device)
+
+                        if TrainerTools().parallel.parallel_train:
+                            if TrainerTools().parallel.device_type == 'mlu':
+                                dist.all_reduce(stats_tensor, op=dist.ReduceOp.SUM)
+                                stats_tensor.div_(TrainerTools().parallel.world_size)
+                            else:
+                                dist.all_reduce(stats_tensor, dist.ReduceOp.AVG)
+
+                        self._log(
+                            keys={
+                                'epoch': epoch,
+                                'file': f'{file_idx + 1}/{file_count}',
+                                'batch': f'{batch + 1}/{batch_count_per_file}',
+                            },
+                            values={
+                                'loss/total': stats_tensor[0].item(),
+                                'loss/moe_aux': stats_tensor[1].item(),
+                                'loss/ptx': stats_tensor[2].item(),
+                                'loss/ptx_aux': stats_tensor[3].item(),
+                                'rl/approx_kl': stats_tensor[4].item(),
+                                'rl/clip_frac': stats_tensor[5].item(),
+                                'rl/entropy': stats_tensor[6].item(),
+                                'env/completion_len': stats_tensor[7].item(),
+                                'env/reward_total': stats_tensor[8].item()
+                            }
+                        )
+
+                        if 0 < self.train_config.save_interval <= global_steps_since_last_save:
+                            save_checkpoint(model=self.train_model, optimizer=self.optimizer)
+                            save_steps(
+                                epoch=epoch,
+                                file_idx=file_idx,
+                                batch_idx=batch + 1,
+                                lr_scheduler=self.lr_scheduler
+                            )
+                            global_steps_since_last_save %= self.train_config.save_interval
+
+                        if 0 < self.train_config.eval_interval <= global_steps_since_last_eval:
+                            self._on_batch_end(tag=f'epoch:{epoch}/batch:{batch}')
+                            global_steps_since_last_eval %= self.train_config.eval_interval
+                    except Exception as e:
+                        self._on_exception(e, epoch, batch)
+
+                try:
+                    # 一个文件训练结束后，清理内存
+                    del train_data_loader
+                    del dataset
+                    del data_iterator
+                    del rollout_data
+                    del batch_data
+                except UnboundLocalError: ...
+
+                if hasattr(TrainerTools().parallel, '_sampler'):
+                    TrainerTools().parallel._sampler = None
+
+                gc.collect()
+                empty_cache()
+
+            # end epoch
+
+            # reset resume state
+            self.resume_file_idx = 0
+            self.resume_batch_idx = 0
+
+            save_checkpoint(model=self.train_model, optimizer=self.optimizer)
+            save_steps(
+                epoch=epoch + 1,
+                file_idx=0,
+                batch_idx=0,
+                lr_scheduler=self.lr_scheduler
+            )
+
+            TrainerTools().parallel.on_epoch_end(epoch)
+            self._on_epoch_end(tag=f'epoch:{epoch}')
+
+        TrainerTools().parallel.destroy()

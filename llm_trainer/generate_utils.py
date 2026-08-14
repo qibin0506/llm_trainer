@@ -537,7 +537,7 @@ def batch_generate(
                 current_attention_mask = full_attention_mask_buffer[:, :prompt_len]
             else:
                 current_attention_mask = full_attention_mask_buffer[:, :prompt_len + i]
-                current_position_ids = current_attention_mask.sum(dim=-1, keepdim=True).long() - 1
+                current_position_ids = (current_attention_mask.sum(dim=-1, keepdim=True).long() - 1).clamp(min=0)
 
             with autocast(TrainerTools().parallel.device_type):
                 if i == 0 and group_size > 1:

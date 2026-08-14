@@ -436,8 +436,8 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
                 active_indices = [i for i, d in enumerate(dones) if not d]
 
                 if not active_indices:
-                    active_prompts = torch.full((1, 1), pad_token_id, dtype=torch.long, device=device)
-                    attention_mask = torch.zeros((1, 1), dtype=torch.long, device=device)
+                    active_prompts = torch.tensor([[pad_token_id]], dtype=torch.long, device=device)
+                    attention_mask = torch.ones((1, 1), dtype=torch.long, device=device)
                     remaining_max_tokens = 1
                     active_pixel_values = None
                     cur_prompt_len = 1
@@ -458,6 +458,10 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
                             active_pixel_values = pixel_values
 
                     attention_mask = (active_prompts != pad_token_id).long()
+
+                    if (attention_mask == 0).all():
+                        attention_mask[:, -1] = 1
+
                     remaining_max_tokens = max(generate_config.max_seq_len - cur_prompt_len, 1)
 
                 outputs, _ = batch_generate(
@@ -495,7 +499,7 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
                         generated_text = tokenizer.decode(valid_new_tokens)
 
                         trajectories[global_idx].extend(valid_new_tokens)
-                        generation_masks[global_idx].extend([True] * len(valid_new_tokens))  # 标记为模型生成
+                        generation_masks[global_idx].extend([True] * len(valid_new_tokens))
 
                         tasks.append((global_idx, valid_new_tokens, generated_text))
 
@@ -556,7 +560,14 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
                         dones[idx] = True
 
                 if not all(dones) and active_indices:
-                    reversed_prompts = [p.flip(dims=(0,)) for p in next_prompts_list]
+                    valid_prompts = []
+                    for p in next_prompts_list:
+                        if p is None or p.numel() == 0:
+                            valid_prompts.append(torch.tensor([pad_token_id], dtype=torch.long, device=device))
+                        else:
+                            valid_prompts.append(p)
+
+                    reversed_prompts = [p.flip(dims=(0,)) for p in valid_prompts]
                     padded_reversed = torch.nn.utils.rnn.pad_sequence(
                         reversed_prompts, batch_first=True, padding_value=pad_token_id
                     )

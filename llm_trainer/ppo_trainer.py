@@ -93,13 +93,13 @@ class PPOTrainer(BaseTrainer):
             - 全局训练配置，必须包含 ppo_config。
 
         reward_func:
-            - 奖励函数，对生成的 Response 打分。
+            - 奖励函数，支持返回 1D 标量 (List[float]) 或 2D 逐 Token 稠密序列 (List[List[float]])。
 
         generation_service:
             - 外部自定义生成服务接口
 
         ptx_builder:
-            -  构建预训练混合数据 (PTX Data Mixture) 的回调函数。
+            - 构建预训练混合数据 (PTX Data Mixture) 的回调函数。
 
         eval_prompts:
             - 评估测试的提示词列表。
@@ -370,10 +370,13 @@ class PPOTrainer(BaseTrainer):
 
         for t in reversed(range(seq_len)):
             if t == seq_len - 1:
+                # 序列最末尾 step：若 dones=True 则置 0.0，否则使用修正后的 last_values
                 next_values = torch.where(dones, 0.0, last_values)
                 next_non_terminal = torch.zeros_like(dones, dtype=torch.float)
             else:
+                # 判断下一个 token 是否已经是 padding
                 is_padding_next = (completion_mask[:, t + 1] == 0.0)
+                # 如果下一 token 是 pad，说明当前 t 就是该样本的最后有效 token
                 next_values_if_end = torch.where(dones, 0.0, last_values)
                 next_values = torch.where(is_padding_next, next_values_if_end, values[:, t + 1])
                 next_non_terminal = completion_mask[:, t + 1]
@@ -567,48 +570,89 @@ class PPOTrainer(BaseTrainer):
                 temp_ids = _mask_prompt(completion_ids.clone())
                 loss_mask = completion_pad_mask & (temp_ids != -100)
 
-            if self.ppo_config.kl_beta > 0.0:
+            if self.ppo_config.kl_beta > 0.0 and ref_log_probs_completion is not None:
                 logr = ref_log_probs_completion.float() - old_log_probs.float()
                 kl = -logr if self.ppo_config.kl_estimator == "k1" else (logr.exp() - 1) - logr
                 kl_rewards = -self.ppo_config.kl_beta * kl
                 rewards += kl_rewards.to(rewards.dtype) * loss_mask
 
-            env_rewards_tensor = torch.tensor(
-                self.reward_func(prompt_ids, completion_ids.cpu(), gt_answer_ids),
-                dtype=torch.float32,
-                device=device
-            )
+            raw_env_rewards = self.reward_func(prompt_ids, completion_ids.cpu(), gt_answer_ids)
+            if isinstance(raw_env_rewards, torch.Tensor):
+                env_rewards_tensor = raw_env_rewards.to(device=device, dtype=torch.float32)
+            else:
+                env_rewards_tensor = torch.tensor(raw_env_rewards, device=device, dtype=torch.float32)
 
-            if self.ppo_config.missing_eos_penalty is not None:
-                env_rewards_tensor[~dones] -= self.ppo_config.missing_eos_penalty
+            if env_rewards_tensor.dim() == 2:
+                # 2D 逐 Token / 分步稠密序列奖励 [batch_size, seq_len]
+                assert env_rewards_tensor.shape == completion_ids.shape, (
+                    f"2D dense reward shape {env_rewards_tensor.shape} must match completion_ids shape {completion_ids.shape}"
+                )
 
-            raw_reward_mean = env_rewards_tensor.mean()
+                if self.ppo_config.missing_eos_penalty is not None:
+                    gen_indices = torch.where(
+                        loss_mask,
+                        torch.arange(completion_ids.size(1), device=device).unsqueeze(0),
+                        torch.tensor(-1, device=device)
+                    )
+                    last_token_indices = gen_indices.max(dim=1).values
+                    missing_eos_mask = ~dones & (last_token_indices >= 0)
+                    if missing_eos_mask.any():
+                        m_batch = torch.arange(padded_prompt_ids.size(0), device=device)[missing_eos_mask]
+                        m_last = last_token_indices[missing_eos_mask]
+                        env_rewards_tensor[m_batch, m_last] -= self.ppo_config.missing_eos_penalty
 
-            if self.ppo_config.normalize_rewards:
-                if self.reward_normalizer:
-                    self.reward_normalizer.update(env_rewards_tensor)
-                    env_rewards_tensor = self.reward_normalizer(env_rewards_tensor)
-                else:
-                    batch_std = env_rewards_tensor.std()
-                    if torch.isnan(batch_std) or batch_std < 1e-8:
-                        batch_std = 1.0
+                # 屏蔽非生成 / Padding 位置的噪声，精确注入到各 Token
+                env_rewards_masked = env_rewards_tensor * loss_mask.float()
+                raw_reward_mean = env_rewards_masked.sum(dim=1).mean()
 
-                    env_rewards_tensor = (env_rewards_tensor - raw_reward_mean) / batch_std
+                if self.ppo_config.normalize_rewards:
+                    if self.reward_normalizer:
+                        # 仅提取 valid token 的 reward 更新 RunningMeanStd
+                        valid_rewards = env_rewards_masked[loss_mask]
+                        self.reward_normalizer.update(valid_rewards)
+                        env_rewards_masked = self.reward_normalizer(env_rewards_masked, shift_mean=False) * loss_mask.float()
+                    else:
+                        valid_rewards = env_rewards_masked[loss_mask]
+                        if valid_rewards.numel() > 1:
+                            batch_std = valid_rewards.std()
+                            if not torch.isnan(batch_std) and batch_std > 1e-8:
+                                env_rewards_masked = (env_rewards_masked / batch_std) * loss_mask.float()
 
-            gen_indices = torch.where(
-                loss_mask,
-                torch.arange(completion_ids.size(1), device=device).unsqueeze(0),
-                torch.tensor(-1, device=device)
-            )
+                rewards += env_rewards_masked
 
-            last_token_indices = gen_indices.max(dim=1).values
-            valid_indices_mask = last_token_indices >= 0
+            elif env_rewards_tensor.dim() == 1:
+                # 1D 轨迹级标量奖励 [batch_size]
+                if self.ppo_config.missing_eos_penalty is not None:
+                    env_rewards_tensor[~dones] -= self.ppo_config.missing_eos_penalty
 
-            if valid_indices_mask.any():
-                valid_batch_indices = torch.arange(padded_prompt_ids.size(0), device=device)[valid_indices_mask]
-                valid_last_token_indices = last_token_indices[valid_indices_mask]
-                valid_env_rewards = env_rewards_tensor[valid_indices_mask]
-                rewards[valid_batch_indices, valid_last_token_indices] += valid_env_rewards
+                raw_reward_mean = env_rewards_tensor.mean()
+
+                if self.ppo_config.normalize_rewards:
+                    if self.reward_normalizer:
+                        self.reward_normalizer.update(env_rewards_tensor)
+                        env_rewards_tensor = self.reward_normalizer(env_rewards_tensor)
+                    else:
+                        batch_std = env_rewards_tensor.std()
+                        if torch.isnan(batch_std) or batch_std < 1e-8:
+                            batch_std = 1.0
+                        env_rewards_tensor = (env_rewards_tensor - raw_reward_mean) / batch_std
+
+                gen_indices = torch.where(
+                    loss_mask,
+                    torch.arange(completion_ids.size(1), device=device).unsqueeze(0),
+                    torch.tensor(-1, device=device)
+                )
+
+                last_token_indices = gen_indices.max(dim=1).values
+                valid_indices_mask = last_token_indices >= 0
+
+                if valid_indices_mask.any():
+                    valid_batch_indices = torch.arange(padded_prompt_ids.size(0), device=device)[valid_indices_mask]
+                    valid_last_token_indices = last_token_indices[valid_indices_mask]
+                    valid_env_rewards = env_rewards_tensor[valid_indices_mask]
+                    rewards[valid_batch_indices, valid_last_token_indices] += valid_env_rewards
+            else:
+                raise ValueError(f"Unsupported reward dimension: {env_rewards_tensor.dim()}, expected 1 or 2.")
 
         return {
             'prompt_ids': padded_prompt_ids.detach(),
@@ -639,8 +683,15 @@ class PPOTrainer(BaseTrainer):
         batch_size = prompt_ids.shape[0]
 
         values_for_gae = old_values[:, prompt_len - 1: -1]
-        last_values = old_values[:, -1]
         assert values_for_gae.shape[1] == completion_ids.shape[1]
+
+        # completion_pad_mask 统计每行有效 token 数量 K (范围 1 ~ max_comp_len)
+        valid_lengths = completion_pad_mask.sum(dim=-1).clamp(min=1)  # [batch_size]
+        last_token_pos_in_full = prompt_len + valid_lengths - 1  # [batch_size]
+
+        # 提取有效末尾位置对应的 Value，作为真实的未终止状态截断引导值
+        batch_indices = torch.arange(batch_size, device=prompt_ids.device)
+        last_values = old_values[batch_indices, last_token_pos_in_full]  # [batch_size]
 
         if self.ppo_config.whiten_rewards:
             rewards = masked_whiten(rewards, loss_mask, shift_mean=False)

@@ -42,7 +42,7 @@ class GRPOTrainer(BaseTrainer):
             - 全局训练配置，必须包含 grpo_config。
 
         reward_func:
-            - 基于 Rule 规则或 RM 模型的奖励打分函数。
+            - 基于 Rule 规则或 RM 模型的奖励打分函数，支持 1D 标量或 2D 逐 Token 序列奖励。
 
         generation_service:
             - 外部自定义生成服务接口
@@ -348,12 +348,30 @@ class GRPOTrainer(BaseTrainer):
         else:
             repeated_ptx_data = []
 
-        # [batch*group_size]
-        rewards = torch.tensor(
-            self.reward_func(repeated_prompt_ids, completion_ids.cpu(), repeated_gt_answer_ids),
-            dtype=torch.float32,
-            device=TrainerTools().parallel.device
-        )
+        raw_rewards = self.reward_func(repeated_prompt_ids, completion_ids.cpu(), repeated_gt_answer_ids)
+        if isinstance(raw_rewards, torch.Tensor):
+            rewards_tensor = raw_rewards.to(dtype=torch.float32, device=TrainerTools().parallel.device)
+        else:
+            rewards_tensor = torch.tensor(
+                raw_rewards,
+                dtype=torch.float32,
+                device=TrainerTools().parallel.device
+            )
+
+        if rewards_tensor.dim() == 2:
+            # 2D 逐 Token / 稠密序列奖励: [batch * group_size, seq_len]
+            assert rewards_tensor.shape == completion_ids.shape, (
+                f"2D dense reward shape {rewards_tensor.shape} must match completion_ids shape {completion_ids.shape}"
+            )
+            # 屏蔽非生成位置后求和，得到整条轨迹的累积得分
+            masked_rewards = rewards_tensor * loss_mask.float()
+            rewards = masked_rewards.sum(dim=-1)
+        elif rewards_tensor.dim() == 1:
+            # 1D 标量轨迹奖励: [batch * group_size]
+            rewards = rewards_tensor
+        else:
+            raise ValueError(f"Unsupported reward dimension: {rewards_tensor.dim()}, expected 1 or 2.")
+        # -----------------------------------------------------------------
 
         advantages = self._compute_group_relative_advantages(rewards)
 

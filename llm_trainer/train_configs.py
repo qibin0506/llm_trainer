@@ -511,7 +511,7 @@ class RewardFun(Protocol):
             prompt_ids: List[torch.Tensor],
             completion_ids: torch.Tensor,
             gt_answer_ids: List[Optional[torch.Tensor]]
-    ) -> List[float]:
+    ) -> Union[List[float], List[List[float]], torch.Tensor]:
         """
         计算奖励分数。
 
@@ -525,7 +525,11 @@ class RewardFun(Protocol):
             - 在 GRPO 训练中，N 通常等于 batch_size * group_size。
 
         Returns:
-            长度为 [N] 的一维列表，返回每个生成句子的标量奖励值。
+            支持以下两种返回格式：
+            1. 1D 轨迹标量奖励 (List[float] 或 [N] Tensor):
+               - 传统的 Outcome Reward（结果导向），框架会自动将得分赋给序列的最后一个有效 Token。
+            2. 2D 逐 Token / 分步稠密奖励 (List[List[float]] 或 [N, max_completion_len] Tensor):
+               - Process / Turn-level Dense Reward（过程监督/多轮分步），用于在指定 Token / 轮次结束位置精确打分。
         """
         ...
 

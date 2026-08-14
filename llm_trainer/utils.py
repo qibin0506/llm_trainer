@@ -689,25 +689,30 @@ class RunningMeanStd(nn.Module):
 
     def update(self, x: torch.Tensor):
         x = x.to(dtype=torch.float64)
+        device = x.device
+        count = x.numel()
 
-        batch_mean = x.mean(dim=0)
-        batch_var = x.var(dim=0, unbiased=False)
-        batch_count = torch.tensor(x.shape[0], device=x.device, dtype=torch.float64)
+        # 兼容空 Tensor 输入，防止多卡通信死锁
+        if count > 0:
+            batch_sum = x.sum()
+            batch_sum_sq = (x ** 2).sum()
+        else:
+            batch_sum = torch.tensor(0.0, device=device, dtype=torch.float64)
+            batch_sum_sq = torch.tensor(0.0, device=device, dtype=torch.float64)
+
+        batch_count = torch.tensor(count, device=device, dtype=torch.float64)
 
         if TrainerTools().parallel.parallel_train:
             dist.all_reduce(batch_count, op=dist.ReduceOp.SUM)
-
-            batch_sum = x.sum(dim=0)
             dist.all_reduce(batch_sum, op=dist.ReduceOp.SUM)
-
-            batch_sum_sq = (x ** 2).sum(dim=0)
             dist.all_reduce(batch_sum_sq, op=dist.ReduceOp.SUM)
 
-            batch_mean = batch_sum / batch_count
-            batch_mean_sq = batch_sum_sq / batch_count
-            batch_var = batch_mean_sq - batch_mean ** 2
+        if batch_count.item() == 0:
+            return
 
-            batch_var = torch.clamp(batch_var, min=0.0)
+        batch_mean = batch_sum / batch_count
+        batch_mean_sq = batch_sum_sq / batch_count
+        batch_var = torch.clamp(batch_mean_sq - batch_mean ** 2, min=0.0)
 
         delta = batch_mean - self.mean
         tot_count = self.count + batch_count

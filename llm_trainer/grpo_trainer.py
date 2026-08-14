@@ -371,7 +371,6 @@ class GRPOTrainer(BaseTrainer):
             rewards = rewards_tensor
         else:
             raise ValueError(f"Unsupported reward dimension: {rewards_tensor.dim()}, expected 1 or 2.")
-        # -----------------------------------------------------------------
 
         advantages = self._compute_group_relative_advantages(rewards)
 

@@ -315,7 +315,8 @@ class PPOTrainer(BaseTrainer):
     def _init_loss(self):
         ppo_criterion = PPOLoss(
             clip_eps=self.ppo_config.clip_eps,
-            vf_coef=self.ppo_config.vf_coef
+            vf_coef=self.ppo_config.vf_coef,
+            huber_delta=self.ppo_config.huber_delta
         )
 
         ptx_criterion = None

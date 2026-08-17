@@ -636,8 +636,17 @@ class BaseTrainer:
         if not isinstance(TrainerTools().parallel, DsParallel) and self.lr_scheduler.can_clip_grad():
             self.scaler.unscale_(self.optimizer)
 
-            trainable_params = filter(lambda p: p.requires_grad, self.train_model.parameters())
-            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+            if hasattr(self.train_model, 'policy_model') and hasattr(self.train_model, 'value_model'):
+                policy_params = [p for p in self.train_model.policy_model.parameters() if p.requires_grad]
+                value_params = [p for p in self.train_model.value_model.parameters() if p.requires_grad]
+
+                if policy_params:
+                    torch.nn.utils.clip_grad_norm_(policy_params, 1.0)
+                if value_params:
+                    torch.nn.utils.clip_grad_norm_(value_params, 1.0)
+            else:
+                trainable_params = filter(lambda p: p.requires_grad, self.train_model.parameters())
+                torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
 
     def _apply_step(self):
         if not isinstance(TrainerTools().parallel, DsParallel):

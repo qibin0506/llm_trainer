@@ -144,6 +144,7 @@ class PPOLoss(nn.Module):
             self,
             clip_eps: float,
             vf_coef: float,
+            huber_delta: float = 1.0
     ):
         """
         初始化PPO损失函数。
@@ -153,6 +154,7 @@ class PPOLoss(nn.Module):
         super().__init__()
         self.clip_eps = clip_eps
         self.vf_coef = vf_coef
+        self.huber_delta = huber_delta
 
     def forward(
             self,
@@ -191,8 +193,9 @@ class PPOLoss(nn.Module):
 
         # Value Loss (价值损失) with clipping
         values_clipped = old_values + torch.clamp(values - old_values, -self.clip_eps, self.clip_eps)
-        vf_loss_unclipped = F.mse_loss(values, returns, reduction='none')
-        vf_loss_clipped = F.mse_loss(values_clipped, returns, reduction='none')
+
+        vf_loss_unclipped = F.smooth_l1_loss(values, returns, reduction='none', beta=self.huber_delta)
+        vf_loss_clipped = F.smooth_l1_loss(values_clipped, returns, reduction='none', beta=self.huber_delta)
         value_loss = torch.max(vf_loss_unclipped, vf_loss_clipped)
 
         # Apply mask and average

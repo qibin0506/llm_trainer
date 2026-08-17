@@ -392,14 +392,15 @@ class PPOConfig:
     gamma: float = 1.0
     lam: float = 0.95
     clip_eps: float = 0.1
-    vf_coef: float = 0.5
+    vf_coef: float = 0.1
     kl_beta: float = 0.02
     kl_estimator: str = 'k1'
+    huber_delta: float = 1.0
     ptx_coef: float = 0.0
     missing_eos_penalty: Optional[float] = None
     normalize_rewards: bool = False
     normalize_method: str = 'RunningMeanStd'
-    whiten_rewards: bool = False
+    whiten_rewards: bool = True
     generate_config: GenerateConfig = field(default_factory=GenerateConfig)
 
 

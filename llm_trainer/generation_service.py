@@ -361,6 +361,7 @@ class EnvironmentStep(Protocol):
         """
         ...
 
+
 class FeedbackFormatter(Protocol):
     """
     环境反馈格式化协议。
@@ -410,7 +411,9 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
 
         batch_size = prompt_ids.shape[0]
         current_prompts = prompt_ids
-        dones = [False] * batch_size
+
+        loop_dones = [False] * batch_size
+        terminals = [False] * batch_size
         consecutive_errors = [0] * batch_size
 
         trajectories = [[] for _ in range(batch_size)]
@@ -421,24 +424,24 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
 
             for turn in range(self.max_turns):
                 for i in range(batch_size):
-                    if not dones[i]:
+                    if not loop_dones[i]:
                         actual_len = (current_prompts[i] != pad_token_id).sum().item()
                         if actual_len >= generate_config.max_seq_len:
-                            dones[i] = True
+                            loop_dones[i] = True
 
-                local_all_done = torch.tensor(1 if all(dones) else 0, device=device)
+                local_all_done = torch.tensor(1 if all(loop_dones) else 0, device=device)
                 if TrainerTools().parallel.world_size > 1:
                     dist.all_reduce(local_all_done, op=dist.ReduceOp.SUM)
 
                 if local_all_done.item() == TrainerTools().parallel.world_size:
                     break
 
-                active_indices = [i for i, d in enumerate(dones) if not d]
+                active_indices = [i for i, d in enumerate(loop_dones) if not d]
 
                 if not active_indices:
                     active_prompts = torch.tensor([[pad_token_id]], dtype=torch.long, device=device)
                     attention_mask = torch.ones((1, 1), dtype=torch.long, device=device)
-                    remaining_max_tokens = 1
+                    local_remaining_max_tokens = 1
                     active_pixel_values = None
                     cur_prompt_len = 1
                 else:
@@ -462,7 +465,16 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
                     if (attention_mask == 0).all():
                         attention_mask[:, -1] = 1
 
-                    remaining_max_tokens = max(generate_config.max_seq_len - cur_prompt_len, 1)
+                    local_remaining_max_tokens = max(generate_config.max_seq_len - cur_prompt_len, 1)
+
+                # =============== 新增全局同步逻辑防止 NCCL 死锁 ===============
+                if TrainerTools().parallel.world_size > 1:
+                    max_token_tensor = torch.tensor([local_remaining_max_tokens], dtype=torch.long, device=device)
+                    dist.all_reduce(max_token_tensor, op=dist.ReduceOp.MAX)
+                    remaining_max_tokens = max_token_tensor.item()
+                else:
+                    remaining_max_tokens = local_remaining_max_tokens
+                # ==============================================================
 
                 outputs, _ = batch_generate(
                     model=gen_model,
@@ -487,11 +499,11 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
 
                 if active_indices:
                     for i in range(batch_size):
-                        if dones[i]:
+                        if loop_dones[i]:
                             next_prompts_list[i] = self._safe_left_unpad(current_prompts[i], pad_token_id)
 
                     for local_idx, global_idx in enumerate(active_indices):
-                        if dones[global_idx]:
+                        if loop_dones[global_idx]:
                             continue
 
                         new_tokens = outputs[local_idx, cur_prompt_len:]
@@ -530,8 +542,9 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
                     else:
                         consecutive_errors[idx] = 0
 
-                    if consecutive_errors[idx] >= self.max_consecutive_errors:
-                        is_done = True
+                    if is_done or consecutive_errors[idx] >= self.max_consecutive_errors:
+                        terminals[idx] = True
+                        loop_dones[idx] = True
 
                     unpadded_prompt = self._safe_left_unpad(current_prompts[idx], pad_token_id)
 
@@ -540,7 +553,7 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
 
                     remaining_capacity = generate_config.max_seq_len - len(unpadded_prompt) - len(valid_new_tokens) - 1
                     if remaining_capacity <= 0:
-                        is_done = True
+                        loop_dones[idx] = True
                         feedback_tokens = []
                     else:
                         feedback_tokens = feedback_tokens[:remaining_capacity]
@@ -556,10 +569,10 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
                         next_prompt = next_prompt[:generate_config.max_seq_len]
                     next_prompts_list[idx] = next_prompt
 
-                    if is_done or turn == self.max_turns - 1 or next_prompt.size(0) >= generate_config.max_seq_len:
-                        dones[idx] = True
+                    if turn == self.max_turns - 1 or next_prompt.size(0) >= generate_config.max_seq_len:
+                        loop_dones[idx] = True
 
-                if not all(dones) and active_indices:
+                if not all(loop_dones) and active_indices:
                     valid_prompts = []
                     for p in next_prompts_list:
                         if p is None or p.numel() == 0:
@@ -575,6 +588,6 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
 
         return {
             'completions': trajectories,
-            'dones': dones,
+            'dones': terminals,
             'generation_masks': generation_masks
         }

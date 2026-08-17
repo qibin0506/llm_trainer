@@ -500,7 +500,9 @@ def batch_generate(
     done = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
     prefilled_len = 0
-    if auto_prefix_cache and pixel_values is None and batch_size > 1:
+    has_left_padding = (orig_tokens[:, 0] == pad_token_id).any().item()
+
+    if auto_prefix_cache and (not has_left_padding) and pixel_values is None and batch_size > 1:
         common_len = _find_longest_common_prefix(orig_tokens)
         common_len = min(common_len, prompt_len - 1)
 

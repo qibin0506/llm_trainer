@@ -19,6 +19,7 @@ from .generate_utils import batch_generate
 from .partition_utils import unwrap_model_for_generation
 from .log import Logger
 from .loss import LMLoss
+
 from .train_configs import (
     TrainConfig,
     RewardFun,
@@ -47,6 +48,10 @@ from .scheduler import (
     WarmupCosineAnnealingLRScheduler,
     CompositeLRScheduler,
     NoneLRScheduler
+)
+from .partition_utils import (
+    maybe_gather_lm_head_ctx,
+    unwrap_model
 )
 
 
@@ -389,59 +394,95 @@ class PPOTrainer(BaseTrainer):
         returns = advantages + values
         return advantages * completion_mask, returns * completion_mask
 
-    def _chunked_compute_log_probs_and_values(
+    def _compute_log_probs_and_values(
             self,
             model,
-            input_ids,
-            attention_mask,
-            prompt_len,
-            completion_ids,
-            chunk_size
-    ):
+            input_ids: torch.Tensor,
+            attention_mask: Optional[torch.Tensor],
+            prompt_len: int,
+            completion_ids: torch.Tensor,
+            chunk_size: Optional[int] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        unwrapped = unwrap_model(model)
+        policy_model = unwrapped.policy_model
+        policy_lm_head = unwrap_model(policy_model).lm_head
+
+        def _step_forward(inp_ids, att_mask, comp_ids):
+            pos_ids = calc_position_ids(att_mask)
+            policy_output, value_output = model(
+                inp_ids,
+                attention_mask=att_mask,
+                position_ids=pos_ids,
+                forward_type='both',
+                return_logits=False
+            )
+
+            h_completion = policy_output['hidden_states'][:, prompt_len - 1: -1]
+            with maybe_gather_lm_head_ctx(policy_lm_head.weight, policy_lm_head.bias):
+                logits_completion = h_completion.float() @ policy_lm_head.weight.float().t()
+                if policy_lm_head.bias is not None:
+                    logits_completion = logits_completion + policy_lm_head.bias.float()
+
+            log_probs = log_softmax(logits_completion, comp_ids)
+            values = value_output[0]
+
+            return log_probs, values
+
+        if chunk_size is None or chunk_size <= 0 or chunk_size >= input_ids.size(0):
+            return _step_forward(input_ids, attention_mask, completion_ids)
+
         all_log_probs = []
         all_values = []
         for i in range(0, input_ids.size(0), chunk_size):
-            chunk_input_ids = input_ids[i: i + chunk_size]
-            chunk_attention_mask = attention_mask[i: i + chunk_size]
-            chunk_completion_ids = completion_ids[i: i + chunk_size]
-            chunk_position_ids = calc_position_ids(chunk_attention_mask)
-
-            policy_output, value_output = model(
-                chunk_input_ids,
-                attention_mask=chunk_attention_mask,
-                position_ids=chunk_position_ids,
-                forward_type='both'
-            )
-
-            log_probs = log_softmax(policy_output['logits'][:, prompt_len - 1: -1], chunk_completion_ids)
+            c_input_ids = input_ids[i: i + chunk_size]
+            c_attention_mask = attention_mask[i: i + chunk_size]
+            c_completion_ids = completion_ids[i: i + chunk_size]
+            log_probs, values = _step_forward(c_input_ids, c_attention_mask, c_completion_ids)
             all_log_probs.append(log_probs)
-            all_values.append(value_output[0])
+            all_values.append(values)
 
         return torch.cat(all_log_probs, dim=0), torch.cat(all_values, dim=0)
 
-    def _chunked_compute_ref_log_probs(
+    def _compute_ref_log_probs(
             self,
             model,
-            input_ids,
-            attention_mask,
-            prompt_len,
-            completion_ids,
-            chunk_size
-    ):
-        all_log_probs = []
-        for i in range(0, input_ids.size(0), chunk_size):
-            chunk_input_ids = input_ids[i: i + chunk_size]
-            chunk_attention_mask = attention_mask[i: i + chunk_size]
-            chunk_completion_ids = completion_ids[i: i + chunk_size]
-            chunk_position_ids = calc_position_ids(chunk_attention_mask)
+            input_ids: torch.Tensor,
+            attention_mask: Optional[torch.Tensor],
+            prompt_len: int,
+            completion_ids: torch.Tensor,
+            chunk_size: Optional[int] = None
+    ) -> torch.Tensor:
+        unwrapped = unwrap_model(model)
+        lm_head = unwrapped.lm_head
 
+        def _step_forward(inp_ids, att_mask, comp_ids):
+            pos_ids = calc_position_ids(att_mask)
             outputs = model(
-                chunk_input_ids,
-                attention_mask=chunk_attention_mask,
-                position_ids=chunk_position_ids
+                inp_ids,
+                attention_mask=att_mask,
+                position_ids=pos_ids,
+                return_logits=False
             )
 
-            log_probs = log_softmax(outputs['logits'][:, prompt_len - 1: -1], chunk_completion_ids)
+            h_completion = outputs['hidden_states'][:, prompt_len - 1: -1]
+            with maybe_gather_lm_head_ctx(lm_head.weight, lm_head.bias):
+                logits_completion = h_completion.float() @ lm_head.weight.float().t()
+                if lm_head.bias is not None:
+                    logits_completion = logits_completion + lm_head.bias.float()
+
+            log_probs = log_softmax(logits_completion, comp_ids)
+
+            return log_probs
+
+        if chunk_size is None or chunk_size <= 0 or chunk_size >= input_ids.size(0):
+            return _step_forward(input_ids, attention_mask, completion_ids)
+
+        all_log_probs = []
+        for i in range(0, input_ids.size(0), chunk_size):
+            c_input_ids = input_ids[i: i + chunk_size]
+            c_attention_mask = attention_mask[i: i + chunk_size]
+            c_completion_ids = completion_ids[i: i + chunk_size]
+            log_probs = _step_forward(c_input_ids, c_attention_mask, c_completion_ids)
             all_log_probs.append(log_probs)
 
         return torch.cat(all_log_probs, dim=0)
@@ -538,10 +579,10 @@ class PPOTrainer(BaseTrainer):
                 dones = torch.any(completion_ids == eos_token_id, dim=1)
 
             full_attention_mask = self._calc_attention_mask(full_ids)
-            chunk_size = self.ppo_config.ppo_batch_size
 
+            chunk_size = self.ppo_config.chunked_rollout_size
             with autocast(TrainerTools().parallel.device_type):
-                old_log_probs, value_output = self._chunked_compute_log_probs_and_values(
+                old_log_probs, value_output = self._compute_log_probs_and_values(
                     self.train_model,
                     full_ids,
                     full_attention_mask,
@@ -551,7 +592,7 @@ class PPOTrainer(BaseTrainer):
                 )
 
                 if self.ref_model is not None:
-                    ref_log_probs_completion = self._chunked_compute_ref_log_probs(
+                    ref_log_probs_completion = self._compute_ref_log_probs(
                         self.ref_model,
                         full_ids,
                         full_attention_mask,
@@ -719,6 +760,9 @@ class PPOTrainer(BaseTrainer):
         total_micro_batches_processed = 0
         has_ptx = self.ptx_criterion is not None and len(ptx_data) > 0
 
+        unwrapped = unwrap_model(self.train_model)
+        policy_lm_head = unwrap_model(unwrapped.policy_model).lm_head
+
         for ppo_epoch in range(self.ppo_config.ppo_epochs):
             indices = torch.randperm(batch_size, device=TrainerTools().parallel.device)
 
@@ -740,10 +784,18 @@ class PPOTrainer(BaseTrainer):
                     policy_output, value_output = self.train_model(
                         mb_input_ids,
                         attention_mask=mb_attention_mask,
-                        position_ids=mb_position_ids
+                        position_ids = mb_position_ids,
+                        forward_type = 'both',
+                        return_logits = False
                     )
 
-                    logits_completion = policy_output['logits'][:, prompt_len - 1: -1]
+                    h_completion = policy_output['hidden_states'][:, prompt_len - 1: -1]
+                    with maybe_gather_lm_head_ctx(policy_lm_head.weight, policy_lm_head.bias):
+                        logits_completion = h_completion.float() @ policy_lm_head.weight.float().t()
+
+                        if policy_lm_head.bias is not None:
+                            logits_completion = logits_completion + policy_lm_head.bias.float()
+
                     current_log_probs = log_softmax(logits_completion, mb_completion_ids)
                     current_values = value_output[0][:, prompt_len - 1: -1]
                     value_aux_loss = value_output[1]

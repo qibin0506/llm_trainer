@@ -1,5 +1,5 @@
 from typing import Optional
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import itertools
 from packaging import version
 import torch
@@ -142,6 +142,40 @@ def unwrap_model(model) -> nn.Module:
     except Exception: ...
 
     return model
+
+
+def maybe_gather_lm_head_ctx(*params: Optional[torch.nn.Parameter]):
+    """
+    上下文管理器：当且仅当 DeepSpeed ZeRO-3 启用时，自动 AllGather 分片的 lm_head 权重/偏置。
+    非 ZeRO-3 环境下直接返回 nullcontext()，零额外开销。
+    """
+    is_zero3 = False
+    if isinstance(TrainerTools().parallel, DsParallel):
+        try:
+            import deepspeed
+            if deepspeed.zero.partition_parameters.is_zero_param(params[0] if params else None):
+                is_zero3 = True
+        except Exception:
+            pass
+
+    if not is_zero3:
+        return nullcontext()
+
+    try:
+        import deepspeed
+        from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
+
+        to_gather = {
+            id(p): p for p in params
+            if p is not None and getattr(p, 'ds_status', None) != ZeroParamStatus.AVAILABLE
+        }
+
+        if not to_gather:
+            return nullcontext()
+
+        return deepspeed.zero.GatheredParameters(list(to_gather.values()))
+    except:
+        return nullcontext()
 
 
 # def get_ds_state_dict(

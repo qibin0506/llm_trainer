@@ -11,16 +11,16 @@ from contextlib import nullcontext
 import torch
 import torch.distributed as dist
 from torch.utils.data import Dataset
-from llm_model import (
-    LlmModel,
-    ModelConfig
-)
 
 from .parallel import DsParallel
 from .tools import TrainerTools
 from .partition_utils import unwrap_model_for_generation
 from .generate_utils import generate
 
+from llm_model import (
+    LlmModel,
+    ModelConfig
+)
 from .log import (
     Logger,
     _get_log_dir
@@ -69,6 +69,9 @@ class BaseTrainer:
 
             gradient_accumulation_steps:
                 - 梯度累积步数，用于通过累积多批数据的梯度来模拟更大的 Global Batch Size。
+
+            return_logits:
+                - 模型forward的时候是否返回logits
         """
     def __init__(
             self,
@@ -76,21 +79,23 @@ class BaseTrainer:
             train_config: TrainConfig,
             eval_prompts: List[str],
             generation_service: Optional[GenerationService] = None,
-            gradient_accumulation_steps: int = 1
+            gradient_accumulation_steps: int = 1,
+            return_logits: bool = True
     ):
         set_seed(default_seed)
 
         self.is_ds = isinstance(TrainerTools().parallel, DsParallel)
         self.train_config: TrainConfig = train_config
         self.eval_prompts = eval_prompts
-        self.eval_idx = -1
+        self.generation_service = generation_service
+        self.gradient_accumulation_steps = max(1, gradient_accumulation_steps)
+        self.return_logits = return_logits
 
+        self.eval_idx = -1
         self.resume_epoch = 0
         self.resume_file_idx = 0
         self.resume_batch_idx = 0
 
-        self.generation_service = generation_service
-        self.gradient_accumulation_steps = max(1, gradient_accumulation_steps)
 
         self.logger = Logger('log.txt')
 
@@ -621,7 +626,7 @@ class BaseTrainer:
 
     def _create_dataset(self, file_idx) -> Tuple[Dataset, str]: ...
 
-    def _calc_loss(self, inputs, attention_mask, logits, labels) -> Tuple[torch.Tensor, Optional[torch.Tensor]]: ...
+    def _calc_loss(self, inputs, attention_mask, result, labels) -> Tuple[torch.Tensor, Optional[torch.Tensor]]: ...
 
     def _backward_loss(self, total_loss_unscaled, gradient_accumulation_steps, step = True):
         if isinstance(TrainerTools().parallel, DsParallel):
@@ -868,11 +873,12 @@ class BaseTrainer:
                             result = self.train_model(
                                 inputs,
                                 attention_mask=attention_mask,
-                                pixel_values=pixel_values
+                                pixel_values=pixel_values,
+                                return_logits=self.return_logits
                             )
 
                             # calc loss
-                            loss, ce_loss = self._calc_loss(inputs, attention_mask, result['logits'], labels)
+                            loss, ce_loss = self._calc_loss(inputs, attention_mask, result, labels)
                             if result['aux_loss'] is not None:
                                 aux_loss = result['aux_loss'].to(loss.dtype)
                             else:

@@ -12,6 +12,7 @@ from .tools import TrainerTools
 from .generate_utils import batch_generate
 from .log import Logger
 from .partition_utils import unwrap_model_for_generation
+
 from .train_configs import (
     TrainConfig,
     RewardFun,
@@ -31,6 +32,10 @@ from .utils import (
 from .checkpoint import (
     save_checkpoint,
     save_steps,
+)
+from .partition_utils import (
+    maybe_gather_lm_head_ctx,
+    unwrap_model
 )
 
 class GRPOTrainer(BaseTrainer):
@@ -166,48 +171,57 @@ class GRPOTrainer(BaseTrainer):
     def _compute_completion_log_probs(
             self,
             model,
-            input_ids,
-            attention_mask,
-            prompt_len,
-            completion_ids
-    ):
-        position_ids = calc_position_ids(attention_mask)
+            input_ids: torch.Tensor,
+            attention_mask: Optional[torch.Tensor],
+            prompt_len: int,
+            completion_ids: torch.Tensor,
+            chunk_size: Optional[int] = None
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        计算 Completion 部分的 LogProbs：
+        1. 采用 Active Token Filtering：跳过 Prompt 的 lm_head 矩阵乘法
+        2. 支持 chunk_size 配置：None 为全量计算，整数则分块计算
+        """
+        unwrapped = unwrap_model(model)
+        lm_head = unwrapped.lm_head
 
-        # [batch_size, total_seq_len, vocab_size]
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids
-        )
-
-        logits_full = outputs['logits']
-        logits_completion = logits_full[:, prompt_len - 1: -1]
-
-        log_probs = log_softmax(logits_completion, completion_ids)
-        aux_loss = outputs['aux_loss']
-
-        del outputs, logits_full, logits_completion
-        return log_probs, aux_loss
-
-    def _chunked_compute_log_probs(
-            self,
-            model,
-            input_ids,
-            attention_mask,
-            prompt_len,
-            completion_ids,
-            chunk_size
-    ):
-        all_log_probs = []
-        for i in range(0, input_ids.size(0), chunk_size):
-            chunk_input_ids = input_ids[i: i + chunk_size]
-            chunk_attention_mask = attention_mask[i: i + chunk_size]
-            chunk_completion_ids = completion_ids[i: i + chunk_size]
-            log_probs, _ = self._compute_completion_log_probs(
-                model, chunk_input_ids, chunk_attention_mask, prompt_len, chunk_completion_ids
+        def _step_forward(inp_ids, att_mask, comp_ids):
+            pos_ids = calc_position_ids(att_mask)
+            outputs = model(
+                input_ids=inp_ids,
+                attention_mask=att_mask,
+                position_ids=pos_ids,
+                return_logits=False
             )
+
+            h_completion = outputs['hidden_states'][:, prompt_len - 1: -1]
+            with maybe_gather_lm_head_ctx(lm_head.weight, lm_head.bias):
+                logits_completion = h_completion.float() @ lm_head.weight.float().t()
+                if lm_head.bias is not None:
+                    logits_completion = logits_completion + lm_head.bias.float()
+
+            log_probs = log_softmax(logits_completion, comp_ids)
+            aux_loss = outputs['aux_loss']
+
+            return log_probs, aux_loss
+
+        if chunk_size is None or chunk_size <= 0 or chunk_size >= input_ids.size(0):
+            return _step_forward(input_ids, attention_mask, completion_ids)
+
+        all_log_probs = []
+        aux_losses = []
+        for i in range(0, input_ids.size(0), chunk_size):
+            c_input_ids = input_ids[i: i + chunk_size]
+            c_attention_mask = attention_mask[i: i + chunk_size]
+            c_completion_ids = completion_ids[i: i + chunk_size]
+            log_probs, aux_loss = _step_forward(c_input_ids, c_attention_mask, c_completion_ids)
             all_log_probs.append(log_probs)
-        return torch.cat(all_log_probs, dim=0)
+            if aux_loss is not None:
+                aux_losses.append(aux_loss)
+        total_log_probs = torch.cat(all_log_probs, dim=0)
+        total_aux_loss = sum(aux_losses) if len(aux_losses) > 0 else None
+
+        return total_log_probs, total_aux_loss
 
     def _compute_group_relative_advantages(self, rewards):
         group_size = self.grpo_config.group_size
@@ -327,15 +341,15 @@ class GRPOTrainer(BaseTrainer):
             input_ids = torch.cat([padded_prompt_ids, completion_ids], dim=1)
             attention_mask = torch.cat([prompt_masks, completion_pad_mask], dim=1)
 
-            chunk_size = self.grpo_config.grpo_batch_size
+            chunk_size = self.grpo_config.chunked_rollout_size
             with autocast(TrainerTools().parallel.device_type):
-                old_log_probs, _ = self._chunked_compute_log_probs(
+                old_log_probs, _ = self._compute_completion_log_probs(
                     self.train_model, input_ids, attention_mask, prompt_len, completion_ids, chunk_size
                 )
 
             if self.ref_model:
                 with autocast(TrainerTools().parallel.device_type):
-                    ref_log_probs, _ = self._chunked_compute_log_probs(
+                    ref_log_probs, _ = self._compute_completion_log_probs(
                         self.ref_model, input_ids, attention_mask, prompt_len, completion_ids, chunk_size
                     )
             else:

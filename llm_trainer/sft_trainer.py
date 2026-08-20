@@ -2,21 +2,22 @@ from typing import Optional, Tuple, List
 import torch
 from torch.utils.data import Dataset
 
+from .base_trainer import BaseTrainer
+from .dataset import SFTDataset
+from .tools import TrainerTools
+from .partition_utils import unwrap_model
+
 from llm_model import (
     VLMConfig,
     LlmModel,
     VlmModel
 )
-
-from .base_trainer import BaseTrainer
-from .dataset import SFTDataset
-from .tools import TrainerTools
-
 from .train_configs import (
     TrainConfig,
     GenerationService
 )
 from .loss import (
+    ChunkedLMLoss,
     LMLoss,
     KDLoss
 )
@@ -56,12 +57,14 @@ class SFTTrainer(BaseTrainer):
         self.sft_config = train_config.sft_config
         self.pixel_values_provider = self.sft_config.pixel_values_provider
         self.eval_image_tags = eval_image_tags
+        self.chunked_cross_entropy_size = self.sft_config.chunked_cross_entropy_size
 
         super().__init__(
             train_config=train_config,
             eval_prompts=eval_prompts,
             generation_service=generation_service,
-            gradient_accumulation_steps=self.sft_config.gradient_accumulation_steps
+            gradient_accumulation_steps=self.sft_config.gradient_accumulation_steps,
+            return_logits=self.chunked_cross_entropy_size is None
         )
 
         self.criterion, self.kd_loss = self._init_loss()
@@ -133,16 +136,46 @@ class SFTTrainer(BaseTrainer):
         return SFTDataset(file_path, block_size, image_tag_file_path, tokens_per_image), file_path
 
     def _init_loss(self) -> Tuple[torch.nn.Module, Optional[torch.nn.Module]]:
-        return LMLoss(), KDLoss() if self.sft_config.kd_config else None
+        if self.chunked_cross_entropy_size is not None:
+            criterion = ChunkedLMLoss(chunk_size=self.chunked_cross_entropy_size)
+        else:
+            criterion = LMLoss()
 
-    def _calc_loss(self, inputs, attention_mask, logits, labels) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        return criterion, KDLoss() if self.sft_config.kd_config else None
+
+    def _calc_loss(self, inputs, attention_mask, result, labels) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        kd_config = self.sft_config.kd_config
+        has_kd = (kd_config is not None and kd_config.kd_coef > 0.0)
+
         # calc loss
-        ce_loss = self.criterion(logits, labels)
-        if not self.kd_loss or self.sft_config.kd_config.kd_coef == 0.0:
-            # 不用计算kd_loss
+        if isinstance(self.criterion, ChunkedLMLoss):
+            unwrapped = unwrap_model(self.train_model)
+            lm_head = unwrapped.lm_head
+            teacher_logits = None
+            kd_coef = 0.0
+
+            if has_kd:
+                with torch.no_grad():
+                    teacher_logits = kd_config.teacher_logits_provider(inputs, attention_mask)
+                kd_coef = kd_config.kd_coef
+
+            total_loss, ce_loss = self.criterion(
+                hidden_states=result['hidden_states'],
+                lm_head_weight=lm_head.weight,
+                labels=labels,
+                lm_head_bias=lm_head.bias,
+                teacher_logits=teacher_logits,
+                kd_coef=kd_coef
+            )
+            return total_loss, ce_loss
+
+        ce_loss = self.criterion(result['logits'], labels)
+        if not has_kd:
             return ce_loss, ce_loss
 
-        teacher_logits = self.sft_config.kd_config.teacher_logits_provider(inputs, attention_mask)
-        loss = self.kd_loss(logits, teacher_logits, labels)
+        with torch.no_grad():
+            teacher_logits = kd_config.teacher_logits_provider(inputs, attention_mask)
 
-        return (1 - self.sft_config.kd_config.kd_coef) * ce_loss + self.sft_config.kd_config.kd_coef * loss, ce_loss
+        kd_loss = self.kd_loss(result['logits'], teacher_logits, labels)
+        total_loss = (1.0 - kd_config.kd_coef) * ce_loss + kd_config.kd_coef * kd_loss
+        return total_loss, ce_loss

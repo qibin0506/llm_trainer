@@ -277,7 +277,6 @@ class KDConfig:
 class GenerateConfig:
     """
     模型自回归生成 (Eval / Generation / Rollout) 阶段的解码配置。
-
     Args:
         max_seq_len (`int`): 生成序列的最大总长度（包含 Prompt）。
         temperature (`float`): 采样温度，控制生成随机性。值越高结果越随机。
@@ -286,6 +285,7 @@ class GenerateConfig:
         repetition_penalty (`Optional[float]`): 重复惩罚因子 (大于 1.0 开启)，防止模型反复生成相同 Token。
         exclude_penalty_tokens (`Optional[List[int]]`): 在重复惩罚中需要被豁免的 Token IDs (如标点符号、换行)。
         suppress_tokens (`Optional[List[int]]`): 强行抑制不被生成的 Token IDs，将其 Logits 置为 -inf。
+        auto_prefix_cache (`bool`): 是否开启自动公共前缀 KV Cache 复用（当 Batch 内样本具有相同 Prompt 前缀且无左填充时大幅加速生成）。
     """
     max_seq_len: int = 512
     temperature: float = 1.0
@@ -305,9 +305,11 @@ class PretrainConfig:
     Args:
         gradient_accumulation_steps (`int`): 梯度累积步数，模拟更大的 Batch Size 以适应小显存。
         kd_config (`Optional[KDConfig]`): 知识蒸馏相关配置，若为 None 则不启用。
+        chunked_cross_entropy_size (Optional[int]): 分块交叉熵大小，默认为None不分块计算
     """
     gradient_accumulation_steps: int = 1
     kd_config: Optional[KDConfig] = None
+    chunked_cross_entropy_size: Optional[int] = None
 
 
 @dataclass(kw_only=True)
@@ -319,6 +321,7 @@ class SFTConfig:
         mask_prompt (`bool`): 是否使用 ignore_index (-100) Mask 掉输入中的 Prompt 部分，使模型只对回答计算 Loss。
         gradient_accumulation_steps (`int`): 梯度累积步数。
         kd_config (`Optional[KDConfig]`): 知识蒸馏相关配置。
+        chunked_cross_entropy_size (Optional[int]): 分块交叉熵大小，默认为None不分块计算
         image_tags_file_dataset (`Optional[FileDataset]`): 多模态 SFT 场景下提供对应数据集的图像 Tag 映射。
         pixel_values_provider (`Optional[PixelValuesProvider]`): VLM 训练时，根据 image_tag 提供图像像素矩阵的回调。
         freeze_llm_model (`bool`): VLM 微调中是否冻结底座大模型，仅微调 Projector 投影层。
@@ -326,6 +329,7 @@ class SFTConfig:
     mask_prompt: bool = True
     gradient_accumulation_steps: int = 1
     kd_config: Optional[KDConfig] = None
+    chunked_cross_entropy_size: Optional[int] = None
     image_tags_file_dataset: Optional[FileDataset] = None
     pixel_values_provider: Optional["PixelValuesProvider"] = None
     freeze_llm_model: bool = False
@@ -362,7 +366,6 @@ class DPOConfig:
 class PPOConfig:
     """
     近端策略优化 (Proximal Policy Optimization, PPO) 算法训练配置。
-
     Args:
         ppo_epochs (`int`): 在当前 Rollout 数据批次上，反复更新 Policy 和 Value 模型的次数。
         ppo_batch_size (`int`): PPO 内部计算 Loss 时的微批次 (Micro-batch) 大小。
@@ -370,12 +373,14 @@ class PPOConfig:
         value_model_weights_path (`Optional[str]`): Value (Critic) 模型的初始化权重路径。
         value_optim_config (`Optional[OptimConfig]`): 专门为 Value 模型配置独立的优化器及学习率。
         gradient_accumulation_steps (`int`): 梯度累积步数。
+        chunked_rollout_size (`Optional[int]`): 采样生成 (Rollout) 阶段的分块大小。若设置则按 chunk 分批进行序列生成，以降低生成时的显存峰值。
         gamma (`float`): 优势函数 (GAE) 中的折扣因子 (Discount Factor)，决定长期奖励的衰减。
         lam (`float`): GAE 中的 lambda 参数，权衡偏差与方差。
         clip_eps (`float`): PPO 的核心裁剪阈值，限制新旧策略更新的步长差距，防止更新崩溃。
         vf_coef (`float`): 总 Loss 中 Value Loss 的权重系数。
         kl_beta (`float`): 基于 KL 散度的初始惩罚奖励系数。
         kl_estimator (`str`): 计算近似 KL 散度的方法，支持 "k1" (log ratio) 或 "k3" (严格近似)。
+        huber_delta (`float`): Value 损失函数中 Smooth L1 (Huber Loss) 的平滑阈值 beta。
         ptx_coef (`float`): 预训练数据 (PTX) Loss 的混合占比系数，用于缓解灾难性遗忘。
         missing_eos_penalty (`Optional[float]`): 针对模型未能正常生成 EOS (结束符) 的硬性奖励惩罚值。
         normalize_rewards (`bool`): 是否在喂给 GAE 前对环境 Reward 进行标准化。
@@ -389,6 +394,7 @@ class PPOConfig:
     value_model_weights_path: Optional[str] = None
     value_optim_config: Optional[OptimConfig] = None
     gradient_accumulation_steps: int = 1
+    chunked_rollout_size: Optional[int] = None
     gamma: float = 1.0
     lam: float = 0.95
     clip_eps: float = 0.1
@@ -408,13 +414,13 @@ class PPOConfig:
 class GRPOConfig:
     """
     组相对策略优化 (Group Relative Policy Optimization, DeepSeek V3 核心强化学习算法) 配置。
-
     Args:
         grpo_epochs (`int`): 同一批数据的复用训练次数。
         grpo_batch_size (`int`): 模型前向/反向的微批次大小。
         group_size (`int`): 对同一个 Prompt 并行生成多少个不同的答案，用于组内 Advantage 优势归一化计算。
         ref_model_weights_path (Optional[str]): GRPO 计算 KL 惩罚奖励时参考模型的权重路径。
         gradient_accumulation_steps (`int`): 梯度累积步数。
+        chunked_rollout_size (`Optional[int]`): 采样生成 (Rollout) 阶段的分块大小。当 group_size 较大时按 chunk 分批生成，防止显存 OOM。
         loss_beta (`float`): KL 惩罚强度。在特定模式下(loss_importance_sampling_level=sequence) 可设为 0.0 改为隐式约束。
         loss_clip_eps (`float`): PPO 基础截断的下限 epsilon。
         loss_clip_eps_high (`Optional[float]`): 不对称裁剪中的上限 epsilon。
@@ -435,6 +441,7 @@ class GRPOConfig:
     group_size: int = 12
     ref_model_weights_path: Optional[str] = None
     gradient_accumulation_steps: int = 1
+    chunked_rollout_size: Optional[int] = None
     loss_beta: float = 0.04
     loss_clip_eps: float = 3e-4
     loss_clip_eps_high: Optional[float] = 4e-4
@@ -455,7 +462,6 @@ class GRPOConfig:
 class TrainConfig:
     """
     全局训练入口参数配置项。控制训练的所有核心层级调度。
-
     Args:
         n_epochs (`int`): 全局数据集需要训练的 Epoch 轮数。
         batch_size (`int`): Global Batch Size (每个 GPU 每次 Data Loader 取出的数据条数)。
@@ -467,8 +473,8 @@ class TrainConfig:
         optim_config (`OptimConfig`): 优化器 (Lion/Adam) 及学习率配置。
         ds_config (`DsConfig`): 掌控分布式底层的 DeepSpeed 引擎配置（含 ZeRO）。
         eval_config (`GenerateConfig`): 训练期间触发 Evaluation 测试集时的生成配置。
-        save_interval (`int`): 指定多少个 global batch step 后触发一次 checkpoint 保存。
-        eval_interval (`int`): 指定多少个 global batch step 后触发一次 checkpoint 保存。
+        save_interval (`int`): 指定多少个 global batch step 后触发一次 Checkpoint 保存。
+        eval_interval (`int`): 指定多少个 global batch step 后触发一次评估/测试集 Evaluation。
         gradient_checkpointing (`bool`): 是否开启梯度检查点，如果开启且使用ds模式，会自动配置DsActivationCheckpointingConfig
         pretrain_config (`Optional[PretrainConfig]`): 使用基础 Trainer 时的配置组。
         sft_config (`Optional[SFTConfig]`): 使用 SFTTrainer 时的监督微调配置组。
@@ -585,8 +591,23 @@ class PtxBuilder(Protocol):
         ...
 
 class TeacherLogitsProvider(Protocol):
+    """
+    知识蒸馏 (KD) 场景下获取 Teacher 模型输出 Logits 的回调函数接口。
+    Args:
+        input_ids (torch.Tensor): 输入 Token 序列张量，形状为 [batch_size, seq_len]。
+        attention_mask (torch.Tensor): 注意力掩码张量，形状为 [batch_size, seq_len]。
+    Returns:
+        torch.Tensor: Teacher 模型计算出的 Logits 张量，形状为 [batch_size, seq_len, vocab_size]。
+    """
     def __call__(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor: ...
 
 
 class PixelValuesProvider(Protocol):
+    """
+    多模态 VLM 场景下根据图像标签获取预处理后像素张量的回调函数接口。
+    Args:
+        image_tags (List[str]): 包含图像路径或标识符的 Tag 字符串列表。
+    Returns:
+        torch.Tensor: 预处理后的图像特征/像素张量 (Pixel Values)。
+    """
     def __call__(self, image_tags: List[str]) -> torch.Tensor: ...

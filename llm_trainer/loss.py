@@ -2,7 +2,138 @@ from typing import Optional, Tuple
 import math
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 import torch.nn.functional as F
+from .partition_utils import maybe_gather_lm_head_ctx
+
+
+def _chunk_ce_kd_forward(
+        h_chunk: torch.Tensor,
+        w: torch.Tensor,
+        b: Optional[torch.Tensor],
+        lbl_chunk: torch.Tensor,
+        t_logits_chunk: Optional[torch.Tensor],
+        ignore_index: int,
+        kd_coef: float
+):
+    """
+    单个 chunk 内部的前向计算：运行在 torch.utils.checkpoint 内部
+    同时完成 Student 投影、CE 损失计算与 KD 蒸馏损失计算
+    """
+    with maybe_gather_lm_head_ctx(w, b):
+        s_logits = h_chunk.float() @ w.float().t()
+        if b is not None:
+            s_logits = s_logits + b.float()
+    s_log_p = F.log_softmax(s_logits, dim=-1)
+
+    chunk_ce_loss = F.nll_loss(s_log_p, lbl_chunk, ignore_index=ignore_index, reduction="sum")
+
+    valid = lbl_chunk != ignore_index
+    chunk_correct = ((s_logits.argmax(dim=-1) == lbl_chunk) & valid).sum().float()
+    if t_logits_chunk is not None and kd_coef > 0.0:
+        t_probs = F.softmax(t_logits_chunk.float(), dim=-1)
+        inf_mask = torch.isinf(s_logits)
+        prod_probs = torch.masked_fill(t_probs * s_log_p, inf_mask, 0.0)
+
+        per_token_kd = -torch.sum(prod_probs, dim=-1) * valid.float()
+        chunk_kd_loss = per_token_kd.sum()
+
+        chunk_total_loss = (1.0 - kd_coef) * chunk_ce_loss + kd_coef * chunk_kd_loss
+    else:
+        chunk_total_loss = chunk_ce_loss
+
+    return chunk_total_loss, chunk_ce_loss, chunk_correct
+
+
+class ChunkedLMLoss(nn.Module):
+    """
+    支持 Active Token Filtering + Chunked Cross Entropy + Chunked Knowledge Distillation
+    """
+
+    def __init__(
+            self,
+            chunk_size: int = 256,
+            ignore_index: int = -100,
+    ):
+        super().__init__()
+        self.chunk_size = chunk_size
+        self.ignore_index = ignore_index
+
+    def forward(
+            self,
+            hidden_states: torch.Tensor,
+            lm_head_weight: torch.Tensor,
+            labels: torch.Tensor,
+            lm_head_bias: Optional[torch.Tensor] = None,
+            teacher_logits: Optional[torch.Tensor] = None,
+            kd_coef: float = 0.0,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            hidden_states: [B, S, H]
+            lm_head_weight: [V, H]
+            labels: [B, S]
+            lm_head_bias: lm_head_bias
+            teacher_logits: [B, S, V] (可选，Teacher 模型生成的软标签)
+            kd_coef: 知识蒸馏权重 (0.0 ~ 1.0)
+        Returns:
+            total_loss: 结合 CE 和 KD 的总损失 (标量)
+            ce_loss: 纯 CE 损失 (标量，用于监控 ppl 和评估)
+        """
+        hidden = hidden_states[:, :-1, :].reshape(-1, hidden_states.size(-1))
+        shift_labels = labels[:, 1:].reshape(-1)
+
+        if teacher_logits is not None and kd_coef > 0.0:
+            shift_teacher_logits = teacher_logits[:, :-1, :].reshape(-1, teacher_logits.size(-1))
+        else:
+            shift_teacher_logits = None
+
+        valid = shift_labels != self.ignore_index
+        n_valid_tensor = valid.sum()
+
+        if n_valid_tensor == 0:
+            with maybe_gather_lm_head_ctx(lm_head_weight, lm_head_bias):
+                loss = (hidden_states.float().sum() + lm_head_weight.float().sum()) * 0.0
+                if lm_head_bias is not None:
+                    loss = loss + lm_head_bias.float().sum() * 0.0
+            return loss, loss
+
+        order = valid.to(torch.int8).argsort(descending=True, stable=True)
+        hidden = hidden[order]
+        shift_labels = shift_labels[order]
+        if shift_teacher_logits is not None:
+            shift_teacher_logits = shift_teacher_logits[order]
+
+        n_padded = (n_valid_tensor / self.chunk_size).ceil().to(torch.int64) * self.chunk_size
+        total_loss_accum = hidden.new_zeros((), dtype=torch.float32)
+        ce_loss_accum = hidden.new_zeros((), dtype=torch.float32)
+
+        for start in range(0, n_padded, self.chunk_size):
+            h_chunk = hidden[start: start + self.chunk_size]
+            lbl_chunk = shift_labels[start: start + self.chunk_size]
+
+            if shift_teacher_logits is not None:
+                t_chunk = shift_teacher_logits[start: start + self.chunk_size]
+            else:
+                t_chunk = None
+
+            chunk_total, chunk_ce, _ = torch_checkpoint(
+                _chunk_ce_kd_forward,
+                h_chunk,
+                lm_head_weight,
+                lm_head_bias,
+                lbl_chunk,
+                t_chunk,
+                self.ignore_index,
+                kd_coef,
+                use_reentrant=False,
+            )
+            total_loss_accum = total_loss_accum + chunk_total
+            ce_loss_accum = ce_loss_accum + chunk_ce
+
+        total_loss = total_loss_accum / n_valid_tensor
+        ce_loss = ce_loss_accum / n_valid_tensor
+        return total_loss, ce_loss
 
 
 class LMLoss(nn.Module):

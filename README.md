@@ -1,3 +1,5 @@
+---
+
 # 🚀 LLM/VLM 全流程分布式训练与强化学习框架
 
 一个基于 PyTorch 与 DeepSpeed 构建的高性能、通用大语言模型（LLM）与视觉语言模型（VLM）训练框架。支持从**预训练（Pretrain）**、**监督微调（SFT）**、**直接偏好优化（DPO/ORPO/SimPO）** 到 **强化学习（PPO & GRPO全系列算子）** 的完整生命周期。
@@ -13,10 +15,10 @@
     * [硬件支持 (CUDA/NPU/MLU/MPS)](#硬件支持)
     * [DeepSpeed ZeRO-2 / ZeRO-3 & Offload 配置](#deepspeed-zero-2--zero-3--offload-配置)
 6. [核心训练模块指南](#-核心训练模块指南)
-    * [1. 预训练 (Pretrain Trainer)](#1-预训练-pretrain-trainer)
-    * [2. 监督微调 (SFT Trainer - LLM & VLM)](#2-监督微调-sft-trainer---llm--vlm)
+    * [1. 预训练 (Pretrain Trainer & 分块交叉熵)](#1-预训练-pretrain-trainer)
+    * [2. 监督微调 (SFT Trainer - ATF 与分块损失)](#2-监督微调-sft-trainer---llm--vlm)
     * [3. 偏好对齐 (DPO / ORPO / SimPO Trainer)](#3-偏好对齐-dpo--orpo--simpo-trainer)
-    * [4. 近端策略优化 (PPO Trainer)](#4-近端策略优化-ppo-trainer)
+    * [4. 近端策略优化 (PPO Trainer & Rollout分块)](#4-近端策略优化-ppo-trainer)
     * [5. 组相对策略优化 (GRPO Trainer & 前沿变体)](#5-组相对策略优化-grpo-trainer--前沿变体)
 7. [自定义生成服务 (Generation Services)](#-自定义生成服务-generation-services)
 8. [实用工具 (Tools & Utilities)](#-实用工具-tools--utilities)
@@ -27,12 +29,17 @@
 ## 🔥 项目特性
 
 * **全流程算法支持**：覆盖 Pretrain、SFT、DPO/ORPO/SimPO、PPO 以及 DeepSeek-R1 核心的 GRPO 及其衍生算子（BNPO, Dr-GRPO, CISPO, DAPO, LUSPO, SAPO, VESPO）。
+* **Active Token Filtering (ATF) & Chunked Cross Entropy (CCE)**：
+  - **动态 Token 筛选**：在 SFT/Pretrain 阶段自动过滤 `-100` 掩码（Prompt/Padding），仅将有效 Token 送入投影层，砍掉 $70\% \sim 90\%$ 的无用 GEMM 计算。
+  - **分块交叉熵 + 梯度检查点**：支持 `chunked_cross_entropy_size`，在前向阶段完全避免具象化超大 $[B, S, V]$ 的 Logits 显存。
+  - **ZeRO-3 原生安全**：内置 `maybe_gather_lm_head_ctx` 与 Zero-Token 假节点穿透，彻底杜绝跨卡通信悬挂与死锁。
+* **分块强化学习与评估 (Chunked Rollout)**：PPO / GRPO 支持在 Log-probs 计算与 Rollout 阶段启用 `chunked_rollout_size`，支持大组采样（Group Size）无显存峰值（OOM）。
 * **多模态 (VLM) 训练**：支持多模态投影层冻结/微调、图像虚拟 Token 扩展与动态 Pixel Features 注入。
 * **异构硬件支持**：原生适配 **NVIDIA CUDA (NCCL)**、**华为升腾 NPU (HCCL)**、**寒武纪 MLU (CNCL)**、**Apple Silicon (MPS)** 及 **CPU/Gloo**。
 * **DeepSpeed 深度集成**：灵活配置 ZeRO-1/2/3、ZeRO-Offload (CPU/NVMe)、ZeRO++ 梯度/权重量化及激活检查点（Activation Checkpointing）。
-* **内存高效的数据载入**：支持 `.npy` (内存映射 mmap)、`.jsonl` 和 `.pkl` 格式，支持大体量数据集零内存暴涨加载。
+* **高效数据载入**：支持 `.npy` (内存映射 mmap)、`.jsonl` 和 `.pkl` 格式，大体量数据集零内存暴涨加载。
 * **解耦生成服务**：内置单卡集中生成、并行广播生成以及**多轮 RL 交互环境服务（Multi-Turn RL）**。
-* **知识蒸馏 (KD) & 灾难性遗忘缓解**：SFT/Pretrain 支持基于 Logits 的 KD 损失；PPO/GRPO 支持 PTX 混合预训练损失。
+* **分块知识蒸馏 (Chunked KD) & PTX**：支持在分块计算中同步完成 Student/Teacher 软标签蒸馏；PPO/GRPO 支持 PTX 混合预训练损失。
 
 ---
 
@@ -40,20 +47,20 @@
 
 ```text
 ├── __init__.py             # 统一导出入口
-├── base_trainer.py         # 训练器基类 (生命周期管理、梯度累积、Checkpoint、LR调度器)
-├── trainer.py              # 预训练 Trainer
-├── sft_trainer.py          # 监督微调 SFT Trainer (支持 LLM & VLM)
+├── base_trainer.py         # 训练器基类 (生命周期管理、梯度累积、Checkpoint、return_logits调度)
+├── trainer.py              # 预训练 Trainer (支持 ChunkedLMLoss 分块交叉熵)
+├── sft_trainer.py          # 监督微调 SFT Trainer (支持 Active Token Filtering 与 VLM)
 ├── dpo_trainer.py          # 偏好对齐 DPO Trainer (支持 DPO, ORPO, SimPO)
-├── ppo_trainer.py          # 强化学习 PPO Trainer (支持 Value Model, GAE, KL Penalty)
-├── grpo_trainer.py         # 强化学习 GRPO Trainer (支持组内归一化及多种前沿 Loss)
-├── train_configs.py        # 全局配置类 dataclasses (Optim, DsConfig, GenerateConfig 等)
+├── ppo_trainer.py          # 强化学习 PPO Trainer (支持 Value Model, GAE, Rollout 分块与 Whitening)
+├── grpo_trainer.py         # 强化学习 GRPO Trainer (支持组内归一化、Rollout 分块及多种前沿 Loss)
+├── train_configs.py        # 全局配置类 dataclasses (Optim, DsConfig, GenerateConfig, Protocols)
 ├── parallel.py             # 分布式并行抽象层 (DsParallel, NoneParallel, 多后端适配)
 ├── generation_service.py   # 生成服务 (SyncCentral, Parallel, MultiTurnRL)
 ├── generate_utils.py       # 自回归生成底层算子 (KV Cache, 核采样, 惩罚项, Prefix Cache)
-├── loss.py                 # Loss 算子库 (CrossEntropy, KD, DPO, PPO, GRPO全系列)
+├── loss.py                 # Loss 算子库 (ChunkedLMLoss, LMLoss, KDLoss, DPO, PPO, GRPO全系列)
 ├── dataset.py              # Dataset 实现类 (Pretrain, SFT, DPO, RL)
 ├── tokenizer.py            # NanoTokenizer 封装与 Chat Template 应用
-├── partition_utils.py      # ZeRO-3 权重 Gather、Unwrap 与跨 Rank 同步工具
+├── partition_utils.py      # ZeRO-3 权重 Gather、maybe_gather_lm_head_ctx、Unwrap 与跨 Rank 同步
 ├── checkpoint.py           # Checkpoint / Steps 序列化与恢复
 ├── ds_checkpoint.py        # DeepSpeed Checkpoint 管理
 ├── scheduler.py            # Warmup Cosine LR 调度器及复合调度器
@@ -143,8 +150,6 @@ export CHECKPOINT_DIR="./output_ckpts"
 
 ### DeepSpeed ZeRO-2 / ZeRO-3 & Offload 配置
 
-通过 Python API 可以非常直观地构建 DeepSpeed 配置：
-
 ```python
 from train_configs import (
     DsConfig, DsZero3Config, DsOffloadConfig, 
@@ -173,26 +178,29 @@ ds_config = DsConfig(
 
 ## 🔍 核心训练模块指南
 
-所有 Trainer 均继承自 `BaseTrainer`，内置了断点续训 (Resume)、混合精度 (AMP)、自动学习率调度、日志记录与定时 Evaluation 评估。
+所有 Trainer 均继承自 `BaseTrainer`，内置断点续训 (Resume)、混合精度 (AMP)、自动学习率调度、日志记录与定时 Evaluation 评估。
 
 ---
 
 ### 1. 预训练 (Pretrain Trainer)
 
-预训练阶段针对文本序列使用自回归 Cross-Entropy Loss（可叠加 Teacher 模型进行知识蒸馏）。
+预训练支持自回归 Cross-Entropy Loss（可叠加 Teacher 模型进行知识蒸馏）。通过配置 `chunked_cross_entropy_size` 可开启**分块交叉熵**，骨干模型自动跳过全量 Logits 计算（`return_logits=False`），大幅降低长文本预训练显存。
 
 ```python
 from trainer import Trainer
-from train_configs import TrainConfig, PretrainConfig, OptimConfig
+from train_configs import TrainConfig, PretrainConfig, OptimConfig, KDConfig
 
 train_config = TrainConfig(
     n_epochs=1,
     batch_size=8,
-    dataset_block_size=2048,
+    dataset_block_size=4096,
     file_dataset=["path/to/data1.npy", "path/to/data2.npy"],
     model_config=your_model_config,
     optim_config=OptimConfig(initial_lr=3e-4, optim_type='adam'),
-    pretrain_config=PretrainConfig(gradient_accumulation_steps=4),
+    pretrain_config=PretrainConfig(
+        gradient_accumulation_steps=4,
+        chunked_cross_entropy_size=1024 # 开启分块计算 (建议 512 ~ 2048)
+    ),
     ds_config=ds_config
 )
 
@@ -207,7 +215,10 @@ trainer.train()
 
 ### 2. 监督微调 (SFT Trainer - LLM & VLM)
 
-SFT 支持 Prompt Masking（只对 Assistant 回答计算 Loss），并原生支持多模态视觉语言模型 (VLM) 训练。
+SFT 原生支持 Prompt Masking（只对 Assistant 回答计算 Loss）。当配置 `chunked_cross_entropy_size` 时，底层通过 `ChunkedLMLoss` 自动激活 **Active Token Filtering (ATF)**：
+- 自动将所有的有效 Token 进行紧凑排列并分块；
+- 内部采用 `torch.utils.checkpoint` 逐块投影并释放显存；
+- 支持在分块阶段同步完成 **Knowledge Distillation (KD)** 软标签蒸馏。
 
 #### A. LLM 监督微调
 ```python
@@ -217,13 +228,14 @@ from train_configs import TrainConfig, SFTConfig, OptimConfig
 train_config = TrainConfig(
     n_epochs=3,
     batch_size=4,
-    dataset_block_size=1024,
+    dataset_block_size=2048,
     file_dataset=["path/to/sft_data.jsonl"],
     model_config=llm_model_config,
     optim_config=OptimConfig(initial_lr=2e-5),
     sft_config=SFTConfig(
-        mask_prompt=True, # 开启 Prompt 掩码
-        gradient_accumulation_steps=2
+        mask_prompt=True,                 # 开启 Prompt 掩码
+        gradient_accumulation_steps=2,
+        chunked_cross_entropy_size=512    # 开启 Active Token Filtering 与分块 CE
     )
 )
 
@@ -247,9 +259,10 @@ def pixel_provider(image_tags):
 train_config.sft_config = SFTConfig(
     mask_prompt=True,
     gradient_accumulation_steps=2,
+    chunked_cross_entropy_size=512,
     image_tags_file_dataset=["path/to/image_tags.csv"],
     pixel_values_provider=pixel_provider,
-    freeze_llm_model=True # 可选择冻结 LLM 底座，仅微调 Projector
+    freeze_llm_model=True # 冻结 LLM 底座，仅微调 Projector
 )
 ```
 
@@ -300,26 +313,31 @@ trainer.train()
 
 ### 4. 近端策略优化 (PPO Trainer)
 
-PPO 包含了 Actor (Policy) 模型与 Critic (Value) 模型，采用 GAE 优势估计，内置 Running Mean/Std 归一化与 KL 散度惩罚。
+PPO 包含了 Actor (Policy) 模型与 Critic (Value) 模型，采用 GAE 优势估计，支持 Running Mean/Std 归一化、Advantage 白化（Whitening）与 KL 散度惩罚。
+支持配置 `chunked_rollout_size` 在计算 Policy / Reference Log-probs 及 Value 时按分块执行，防止长序列显存溢出。
 
 ```python
 from ppo_trainer import PPOTrainer
 from train_configs import TrainConfig, PPOConfig, GenerateConfig, OptimConfig
 
+# 支持 1D 轨迹标量奖励 或 2D 逐 Token 稠密奖励
 def reward_function(prompt_ids, completion_ids, gt_answer_ids):
-    # 返回 List[float]，表示每个生成 Response 的标量 Reward
+    # 返回 List[float] (1D Outcome Reward) 或 List[List[float]] (2D Process/Dense Reward)
     return [compute_score(c, g) for c, g in zip(completion_ids, gt_answer_ids)]
 
 train_config.ppo_config = PPOConfig(
     ppo_epochs=1,
     ppo_batch_size=2,
     gradient_accumulation_steps=2,
+    chunked_rollout_size=2,            # 采样/估值阶段按 chunk 分批执行，消除峰值显存
     ref_model_weights_path="path/to/ref_model",
     value_model_weights_path="path/to/value_model",
     value_optim_config=OptimConfig(initial_lr=1e-5), # Critic 独立学习率
     kl_beta=0.02,
-    clip_eps=0.2,
-    normalize_rewards=True,
+    clip_eps=0.1,
+    vf_coef=0.1,
+    whiten_rewards=True,               # 默认启用 Advantage 白化
+    normalize_rewards=False,
     generate_config=GenerateConfig(max_seq_len=512, temperature=0.7)
 )
 
@@ -350,7 +368,7 @@ from grpo_trainer import GRPOTrainer
 from train_configs import TrainConfig, GRPOConfig, GenerateConfig
 
 def reward_function(prompt_ids, completion_ids, gt_answer_ids):
-    # 针对 batch_size * group_size 条样本计算奖励
+    # 针对 batch_size * group_size 条样本计算奖励 (支持 1D 标量或 2D 稠密打分)
     scores = []
     for comp, gt in zip(completion_ids, gt_answer_ids):
         score = rule_based_math_checker(comp, gt)
@@ -365,11 +383,12 @@ def ptx_builder(prompt_ids_list, gt_answer_ids_list):
 train_config.grpo_config = GRPOConfig(
     grpo_epochs=1,
     grpo_batch_size=2,
-    group_size=8, # 每个 Prompt 采样 8 个回答进行组内竞争
+    group_size=12,                     # 组内采样数
     gradient_accumulation_steps=2,
-    loss_type='grpo', # 可选: 'bnpo', 'dr_grpo', 'cispo', 'dapo', 'luspo', 'sapo', 'vespo'
-    loss_beta=0.04,   # KL 散度约束强度
-    ptx_coef=0.1,     # PTX 预训练 Loss 融合权重
+    chunked_rollout_size=4,            # Group 评估时分块计算 Log-probs，防止 OOM
+    loss_type='grpo',                  # 可选: 'bnpo', 'dr_grpo', 'cispo', 'dapo', 'luspo', 'sapo', 'vespo'
+    loss_beta=0.04,                    # KL 散度约束强度
+    ptx_coef=0.1,                      # PTX 预训练 Loss 融合权重
     generate_config=GenerateConfig(max_seq_len=1024, temperature=0.9, top_p=0.95)
 )
 
@@ -394,7 +413,7 @@ trainer.train()
 ### 2. `ParallelGenerationService`
 多卡并行生成服务。使用自定义的桶式 `dist.broadcast` 高效同步模型最新权重到各卡独立生成设备，避免 pickle 序列化开销。
 
-### 3. `MultiTurnRLGenerationService` (多轮环境交互/ Agent RL)
+### 3. `MultiTurnRLGenerationService` (多轮环境交互 / Agent RL)
 专门用于大模型代码执行、公式推理、工具调用的多轮强化学习交互服务。
 
 ```python
@@ -475,19 +494,14 @@ save_pt_weights_to_safetensors(
 ```python
 from tools import extract_policy_weights_from_ppo
 
-# 提取纯 Policy 模型权重 state_dict，方便转存与部署
 policy_state_dict = extract_policy_weights_from_ppo(model_config, ppo_checkpoint_weights)
 ```
 
 ---
 
-
 # 📖 附录
 
-
 ## 1. 全局训练主配置 (`TrainConfig`)
-
-全局训练配置类，负责协调模型、优化器、分布式引擎及特定算法阶段的全局调度。
 
 | 参数名 | 类型 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- |
@@ -503,7 +517,7 @@ policy_state_dict = extract_policy_weights_from_ppo(model_config, ppo_checkpoint
 | `eval_config` | `GenerateConfig` | `GenerateConfig()` | 训练过程中触发 Evaluation 阶段时的生成控制参数。 |
 | `save_interval` | `int` | `100` | 每隔多少个 global batch step 触发一次保存 checkpoint。 |
 | `eval_interval` | `int` | `100` | 每隔多少个 global batch step 触发一次测试集推理评估。 |
-| `gradient_checkpointing` | `bool` | `False` | 是否开启梯度检查点（重计算）以节省显存。 |
+| `gradient_checkpointing` | `bool` | `False` | 是否开启梯度检查点；若开启且使用 DeepSpeed，会自动同步初始化 `ds_config.activation_checkpointing`。 |
 | `pretrain_config` | `Optional[PretrainConfig]` | `None` | 使用 `Trainer` 进行无监督预训练时的特定配置。 |
 | `sft_config` | `Optional[SFTConfig]` | `None` | 使用 `SFTTrainer` 进行监督微调时的特定配置。 |
 | `dpo_config` | `Optional[DPOConfig]` | `None` | 使用 `DPOTrainer` 进行直接偏好对齐时的特定配置。 |
@@ -568,6 +582,7 @@ policy_state_dict = extract_policy_weights_from_ppo(model_config, ppo_checkpoint
 | :--- | :--- | :--- | :--- |
 | `gradient_accumulation_steps` | `int` | `1` | 梯度累积步数，用于模拟更大 Global Batch Size。 |
 | `kd_config` | `Optional[KDConfig]` | `None` | 知识蒸馏配置；设为 `None` 则不开启蒸馏。 |
+| `chunked_cross_entropy_size` | `Optional[int]` | `None` | 分块交叉熵大小（如 `512` / `1024` / `2048`）。开启后自动跳过全量 Logits 前向计算，按 Chunk 计算 CE/KD 损失以显著降低显存。 |
 
 ### 3.2 监督微调配置 (`SFTConfig`)
 
@@ -576,6 +591,7 @@ policy_state_dict = extract_policy_weights_from_ppo(model_config, ppo_checkpoint
 | `mask_prompt` | `bool` | `True` | 是否使用 `-100` Mask 屏蔽输入中的 Prompt，仅对回答部分计算 Loss。 |
 | `gradient_accumulation_steps` | `int` | `1` | 梯度累积步数。 |
 | `kd_config` | `Optional[KDConfig]` | `None` | 知识蒸馏配置。 |
+| `chunked_cross_entropy_size` | `Optional[int]` | `None` | 分块交叉熵大小。开启后自动启用 **Active Token Filtering (ATF)** 动态剔除 Prompt/Padding Token，并在 ZeRO-3 环境下安全分块计算损失。 |
 | `image_tags_file_dataset` | `Optional[FileDataset]` | `None` | 多模态场景下提供图片 Tag 标识的文件映射 Dataset。 |
 | `pixel_values_provider` | `Optional[PixelValuesProvider]` | `None` | 根据 Image Tag 动态提供图片像素 Tensor 的回调函数。 |
 | `freeze_llm_model` | `bool` | `False` | VLM 微调时是否冻结 LLM 底座，仅训练 Projector 投影层。 |
@@ -604,17 +620,19 @@ policy_state_dict = extract_policy_weights_from_ppo(model_config, ppo_checkpoint
 | `value_model_weights_path` | `Optional[str]` | `None` | Critic (Value) 模型的初始化权重路径。 |
 | `value_optim_config` | `Optional[OptimConfig]` | `None` | 为 Critic 模型配置的独立优化器与学习率设置。 |
 | `gradient_accumulation_steps` | `int` | `1` | 梯度累积步数。 |
+| `chunked_rollout_size` | `Optional[int]` | `None` | 采样生成与估值（Rollout）阶段的分块大小。若设置则分批计算 log-probs 与 values，降低峰值显存。 |
 | `gamma` | `float` | `1.0` | GAE 优势估计中的折扣因子 $\gamma$。 |
 | `lam` | `float` | `0.95` | GAE 优势估计中的平滑因子 $\lambda$。 |
 | `clip_eps` | `float` | `0.1` | PPO 策略更新的代换截断阈值 $\epsilon$。 |
-| `vf_coef` | `float` | `0.5` | 总 Loss 中 Value Loss 的比重系数。 |
+| `vf_coef` | `float` | `0.1` | 总 Loss 中 Value Loss 的比重系数。 |
 | `kl_beta` | `float` | `0.02` | 基于 KL 散度的环境奖励惩罚系数。 |
 | `kl_estimator` | `str` | `'k1'` | 近似 KL 计算公式：`'k1'`（Log-Ratio 方差）或 `'k3'`。 |
+| `huber_delta` | `float` | `1.0` | Value 损失函数中 Smooth L1 (Huber Loss) 的平滑阈值 beta。 |
 | `ptx_coef` | `float` | `0.0` | PTX 混合预训练 Loss 的权重，用于缓解灾难性遗忘。 |
 | `missing_eos_penalty` | `Optional[float]` | `None` | 当生成的回答未能包含 EOS 结束符时的硬性扣分惩罚值。 |
 | `normalize_rewards` | `bool` | `False` | 是否在送入 GAE 前对 Reward 进行标准化。 |
 | `normalize_method` | `str` | `'RunningMeanStd'` | Reward 标准化算法：`'RunningMeanStd'` 或 `'BatchStd'`。 |
-| `whiten_rewards` | `bool` | `False` | 是否对 GAE 计算得出的 Advantage 优势值进行白化（Whitening）处理。 |
+| `whiten_rewards` | `bool` | `True` | 是否对 GAE 计算得出的 Advantage 优势值进行白化（Whitening）处理。 |
 | `generate_config` | `GenerateConfig` | `GenerateConfig()` | PPO 采样 Rollout 生成数据时的自回归解码参数。 |
 
 ### 3.5 组相对策略优化配置 (`GRPOConfig`)
@@ -626,6 +644,7 @@ policy_state_dict = extract_policy_weights_from_ppo(model_config, ppo_checkpoint
 | `group_size` | `int` | `12` | 对同一个 Prompt 并行生成的不同的回答数量（用于组内归一化）。 |
 | `ref_model_weights_path` | `Optional[str]` | `None` | 参考模型（Reference Model）权重路径；当 `loss_beta=0.0` 时可设为 `None`。 |
 | `gradient_accumulation_steps` | `int` | `1` | 梯度累积步数。 |
+| `chunked_rollout_size` | `Optional[int]` | `None` | Rollout 评估阶段的分块大小。当 `group_size` 较大时分批计算 Log-probs，防止显存 OOM。 |
 | `loss_beta` | `float` | `0.04` | KL 散度惩罚系数。 |
 | `loss_clip_eps` | `float` | `3e-4` | 组相对优化下限截断阈值 $\epsilon_{low}$。 |
 | `loss_clip_eps_high` | `Optional[float]` | `4e-4` | 不对称截断时的上限阈值 $\epsilon_{high}$。 |
@@ -671,7 +690,7 @@ policy_state_dict = extract_policy_weights_from_ppo(model_config, ppo_checkpoint
 
 #### B. ZeRO Stage 2 特有属性 (`DsZero2Config`)
 - `offload_optimizer` (`Optional[DsOffloadConfig]`): 优化器状态 CPU/NVMe 卸载配置。
-- `offload_param` (`Optional[DsOffloadConfig]`): 参数卸载配置。
+- `offload_param` (`Optional[DsOffloadConfig]`): 注意：ZeRO-2 理论上只卸载优化器和梯度，参数卸载(offload_param)部分特性受限。
 
 #### C. ZeRO Stage 3 特有属性 (`DsZero3Config`)
 - `sub_group_size` (`int`, 默认 `1e9`): 参数切分时的子通信组大小。
@@ -682,7 +701,7 @@ policy_state_dict = extract_policy_weights_from_ppo(model_config, ppo_checkpoint
 - `stage3_gather_16bit_weights_on_model_save` (`bool`, 默认 `True`): 保存 Checkpoint 时是否 Gather 收集半精度权重。
 - `memory_efficient_linear` (`bool`, 默认 `True`): 是否在 Linear 算子中开启更精细的显存优化。
 - `offload_optimizer` (`Optional[DsOffloadConfig]`): 优化器卸载配置。
-- `offload_param` (`Optional[DsOffloadConfig]`): 权重参数 CPU/NVMe 卸载配置。
+- `offload_param` (`Optional[DsOffloadConfig]`): 模型参数卸载配置。
 - `zero_quantized_weights` (`bool`, 默认 `False`): **ZeRO++ QWZ** 特性，开启 INT8 权重 All-Gather 传输，减少一半通信量。
 - `zero_hpz_partition_size` (`int`, 默认 `1`): **ZeRO++ HPZ** 特性，层级切分策略。多机训练时建议设为单机 GPU 数（如 8），消除跨节点拉取权重的网络瓶颈。
 - `zero_quantized_gradients` (`bool`, 默认 `False`): **ZeRO++ QGZ** 特性，开启 INT4/INT8 的梯度 Reduce-Scatter 压缩。
@@ -719,3 +738,66 @@ policy_state_dict = extract_policy_weights_from_ppo(model_config, ppo_checkpoint
 | `top_modules` | `int` | `1` | 在性能分析报告中展示耗时或计算量排名前 N 的模块。 |
 | `detailed` | `bool` | `True` | 是否打印包含各个算子及内存带宽详细信息的深度报告。 |
 | `output_file` | `Optional[str]` | `None` | 分析报告写入的文件路径；若为 `None` 则直接打印到标准终端控制台。 |
+
+---
+
+## 5. Protocols 回调协议类型定义
+
+框架在 `train_configs.py` 中定义了标准协议接口：
+
+### 5.1 奖励计算接口 (`RewardFun`)
+```python
+class RewardFun(Protocol):
+    def __call__(
+        self,
+        prompt_ids: List[torch.Tensor],
+        completion_ids: torch.Tensor,
+        gt_answer_ids: List[Optional[torch.Tensor]]
+    ) -> Union[List[float], List[List[float]], torch.Tensor]:
+        """
+        支持返回：
+        1. 1D 轨迹标量奖励 (List[float] 或 [N] Tensor): 结果导向，自动赋予序列最后一个有效 Token。
+        2. 2D 逐 Token / 分步稠密奖励 (List[List[float]] 或 [N, max_completion_len] Tensor): 过程监督打分。
+        """
+        ...
+```
+
+### 5.2 自定义生成服务接口 (`GenerationService`)
+```python
+class GenerationService(Protocol):
+    def __call__(
+        self,
+        model: torch.nn.Module,
+        prompt_ids: torch.Tensor,
+        generate_config: GenerateConfig,
+        task_type: str,
+        pixel_values: Optional[torch.Tensor],
+        tokens_per_image: Optional[int]
+    ) -> Dict[str, Any]:
+        """
+        返回包含 'completions' (List[List[int]])、'dones' (Optional[List[bool]]) 
+        及 'generation_masks' (Optional[List[List[bool]]]) 的字典。
+        """
+        ...
+```
+
+### 5.3 PTX 混合预训练构建器 (`PtxBuilder`)
+```python
+class PtxBuilder(Protocol):
+    def __call__(
+        self,
+        prompt_ids: List[torch.Tensor],
+        gt_answer_ids: List[torch.Tensor]
+    ) -> List[torch.Tensor]:
+        """返回长度为 [B] 的拼接后（Prompt + Answer）完整句子 Token 张量列表。"""
+        ...
+```
+
+### 5.4 知识蒸馏与多模态接口 (`TeacherLogitsProvider` & `PixelValuesProvider`)
+```python
+class TeacherLogitsProvider(Protocol):
+    def __call__(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor: ...
+
+class PixelValuesProvider(Protocol):
+    def __call__(self, image_tags: List[str]) -> torch.Tensor: ...
+```

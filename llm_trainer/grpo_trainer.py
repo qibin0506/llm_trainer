@@ -11,7 +11,6 @@ from .loss import GRPOLoss, LMLoss
 from .tools import TrainerTools
 from .generate_utils import batch_generate
 from .log import Logger
-from .partition_utils import unwrap_model_for_generation
 
 from .train_configs import (
     TrainConfig,
@@ -34,6 +33,7 @@ from .checkpoint import (
     save_steps,
 )
 from .partition_utils import (
+    unwrap_model_for_generation,
     unwrap_model
 )
 

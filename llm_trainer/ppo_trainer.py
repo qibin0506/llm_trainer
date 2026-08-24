@@ -16,7 +16,6 @@ from .dataset import RLDataset
 from .loss import PPOLoss
 from .tools import TrainerTools
 from .generate_utils import batch_generate
-from .partition_utils import unwrap_model_for_generation
 from .log import Logger
 from .loss import LMLoss
 
@@ -50,6 +49,7 @@ from .scheduler import (
     NoneLRScheduler
 )
 from .partition_utils import (
+    unwrap_model_for_generation,
     unwrap_model
 )
 

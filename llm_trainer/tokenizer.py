@@ -25,6 +25,12 @@ class Tokenizer:
 
         self.text_image = '<image>'
 
+        self.text_tool_call_start = '<tool_call>'
+        self.text_tool_call_end = '</tool_call>'
+
+        self.text_tool_response_start = '<tool_response>'
+        self.text_tool_response_end = '</tool_response>'
+
         self.end = self.tokenizer.convert_tokens_to_ids(self.text_end)
 
         self.pad = self.tokenizer.convert_tokens_to_ids(self.text_pad)
@@ -41,6 +47,12 @@ class Tokenizer:
 
         self.system = self.tokenizer.convert_tokens_to_ids(self.text_system)
         self.image = self.tokenizer.convert_tokens_to_ids(self.text_image)
+
+        self.tool_call_start = self.tokenizer.convert_tokens_to_ids(self.text_tool_call_start)
+        self.tool_call_end = self.tokenizer.convert_tokens_to_ids(self.text_tool_call_end)
+
+        self.tool_response_start = self.tokenizer.convert_tokens_to_ids(self.text_tool_response_start)
+        self.tool_response_end = self.tokenizer.convert_tokens_to_ids(self.text_tool_response_end)
 
         self.vocab_size = self.tokenizer.get_vocab_size()
 
@@ -83,26 +95,60 @@ class Tokenizer:
             [
                 {"role":"system", "content":"system prompt"},
                 {"role":"user", "content":"hello?"},
-                {"role":"assistant", "content":"hello"},
-                {"role":"user", "content":"hello hello?"},
+                {"role":"assistant", "tool_call":'{"name": "calc", "arguments": {"expr": "1+1"}}'},
+                {"role":"tool", "content":'{"result": 2}'},
                 {"role":"assistant", "think":"thinking", "content":"hello hello"},
             ]
-            <system>{system_prompt}</s><user>hello?</s><assistant>hello</s><user>hello hello?</s><assistant><think>thinking</think><answer>hello hello</answer></s>
+            <system>{system_prompt}</s><user>hello?</s><assistant><tool_call>...</tool_call></s><user><tool_response>...</tool_response></s><assistant><think>thinking</think><answer>hello hello</answer></s>
         """
 
         chat_template = ''
-        support_roles = {'system': self.text_system, 'user': self.text_user, 'assistant': self.text_assistant}
+        support_roles = {
+            'system': self.text_system,
+            'user': self.text_user,
+            'assistant': self.text_assistant,
+            'tool': self.text_user,
+            'tool_response': self.text_user
+        }
         for conversation in conversations:
             role = conversation['role']
             if role in support_roles:
-                content = conversation['content']
-                if add_answer_tag_for_assistant and role == 'assistant':
-                    content = f"{self.text_answer_start}{content}{self.text_answer_end}"
+                content = conversation.get('content', '')
+                
+                # 处理 tool / tool_response 角色 (放入 <user><tool_response>...</tool_response></s>)
+                if role in ('tool', 'tool_response'):
+                    if not content.startswith(self.text_tool_response_start):
+                        content = f"{self.text_tool_response_start}\n{content}\n{self.text_tool_response_end}"
+                    chat_template = f"{chat_template}{support_roles[role]}{content}{self.text_end}"
+                    continue
 
-                if 'think' in conversation:
-                    content = f"{self.text_think_start}{conversation['think']}{self.text_think_end}{content}"
+                # 处理 assistant 角色
+                if role == 'assistant':
+                    # 1. 优先处理工具调用 tool_call
+                    if 'tool_call' in conversation:
+                        tc_content = conversation['tool_call']
+                        if not tc_content.startswith(self.text_tool_call_start):
+                            tc_content = f"{self.text_tool_call_start}\n{tc_content}\n{self.text_tool_call_end}"
+                        body = f"{content}\n{tc_content}".strip() if content else tc_content
+                    else:
+                        # 2. 普通内容生成，判断是否需要加 <answer>
+                        if (
+                            add_answer_tag_for_assistant
+                            and content
+                            and not content.startswith(self.text_tool_call_start)
+                            and not content.startswith(self.text_answer_start)
+                        ):
+                            body = f"{self.text_answer_start}{content}{self.text_answer_end}"
+                        else:
+                            body = content
 
-                chat_template = f"{chat_template}{support_roles[role]}{content}{self.text_end}"
+                    if 'think' in conversation and conversation['think']:
+                        body = f"{self.text_think_start}{conversation['think']}{self.text_think_end}{body}"
+
+                    chat_template = f"{chat_template}{support_roles[role]}{body}{self.text_end}"
+                else:
+                    # system / user 角色
+                    chat_template = f"{chat_template}{support_roles[role]}{content}{self.text_end}"
 
         if tokenizer:
             return self.encode(chat_template)
@@ -122,5 +168,9 @@ class Tokenizer:
             self.text_answer_end: self.answer_end,
             self.text_system: self.system,
             self.text_image: self.image,
+            self.text_tool_call_start: self.tool_call_start,
+            self.text_tool_call_end: self.tool_call_end,
+            self.text_tool_response_start: self.tool_response_start,
+            self.text_tool_response_end: self.tool_response_end,
         }
 

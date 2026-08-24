@@ -34,7 +34,6 @@ from .checkpoint import (
     save_steps,
 )
 from .partition_utils import (
-    maybe_gather_lm_head_ctx,
     unwrap_model
 )
 
@@ -195,10 +194,7 @@ class GRPOTrainer(BaseTrainer):
             )
 
             h_completion = outputs['hidden_states'][:, prompt_len - 1: -1]
-            with maybe_gather_lm_head_ctx(lm_head.weight, lm_head.bias):
-                logits_completion = h_completion.float() @ lm_head.weight.float().t()
-                if lm_head.bias is not None:
-                    logits_completion = logits_completion + lm_head.bias.float()
+            logits_completion = lm_head(h_completion).float()
 
             log_probs = log_softmax(logits_completion, comp_ids)
             aux_loss = outputs['aux_loss']

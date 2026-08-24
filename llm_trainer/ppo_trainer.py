@@ -50,7 +50,6 @@ from .scheduler import (
     NoneLRScheduler
 )
 from .partition_utils import (
-    maybe_gather_lm_head_ctx,
     unwrap_model
 )
 
@@ -418,10 +417,7 @@ class PPOTrainer(BaseTrainer):
             )
 
             h_completion = policy_output['hidden_states'][:, prompt_len - 1: -1]
-            with maybe_gather_lm_head_ctx(policy_lm_head.weight, policy_lm_head.bias):
-                logits_completion = h_completion.float() @ policy_lm_head.weight.float().t()
-                if policy_lm_head.bias is not None:
-                    logits_completion = logits_completion + policy_lm_head.bias.float()
+            logits_completion = policy_lm_head(h_completion).float()
 
             log_probs = log_softmax(logits_completion, comp_ids)
             values = value_output[0]
@@ -465,10 +461,7 @@ class PPOTrainer(BaseTrainer):
             )
 
             h_completion = outputs['hidden_states'][:, prompt_len - 1: -1]
-            with maybe_gather_lm_head_ctx(lm_head.weight, lm_head.bias):
-                logits_completion = h_completion.float() @ lm_head.weight.float().t()
-                if lm_head.bias is not None:
-                    logits_completion = logits_completion + lm_head.bias.float()
+            logits_completion = lm_head(h_completion).float()
 
             log_probs = log_softmax(logits_completion, comp_ids)
 
@@ -790,11 +783,7 @@ class PPOTrainer(BaseTrainer):
                     )
 
                     h_completion = policy_output['hidden_states'][:, prompt_len - 1: -1]
-                    with maybe_gather_lm_head_ctx(policy_lm_head.weight, policy_lm_head.bias):
-                        logits_completion = h_completion.float() @ policy_lm_head.weight.float().t()
-
-                        if policy_lm_head.bias is not None:
-                            logits_completion = logits_completion + policy_lm_head.bias.float()
+                    logits_completion = policy_lm_head(h_completion).float()
 
                     current_log_probs = log_softmax(logits_completion, mb_completion_ids)
                     current_values = value_output[0][:, prompt_len - 1: -1]

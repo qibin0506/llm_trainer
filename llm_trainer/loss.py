@@ -19,31 +19,31 @@ def _chunk_ce_kd_forward(
 ):
     """
     单个 chunk 内部的前向计算：运行在 torch.utils.checkpoint 内部
-    同时完成 Student 投影、CE 损失计算与 KD 蒸馏损失计算
+    - 投影 GEMM 保持在 Tensor Core 原始精度 (bf16/fp16)，计算后转 float32 保证损失数值稳定性
+    - 同时完成 Student 投影、CE 损失与安全 KD 蒸馏损失计算
     """
     with maybe_gather_lm_head_ctx(w, b):
-        s_logits = h_chunk.float() @ w.float().t()
+        s_logits = (h_chunk @ w.t()).float()
         if b is not None:
             s_logits = s_logits + b.float()
-    s_log_p = F.log_softmax(s_logits, dim=-1)
 
+    s_log_p = F.log_softmax(s_logits, dim=-1)
     chunk_ce_loss = F.nll_loss(s_log_p, lbl_chunk, ignore_index=ignore_index, reduction="sum")
 
-    valid = lbl_chunk != ignore_index
-    chunk_correct = ((s_logits.argmax(dim=-1) == lbl_chunk) & valid).sum().float()
     if t_logits_chunk is not None and kd_coef > 0.0:
+        valid = (lbl_chunk != ignore_index).float()
         t_probs = F.softmax(t_logits_chunk.float(), dim=-1)
-        inf_mask = torch.isinf(s_logits)
-        prod_probs = torch.masked_fill(t_probs * s_log_p, inf_mask, 0.0)
+        # 避免 0.0 * (-inf) 产生 NaN
+        safe_prod = torch.where(t_probs > 0, t_probs * s_log_p, torch.zeros_like(s_log_p))
 
-        per_token_kd = -torch.sum(prod_probs, dim=-1) * valid.float()
+        per_token_kd = -torch.sum(safe_prod, dim=-1) * valid
         chunk_kd_loss = per_token_kd.sum()
 
         chunk_total_loss = (1.0 - kd_coef) * chunk_ce_loss + kd_coef * chunk_kd_loss
     else:
         chunk_total_loss = chunk_ce_loss
 
-    return chunk_total_loss, chunk_ce_loss, chunk_correct
+    return chunk_total_loss, chunk_ce_loss
 
 
 class ChunkedLMLoss(nn.Module):
@@ -87,6 +87,7 @@ class ChunkedLMLoss(nn.Module):
             shift_teacher_logits = teacher_logits[:, :-1, :].reshape(-1, teacher_logits.size(-1))
         else:
             shift_teacher_logits = None
+
         valid = shift_labels != self.ignore_index
         n_valid_tensor = valid.sum()
         order = valid.to(torch.int8).argsort(descending=True, stable=True)
@@ -94,6 +95,7 @@ class ChunkedLMLoss(nn.Module):
         shift_labels = shift_labels[order]
         if shift_teacher_logits is not None:
             shift_teacher_logits = shift_teacher_logits[order]
+
         n_valid_chunks = (n_valid_tensor + self.chunk_size - 1) // self.chunk_size
 
         if dist.is_available() and dist.is_initialized():
@@ -120,6 +122,12 @@ class ChunkedLMLoss(nn.Module):
                     shift_teacher_logits,
                     shift_teacher_logits.new_zeros((pad_len, shift_teacher_logits.size(-1)))
                 ], dim=0)
+        elif max_padded < hidden.size(0):
+            hidden = hidden[:max_padded]
+            shift_labels = shift_labels[:max_padded]
+            if shift_teacher_logits is not None:
+                shift_teacher_logits = shift_teacher_logits[:max_padded]
+
         total_loss_accum = hidden.new_zeros((), dtype=torch.float32)
         ce_loss_accum = hidden.new_zeros((), dtype=torch.float32)
 
@@ -127,7 +135,7 @@ class ChunkedLMLoss(nn.Module):
             h_chunk = hidden[start: start + self.chunk_size]
             lbl_chunk = shift_labels[start: start + self.chunk_size]
             t_chunk = shift_teacher_logits[start: start + self.chunk_size] if shift_teacher_logits is not None else None
-            chunk_total, chunk_ce, _ = torch_checkpoint(
+            chunk_total, chunk_ce = torch_checkpoint(
                 _chunk_ce_kd_forward,
                 h_chunk,
                 lm_head_weight,

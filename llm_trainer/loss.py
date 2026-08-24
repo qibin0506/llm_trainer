@@ -2,6 +2,7 @@ from typing import Optional, Tuple
 import math
 import torch
 from torch import nn
+import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 import torch.nn.functional as F
 from .partition_utils import maybe_gather_lm_head_ctx
@@ -73,50 +74,59 @@ class ChunkedLMLoss(nn.Module):
             hidden_states: [B, S, H]
             lm_head_weight: [V, H]
             labels: [B, S]
-            lm_head_bias: lm_head_bias
+            lm_head_bias: [V] (可选)
             teacher_logits: [B, S, V] (可选，Teacher 模型生成的软标签)
             kd_coef: 知识蒸馏权重 (0.0 ~ 1.0)
         Returns:
             total_loss: 结合 CE 和 KD 的总损失 (标量)
-            ce_loss: 纯 CE 损失 (标量，用于监控 ppl 和评估)
+            ce_loss: 纯 CE 损失 (标量)
         """
         hidden = hidden_states[:, :-1, :].reshape(-1, hidden_states.size(-1))
         shift_labels = labels[:, 1:].reshape(-1)
-
         if teacher_logits is not None and kd_coef > 0.0:
             shift_teacher_logits = teacher_logits[:, :-1, :].reshape(-1, teacher_logits.size(-1))
         else:
             shift_teacher_logits = None
-
         valid = shift_labels != self.ignore_index
         n_valid_tensor = valid.sum()
+        order = valid.to(torch.int8).argsort(descending=True, stable=True)
+        hidden = hidden[order]
+        shift_labels = shift_labels[order]
+        if shift_teacher_logits is not None:
+            shift_teacher_logits = shift_teacher_logits[order]
+        n_valid_chunks = (n_valid_tensor + self.chunk_size - 1) // self.chunk_size
 
-        if n_valid_tensor == 0:
+        if dist.is_available() and dist.is_initialized():
+            max_chunks_tensor = n_valid_chunks.clone()
+            dist.all_reduce(max_chunks_tensor, op=dist.ReduceOp.MAX)
+            max_num_chunks = int(max_chunks_tensor.item())
+        else:
+            max_num_chunks = int(n_valid_chunks.item())
+
+        if max_num_chunks == 0:
             with maybe_gather_lm_head_ctx(lm_head_weight, lm_head_bias):
                 loss = (hidden_states.float().sum() + lm_head_weight.float().sum()) * 0.0
                 if lm_head_bias is not None:
                     loss = loss + lm_head_bias.float().sum() * 0.0
             return loss, loss
 
-        order = valid.to(torch.int8).argsort(descending=True, stable=True)
-        hidden = hidden[order]
-        shift_labels = shift_labels[order]
-        if shift_teacher_logits is not None:
-            shift_teacher_logits = shift_teacher_logits[order]
-
-        n_padded = (n_valid_tensor / self.chunk_size).ceil().to(torch.int64) * self.chunk_size
+        max_padded = max_num_chunks * self.chunk_size
+        if max_padded > hidden.size(0):
+            pad_len = max_padded - hidden.size(0)
+            hidden = torch.cat([hidden, hidden.new_zeros((pad_len, hidden.size(-1)))], dim=0)
+            shift_labels = torch.cat([shift_labels, shift_labels.new_full((pad_len,), self.ignore_index)], dim=0)
+            if shift_teacher_logits is not None:
+                shift_teacher_logits = torch.cat([
+                    shift_teacher_logits,
+                    shift_teacher_logits.new_zeros((pad_len, shift_teacher_logits.size(-1)))
+                ], dim=0)
         total_loss_accum = hidden.new_zeros((), dtype=torch.float32)
         ce_loss_accum = hidden.new_zeros((), dtype=torch.float32)
 
-        for start in range(0, n_padded, self.chunk_size):
+        for start in range(0, max_padded, self.chunk_size):
             h_chunk = hidden[start: start + self.chunk_size]
             lbl_chunk = shift_labels[start: start + self.chunk_size]
-
-            if shift_teacher_logits is not None:
-                t_chunk = shift_teacher_logits[start: start + self.chunk_size]
-            else:
-                t_chunk = None
-
+            t_chunk = shift_teacher_logits[start: start + self.chunk_size] if shift_teacher_logits is not None else None
             chunk_total, chunk_ce, _ = torch_checkpoint(
                 _chunk_ce_kd_forward,
                 h_chunk,
@@ -131,8 +141,12 @@ class ChunkedLMLoss(nn.Module):
             total_loss_accum = total_loss_accum + chunk_total
             ce_loss_accum = ce_loss_accum + chunk_ce
 
-        total_loss = total_loss_accum / n_valid_tensor
-        ce_loss = ce_loss_accum / n_valid_tensor
+        if n_valid_tensor > 0:
+            total_loss = total_loss_accum / n_valid_tensor
+            ce_loss = ce_loss_accum / n_valid_tensor
+        else:
+            total_loss = total_loss_accum * 0.0
+            ce_loss = ce_loss_accum * 0.0
         return total_loss, ce_loss
 
 

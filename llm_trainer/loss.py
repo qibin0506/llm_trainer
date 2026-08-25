@@ -407,7 +407,7 @@ class GRPOLoss(nn.Module):
 
         self.beta = beta
         self.clip_eps_low = clip_eps_low
-        self.clip_eps_high = clip_eps_high if clip_eps_high else clip_eps_low
+        self.clip_eps_high = clip_eps_high if clip_eps_high is not None else clip_eps_low
         self.delta = delta
         self.importance_sampling_level = importance_sampling_level
         self.loss_type = loss_type

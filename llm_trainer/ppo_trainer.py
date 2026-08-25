@@ -573,7 +573,7 @@ class PPOTrainer(BaseTrainer):
 
             full_attention_mask = self._calc_attention_mask(full_ids)
 
-            chunk_size = self.ppo_config.chunked_rollout_size
+            chunk_size = self.ppo_config.chunked_log_probs_size
             with autocast(TrainerTools().parallel.device_type):
                 old_log_probs, value_output = self._compute_log_probs_and_values(
                     self.train_model,

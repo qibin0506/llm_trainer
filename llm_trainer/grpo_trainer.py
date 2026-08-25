@@ -337,7 +337,7 @@ class GRPOTrainer(BaseTrainer):
             input_ids = torch.cat([padded_prompt_ids, completion_ids], dim=1)
             attention_mask = torch.cat([prompt_masks, completion_pad_mask], dim=1)
 
-            chunk_size = self.grpo_config.chunked_rollout_size
+            chunk_size = self.grpo_config.chunked_log_probs_size
             with autocast(TrainerTools().parallel.device_type):
                 old_log_probs, _ = self._compute_completion_log_probs(
                     self.train_model, input_ids, attention_mask, prompt_len, completion_ids, chunk_size

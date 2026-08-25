@@ -373,7 +373,7 @@ class PPOConfig:
         value_model_weights_path (`Optional[str]`): Value (Critic) 模型的初始化权重路径。
         value_optim_config (`Optional[OptimConfig]`): 专门为 Value 模型配置独立的优化器及学习率。
         gradient_accumulation_steps (`int`): 梯度累积步数。
-        chunked_rollout_size (`Optional[int]`): 采样生成 (Rollout) 阶段的分块大小。若设置则按 chunk 分批进行序列生成，以降低生成时的显存峰值。
+        chunked_log_probs_size (`Optional[int]`): 评估/前向阶段（计算旧策略及参考模型 Log Prob 和 Value）的 Batch 分块大小，用于降低显存峰值。
         gamma (`float`): 优势函数 (GAE) 中的折扣因子 (Discount Factor)，决定长期奖励的衰减。
         lam (`float`): GAE 中的 lambda 参数，权衡偏差与方差。
         clip_eps (`float`): PPO 的核心裁剪阈值，限制新旧策略更新的步长差距，防止更新崩溃。
@@ -394,7 +394,7 @@ class PPOConfig:
     value_model_weights_path: Optional[str] = None
     value_optim_config: Optional[OptimConfig] = None
     gradient_accumulation_steps: int = 1
-    chunked_rollout_size: Optional[int] = None
+    chunked_log_probs_size: Optional[int] = None
     gamma: float = 1.0
     lam: float = 0.95
     clip_eps: float = 0.1
@@ -420,7 +420,7 @@ class GRPOConfig:
         group_size (`int`): 对同一个 Prompt 并行生成多少个不同的答案，用于组内 Advantage 优势归一化计算。
         ref_model_weights_path (Optional[str]): GRPO 计算 KL 惩罚奖励时参考模型的权重路径。
         gradient_accumulation_steps (`int`): 梯度累积步数。
-        chunked_rollout_size (`Optional[int]`): 采样生成 (Rollout) 阶段的分块大小。当 group_size 较大时按 chunk 分批生成，防止显存 OOM。
+        chunked_log_probs_size (`Optional[int]`): 评估/前向阶段（计算旧策略及参考模型 Log Prob）的 Batch 分块大小，用于降低显存峰值。
         loss_beta (`float`): KL 惩罚强度。在特定模式下(loss_importance_sampling_level=sequence) 可设为 0.0 改为隐式约束。
         loss_clip_eps (`float`): PPO 基础截断的下限 epsilon。
         loss_clip_eps_high (`Optional[float]`): 不对称裁剪中的上限 epsilon。
@@ -441,7 +441,7 @@ class GRPOConfig:
     group_size: int = 12
     ref_model_weights_path: Optional[str] = None
     gradient_accumulation_steps: int = 1
-    chunked_rollout_size: Optional[int] = None
+    chunked_log_probs_size: Optional[int] = None
     loss_beta: float = 0.04
     loss_clip_eps: float = 3e-4
     loss_clip_eps_high: Optional[float] = 4e-4

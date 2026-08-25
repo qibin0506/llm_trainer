@@ -467,14 +467,12 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
 
                     local_remaining_max_tokens = max(generate_config.max_seq_len - cur_prompt_len, 1)
 
-                # =============== 新增全局同步逻辑防止 NCCL 死锁 ===============
                 if TrainerTools().parallel.world_size > 1:
                     max_token_tensor = torch.tensor([local_remaining_max_tokens], dtype=torch.long, device=device)
                     dist.all_reduce(max_token_tensor, op=dist.ReduceOp.MAX)
                     remaining_max_tokens = max_token_tensor.item()
                 else:
                     remaining_max_tokens = local_remaining_max_tokens
-                # ==============================================================
 
                 outputs, _ = batch_generate(
                     model=gen_model,

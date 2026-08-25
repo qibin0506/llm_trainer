@@ -202,7 +202,11 @@ class GRPOTrainer(BaseTrainer):
             return log_probs, aux_loss
 
         if chunk_size is None or chunk_size <= 0 or chunk_size >= input_ids.size(0):
+            print(f"[No-Chunk] chunk_size={chunk_size}, batch_size={input_ids.size(0)}, is_training={model.training}")
             return _step_forward(input_ids, attention_mask, completion_ids)
+        else:
+            print(
+                f"[>>> USE-CHUNK <<<] chunk_size={chunk_size}, total_batch={input_ids.size(0)}, is_training={model.training}")
 
         all_log_probs = []
         aux_losses = []

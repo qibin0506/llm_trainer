@@ -553,7 +553,10 @@ class PPOTrainer(BaseTrainer):
                 full_ids = torch.cat([padded_prompt_ids, completion_ids], dim=1)
             else:
                 with unwrap_model_for_generation(self.train_model) as unwrapped_model:
-                    gen_chunk_size = self.ppo_config.generate_config.chunked_generate_size or padded_prompt_ids.size(0)
+                    gen_chunk_size = self.ppo_config.generate_config.chunked_generate_size
+                    if gen_chunk_size is None or gen_chunk_size <= 0:
+                        gen_chunk_size = padded_prompt_ids.size(0)
+
                     chunk_completions = []
                     max_comp_len = 0
                     for start_idx in range(0, padded_prompt_ids.size(0), gen_chunk_size):

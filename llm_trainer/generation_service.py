@@ -103,7 +103,10 @@ class SyncCentralGenerationService(GenerationServiceBase):
 
                 max_new_tokens = max(generate_config.max_seq_len - target_prompts_tensor.shape[1], 1)
                 completions = []
-                actual_chunk_size = generate_config.chunked_generate_size or len(target_prompts_tensor)
+
+                actual_chunk_size = generate_config.chunked_generate_size
+                if actual_chunk_size is None or actual_chunk_size <= 0:
+                    actual_chunk_size = len(target_prompts_tensor)
 
                 for chunk_start in range(0, len(target_prompts_tensor), actual_chunk_size):
                     chunk_prompts = target_prompts_tensor[chunk_start: chunk_start + actual_chunk_size]
@@ -293,7 +296,10 @@ class ParallelGenerationService(GenerationServiceBase):
         attention_mask = (local_prompts_tensor != TrainerTools().tokenizer.pad).long()
         max_new_tokens = max(generate_config.max_seq_len - local_prompts_tensor.shape[1], 1)
         completions = []
-        actual_chunk_size = generate_config.chunked_generate_size or len(local_prompts_tensor)
+
+        actual_chunk_size = generate_config.chunked_generate_size
+        if actual_chunk_size is None or actual_chunk_size <= 0:
+            actual_chunk_size = len(local_prompts_tensor)
 
         for chunk_start in range(0, len(local_prompts_tensor), actual_chunk_size):
             chunk_prompts = local_prompts_tensor[chunk_start: chunk_start + actual_chunk_size]

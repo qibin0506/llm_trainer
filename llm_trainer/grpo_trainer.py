@@ -216,7 +216,7 @@ class GRPOTrainer(BaseTrainer):
             if aux_loss is not None:
                 aux_losses.append(aux_loss)
         total_log_probs = torch.cat(all_log_probs, dim=0)
-        total_aux_loss = sum(aux_losses) if len(aux_losses) > 0 else None
+        total_aux_loss = sum(aux_losses) / len(aux_losses) if len(aux_losses) > 0 else None
 
         return total_log_probs, total_aux_loss
 
@@ -310,7 +310,10 @@ class GRPOTrainer(BaseTrainer):
                     external_gen_mask = torch.tensor(padded_gen_masks, dtype=torch.bool, device=device)
             else:
                 with unwrap_model_for_generation(self.train_model) as unwrapped_model:
-                    gen_chunk_size = self.grpo_config.generate_config.chunked_generate_size or padded_prompt_ids.size(0)
+                    gen_chunk_size = self.grpo_config.generate_config.chunked_generate_size
+                    if gen_chunk_size is None or gen_chunk_size <= 0:
+                        gen_chunk_size = padded_prompt_ids.size(0)
+
                     chunk_completions = []
                     max_comp_len = 0
                     for start_idx in range(0, padded_prompt_ids.size(0), gen_chunk_size):

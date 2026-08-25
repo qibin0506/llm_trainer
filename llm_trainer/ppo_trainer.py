@@ -1,5 +1,6 @@
 from typing import Tuple, List, Union, Optional
 import gc
+import math
 import torch
 import torch.distributed as dist
 from torch.utils.data import Dataset
@@ -35,8 +36,7 @@ from .utils import (
     disable_dropout_in_model,
     calc_position_ids,
     RunningMeanStd,
-    empty_cache,
-    _mask_prompt
+    empty_cache
 )
 from .checkpoint import (
     save_checkpoint,

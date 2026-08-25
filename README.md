@@ -1,5 +1,3 @@
----
-
 # 🚀 LLM/VLM 全流程分布式训练与强化学习框架
 
 一个基于 PyTorch 与 DeepSpeed 构建的高性能、通用大语言模型（LLM）与视觉语言模型（VLM）训练框架。支持从**预训练（Pretrain）**、**监督微调（SFT）**、**直接偏好优化（DPO/ORPO/SimPO）** 到 **强化学习（PPO & GRPO全系列算子）** 的完整生命周期。
@@ -33,7 +31,9 @@
   - **动态 Token 筛选**：在 SFT/Pretrain 阶段自动过滤 `-100` 掩码（Prompt/Padding），仅将有效 Token 送入投影层，砍掉 $70\% \sim 90\%$ 的无用 GEMM 计算。
   - **分块交叉熵 + 梯度检查点**：支持 `chunked_cross_entropy_size`，在前向阶段完全避免具象化超大 $[B, S, V]$ 的 Logits 显存。
   - **ZeRO-3 原生安全**：内置 `maybe_gather_lm_head_ctx` 与 Zero-Token 假节点穿透，彻底杜绝跨卡通信悬挂与死锁。
-* **分块强化学习与评估 (Chunked Rollout)**：PPO / GRPO 支持在 Log-probs 计算与 Rollout 阶段启用 `chunked_rollout_size`，支持大组采样（Group Size）无显存峰值（OOM）。
+* **分块强化学习与自回归生成 (Chunked Generation & Log-probs)**：
+  - **自回归生成分块 (`chunked_generate_size`)**：在 Rollout 采样阶段按 Chunk 执行 `batch_generate`，防止大 Batch/长文本并发 KV Cache 导致显存溢出（OOM）。
+  - **评估前向分块 (`chunked_log_probs_size`)**：在 Policy 与 Reference 模型的 Log-probs 及 Value 评估阶段按 Chunk 分批推理，配合 Active Token Filtering 消除超长序列下的显存尖峰。
 * **多模态 (VLM) 训练**：支持多模态投影层冻结/微调、图像虚拟 Token 扩展与动态 Pixel Features 注入。
 * **异构硬件支持**：原生适配 **NVIDIA CUDA (NCCL)**、**华为升腾 NPU (HCCL)**、**寒武纪 MLU (CNCL)**、**Apple Silicon (MPS)** 及 **CPU/Gloo**。
 * **DeepSpeed 深度集成**：灵活配置 ZeRO-1/2/3、ZeRO-Offload (CPU/NVMe)、ZeRO++ 梯度/权重量化及激活检查点（Activation Checkpointing）。
@@ -51,8 +51,8 @@
 ├── trainer.py              # 预训练 Trainer (支持 ChunkedLMLoss 分块交叉熵)
 ├── sft_trainer.py          # 监督微调 SFT Trainer (支持 Active Token Filtering 与 VLM)
 ├── dpo_trainer.py          # 偏好对齐 DPO Trainer (支持 DPO, ORPO, SimPO)
-├── ppo_trainer.py          # 强化学习 PPO Trainer (支持 Value Model, GAE, Rollout 分块与 Whitening)
-├── grpo_trainer.py         # 强化学习 GRPO Trainer (支持组内归一化、Rollout 分块及多种前沿 Loss)
+├── ppo_trainer.py          # 强化学习 PPO Trainer (支持 Value Model, GAE, 生成与评估分块与 Whitening)
+├── grpo_trainer.py         # 强化学习 GRPO Trainer (支持组内归一化、生成与评估分块及多种前沿 Loss)
 ├── train_configs.py        # 全局配置类 dataclasses (Optim, DsConfig, GenerateConfig, Protocols)
 ├── parallel.py             # 分布式并行抽象层 (DsParallel, NoneParallel, 多后端适配)
 ├── generation_service.py   # 生成服务 (SyncCentral, Parallel, MultiTurnRL)
@@ -314,7 +314,8 @@ trainer.train()
 ### 4. 近端策略优化 (PPO Trainer)
 
 PPO 包含了 Actor (Policy) 模型与 Critic (Value) 模型，采用 GAE 优势估计，支持 Running Mean/Std 归一化、Advantage 白化（Whitening）与 KL 散度惩罚。
-支持配置 `chunked_rollout_size` 在计算 Policy / Reference Log-probs 及 Value 时按分块执行，防止长序列显存溢出。
+- 支持配置 `GenerateConfig.chunked_generate_size` 在自回归采样生成阶段按分块执行，降低并发 KV Cache 显存峰值。
+- 支持配置 `PPOConfig.chunked_log_probs_size` 在计算 Policy / Reference Log-probs 及 Value 评估阶段按分块执行，防止长序列显存溢出。
 
 ```python
 from ppo_trainer import PPOTrainer
@@ -329,7 +330,7 @@ train_config.ppo_config = PPOConfig(
     ppo_epochs=1,
     ppo_batch_size=2,
     gradient_accumulation_steps=2,
-    chunked_rollout_size=2,            # 采样/估值阶段按 chunk 分批执行，消除峰值显存
+    chunked_log_probs_size=2,          # 估值与 Log-probs 评估阶段分批执行，消除峰值显存
     ref_model_weights_path="path/to/ref_model",
     value_model_weights_path="path/to/value_model",
     value_optim_config=OptimConfig(initial_lr=1e-5), # Critic 独立学习率
@@ -338,7 +339,11 @@ train_config.ppo_config = PPOConfig(
     vf_coef=0.1,
     whiten_rewards=True,               # 默认启用 Advantage 白化
     normalize_rewards=False,
-    generate_config=GenerateConfig(max_seq_len=512, temperature=0.7)
+    generate_config=GenerateConfig(
+        max_seq_len=512, 
+        temperature=0.7,
+        chunked_generate_size=2        # 自回归生成采样阶段分块大小
+    )
 )
 
 trainer = PPOTrainer(
@@ -385,11 +390,16 @@ train_config.grpo_config = GRPOConfig(
     grpo_batch_size=2,
     group_size=12,                     # 组内采样数
     gradient_accumulation_steps=2,
-    chunked_rollout_size=4,            # Group 评估时分块计算 Log-probs，防止 OOM
+    chunked_log_probs_size=4,          # Group 评估时分块计算 Log-probs，防止 OOM
     loss_type='grpo',                  # 可选: 'bnpo', 'dr_grpo', 'cispo', 'dapo', 'luspo', 'sapo', 'vespo'
     loss_beta=0.04,                    # KL 散度约束强度
     ptx_coef=0.1,                      # PTX 预训练 Loss 融合权重
-    generate_config=GenerateConfig(max_seq_len=1024, temperature=0.9, top_p=0.95)
+    generate_config=GenerateConfig(
+        max_seq_len=1024, 
+        temperature=0.9, 
+        top_p=0.95,
+        chunked_generate_size=4        # 组内自回归采样分块大小
+    )
 )
 
 trainer = GRPOTrainer(
@@ -408,13 +418,13 @@ trainer.train()
 在 RL (PPO/GRPO) 阶段，如果采用 DeepSpeed ZeRO-3 参数切分，在前向采样生成时频繁 Gather 权重可能带来开销。框架提供了多种专门解耦的生成服务类（通过 `generation_service` 参数传入 Trainer）：
 
 ### 1. `SyncCentralGenerationService`
-由 Rank 0 保持一份非切分的评估/采样模型，汇总所有 Rank 的 Prompts 并统一集中生成，再将结果 Broadcast 回各个 Rank。
+由 Rank 0 保持一份非切分的评估/采样模型，汇总所有 Rank 的 Prompts 并统一集中生成（支持 `chunked_generate_size` 分块），再将结果 Broadcast 回各个 Rank。
 
 ### 2. `ParallelGenerationService`
-多卡并行生成服务。使用自定义的桶式 `dist.broadcast` 高效同步模型最新权重到各卡独立生成设备，避免 pickle 序列化开销。
+多卡并行生成服务。使用自定义的桶式 `dist.broadcast` 高效同步模型最新权重到各卡独立生成设备，各卡本地按 `chunked_generate_size` 分块生成，避免 pickle 序列化开销。
 
 ### 3. `MultiTurnRLGenerationService` (多轮环境交互 / Agent RL)
-专门用于大模型代码执行、公式推理、工具调用的多轮强化学习交互服务。
+专门用于大模型代码执行、公式推理、工具调用的多轮强化学习交互服务。在多轮自回归生成时原生支持分块生成与动态 Padding 对齐。
 
 ```python
 from generation_service import MultiTurnRLGenerationService
@@ -511,7 +521,7 @@ policy_state_dict = extract_policy_weights_from_ppo(model_config, ppo_checkpoint
 | `init_weights_path` | `Optional[str]` | `None` | 主干模型的初始化权重路径（本地目录或单文件）。 |
 | `file_dataset` | `FileDataset` | **必填** | 训练数据集文件列表或 Dataset 接口实例。 |
 | `dataset_block_size` | `int` | **必填** | 序列截断/打包的最大 Token 长度。 |
-| `data_loader_config` | `DataLoaderConfig` | `DataLoaderConfig()` | PyTorch DataLoader 的加载配置（如 worker 进程数）。 |
+| `data_loader_config` | `DataLoaderConfig` | `DataLoaderConfig()` | PyTorch DataLoader 的加载配置（如 worker 进程数、shuffle 等）。 |
 | `optim_config` | `OptimConfig` | `OptimConfig()` | 优化器（Adam/Lion）与学习率调度器参数。 |
 | `ds_config` | `DsConfig` | `DsConfig()` | DeepSpeed 分布式引擎配置（含 ZeRO、精度与检查点）。 |
 | `eval_config` | `GenerateConfig` | `GenerateConfig()` | 训练过程中触发 Evaluation 阶段时的生成控制参数。 |
@@ -557,6 +567,7 @@ policy_state_dict = extract_policy_weights_from_ppo(model_config, ppo_checkpoint
 | 参数名 | 类型 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- |
 | `max_seq_len` | `int` | `512` | 自回归生成的序列最大总长度（包含 Prompt）。 |
+| `chunked_generate_size` | `Optional[int]` | `None` | 自回归生成阶段 (`batch_generate`) 的 Batch 分块大小，防止并发 KV Cache 过大导致显存 OOM。 |
 | `temperature` | `float` | `1.0` | 采样温度；值越大越随机，值为 `0` 或接近 `0` 时退化为贪婪搜索。 |
 | `top_p` | `float` | `0.95` | Nucleus 采样概率阈值；仅保留累积概率达 `top_p` 的候选词。 |
 | `top_k` | `Optional[int]` | `None` | Top-K 采样限制；设为非空时仅保留概率最高的 K 个候选词。 |
@@ -620,7 +631,7 @@ policy_state_dict = extract_policy_weights_from_ppo(model_config, ppo_checkpoint
 | `value_model_weights_path` | `Optional[str]` | `None` | Critic (Value) 模型的初始化权重路径。 |
 | `value_optim_config` | `Optional[OptimConfig]` | `None` | 为 Critic 模型配置的独立优化器与学习率设置。 |
 | `gradient_accumulation_steps` | `int` | `1` | 梯度累积步数。 |
-| `chunked_rollout_size` | `Optional[int]` | `None` | 采样生成与估值（Rollout）阶段的分块大小。若设置则分批计算 log-probs 与 values，降低峰值显存。 |
+| `chunked_log_probs_size` | `Optional[int]` | `None` | 评估/前向阶段（计算旧策略及参考模型 Log Prob 和 Value）的 Batch 分块大小，用于降低显存峰值。 |
 | `gamma` | `float` | `1.0` | GAE 优势估计中的折扣因子 $\gamma$。 |
 | `lam` | `float` | `0.95` | GAE 优势估计中的平滑因子 $\lambda$。 |
 | `clip_eps` | `float` | `0.1` | PPO 策略更新的代换截断阈值 $\epsilon$。 |
@@ -633,7 +644,7 @@ policy_state_dict = extract_policy_weights_from_ppo(model_config, ppo_checkpoint
 | `normalize_rewards` | `bool` | `False` | 是否在送入 GAE 前对 Reward 进行标准化。 |
 | `normalize_method` | `str` | `'RunningMeanStd'` | Reward 标准化算法：`'RunningMeanStd'` 或 `'BatchStd'`。 |
 | `whiten_rewards` | `bool` | `True` | 是否对 GAE 计算得出的 Advantage 优势值进行白化（Whitening）处理。 |
-| `generate_config` | `GenerateConfig` | `GenerateConfig()` | PPO 采样 Rollout 生成数据时的自回归解码参数。 |
+| `generate_config` | `GenerateConfig` | `GenerateConfig()` | PPO 采样 Rollout 生成数据时的自回归解码参数（可在此配置 `chunked_generate_size`）。 |
 
 ### 3.5 组相对策略优化配置 (`GRPOConfig`)
 
@@ -644,7 +655,7 @@ policy_state_dict = extract_policy_weights_from_ppo(model_config, ppo_checkpoint
 | `group_size` | `int` | `12` | 对同一个 Prompt 并行生成的不同的回答数量（用于组内归一化）。 |
 | `ref_model_weights_path` | `Optional[str]` | `None` | 参考模型（Reference Model）权重路径；当 `loss_beta=0.0` 时可设为 `None`。 |
 | `gradient_accumulation_steps` | `int` | `1` | 梯度累积步数。 |
-| `chunked_rollout_size` | `Optional[int]` | `None` | Rollout 评估阶段的分块大小。当 `group_size` 较大时分批计算 Log-probs，防止显存 OOM。 |
+| `chunked_log_probs_size` | `Optional[int]` | `None` | 评估/前向阶段（计算旧策略及参考模型 Log Prob）的 Batch 分块大小，用于降低显存峰值。 |
 | `loss_beta` | `float` | `0.04` | KL 散度惩罚系数。 |
 | `loss_clip_eps` | `float` | `3e-4` | 组相对优化下限截断阈值 $\epsilon_{low}$。 |
 | `loss_clip_eps_high` | `Optional[float]` | `4e-4` | 不对称截断时的上限阈值 $\epsilon_{high}$。 |
@@ -658,7 +669,7 @@ policy_state_dict = extract_policy_weights_from_ppo(model_config, ppo_checkpoint
 | `vespo_k_neg` | `float` | `3.0` | VESPO 算法特定 Gamma 权重超参数。 |
 | `vespo_lambda_neg` | `float` | `2.0` | VESPO 算法特定 Gamma 权重超参数。 |
 | `ptx_coef` | `float` | `0.0` | PTX 混合预训练 Loss 的权重系数。 |
-| `generate_config` | `GenerateConfig` | `GenerateConfig()` | GRPO 组采样生成数据时的自回归解码参数。 |
+| `generate_config` | `GenerateConfig` | `GenerateConfig()` | GRPO 组采样生成数据时的自回归解码参数（可在此配置 `chunked_generate_size`）。 |
 
 ---
 

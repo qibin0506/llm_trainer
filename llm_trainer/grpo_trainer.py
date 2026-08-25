@@ -349,8 +349,7 @@ class GRPOTrainer(BaseTrainer):
             if external_gen_mask is not None:
                 loss_mask = completion_pad_mask & external_gen_mask
             else:
-                temp_ids = _mask_prompt(completion_ids.clone())
-                loss_mask = completion_pad_mask & (temp_ids != -100)
+                loss_mask = completion_pad_mask
 
             input_ids = torch.cat([padded_prompt_ids, completion_ids], dim=1)
             attention_mask = torch.cat([prompt_masks, completion_pad_mask], dim=1)
@@ -443,6 +442,7 @@ class GRPOTrainer(BaseTrainer):
         }
 
         total_micro_batches_processed = 0
+        global_micro_batch_idx = 0
         has_ptx = self.ptx_criterion is not None and len(ptx_data) > 0
 
         for grpo_epoch in range(self.grpo_config.grpo_epochs):
@@ -523,8 +523,8 @@ class GRPOTrainer(BaseTrainer):
                 if self.is_ds:
                     need_update_step = self.train_model.is_gradient_accumulation_boundary()
                 else:
-                    micro_batch_idx = i // grpo_batch_size
-                    need_update_step = ((micro_batch_idx + 1) % self.gradient_accumulation_steps == 0)
+                    global_micro_batch_idx += 1
+                    need_update_step = (global_micro_batch_idx % self.gradient_accumulation_steps == 0)
 
                 if has_ptx:
                     self._backward_loss(grpo_loss_unscaled, self.gradient_accumulation_steps, step=False)
@@ -545,6 +545,9 @@ class GRPOTrainer(BaseTrainer):
                 if need_update_step:
                     self._update_step()
 
+        if not self.is_ds and (global_micro_batch_idx % self.gradient_accumulation_steps != 0):
+            self._update_step()
+
         if total_micro_batches_processed > 0:
             for key in ["loss", "moe_aux_loss", "ptx_loss",
                         "ptx_aux_loss", "approx_kl", "clip_frac",
@@ -559,7 +562,7 @@ class GRPOTrainer(BaseTrainer):
 
         micro_batches_per_rollout = (self.train_config.batch_size * self.grpo_config.group_size) / self.grpo_config.grpo_batch_size
         updates_per_rollout = (self.grpo_config.grpo_epochs * micro_batches_per_rollout) / self.gradient_accumulation_steps
-        global_steps_per_rollout = max(1, int(updates_per_rollout))
+        global_steps_per_rollout = max(1, math.ceil(updates_per_rollout))
 
         for epoch in range(self.resume_epoch, self.train_config.n_epochs):
             file_count = len(self.train_config.file_dataset)

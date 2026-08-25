@@ -138,6 +138,7 @@ class Parallel(ABC):
         if self._use_parallel:
             sampler_kwargs = sampler_kwargs or {}
             self._sampler = DistributedSampler(dataset=dataset, **sampler_kwargs)
+            data_loader_kwargs = {k: v for k, v in data_loader_kwargs.items() if k != "shuffle"}
             return DataLoader(dataset=dataset, sampler=self._sampler, **data_loader_kwargs)
 
         return DataLoader(dataset=dataset, **data_loader_kwargs)

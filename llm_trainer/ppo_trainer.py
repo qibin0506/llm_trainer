@@ -622,8 +622,7 @@ class PPOTrainer(BaseTrainer):
             if external_gen_mask is not None:
                 loss_mask = completion_pad_mask & external_gen_mask
             else:
-                temp_ids = _mask_prompt(completion_ids.clone())
-                loss_mask = completion_pad_mask & (temp_ids != -100)
+                loss_mask = completion_pad_mask
 
             if self.ppo_config.kl_beta > 0.0 and ref_log_probs_completion is not None:
                 logr = ref_log_probs_completion.float() - old_log_probs.float()
@@ -771,6 +770,7 @@ class PPOTrainer(BaseTrainer):
 
         ppo_batch_size = self.ppo_config.ppo_batch_size
         total_micro_batches_processed = 0
+        global_micro_batch_idx = 0
         has_ptx = self.ptx_criterion is not None and len(ptx_data) > 0
 
         unwrapped = unwrap_model(self.train_model)
@@ -863,8 +863,8 @@ class PPOTrainer(BaseTrainer):
                 if self.is_ds:
                     need_update_step = self.train_model.is_gradient_accumulation_boundary()
                 else:
-                    micro_batch_idx = i // ppo_batch_size
-                    need_update_step = ((micro_batch_idx + 1) % self.gradient_accumulation_steps == 0)
+                    global_micro_batch_idx += 1
+                    need_update_step = (global_micro_batch_idx % self.gradient_accumulation_steps == 0)
 
                 if has_ptx:
                     self._backward_loss(ppo_loss_unscaled, self.gradient_accumulation_steps, step=False)
@@ -890,6 +890,9 @@ class PPOTrainer(BaseTrainer):
                 if need_update_step:
                     self._update_step()
 
+        if not self.is_ds and (global_micro_batch_idx % self.gradient_accumulation_steps != 0):
+            self._update_step()
+
         if total_micro_batches_processed > 0:
             for key in ppo_stats:
                 ppo_stats[key] /= total_micro_batches_processed
@@ -902,7 +905,7 @@ class PPOTrainer(BaseTrainer):
 
         micro_batches_per_rollout = self.train_config.batch_size / self.ppo_config.ppo_batch_size
         updates_per_rollout = (self.ppo_config.ppo_epochs * micro_batches_per_rollout) / self.gradient_accumulation_steps
-        global_steps_per_rollout = max(1, int(updates_per_rollout))
+        global_steps_per_rollout = max(1, math.ceil(updates_per_rollout))
 
         for epoch in range(self.resume_epoch, self.train_config.n_epochs):
             file_count = len(self.train_config.file_dataset)

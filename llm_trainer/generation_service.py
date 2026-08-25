@@ -403,6 +403,7 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
         tokenizer = TrainerTools().tokenizer
         device = TrainerTools().parallel.device
         pad_token_id = tokenizer.pad
+        prompt_ids = prompt_ids.to(device)
 
         if tokens_per_image is not None and tokens_per_image > 1:
             from .utils import batch_repeat_image_tok

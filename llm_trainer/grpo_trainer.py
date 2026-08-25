@@ -3,6 +3,7 @@ import gc
 import torch
 import torch.distributed as dist
 from torch.utils.data import Dataset
+import torch.nn.functional as F
 from itertools import islice
 
 from .base_trainer import BaseTrainer
@@ -309,23 +310,37 @@ class GRPOTrainer(BaseTrainer):
                     external_gen_mask = torch.tensor(padded_gen_masks, dtype=torch.bool, device=device)
             else:
                 with unwrap_model_for_generation(self.train_model) as unwrapped_model:
-                    outputs, _ = batch_generate(
-                        model=unwrapped_model,
-                        tokens=padded_prompt_ids,
-                        attention_mask=prompt_masks,
-                        max_new_tokens=max_new_tokens,
-                        temperature=self.grpo_config.generate_config.temperature,
-                        top_k=self.grpo_config.generate_config.top_k,
-                        top_p=self.grpo_config.generate_config.top_p,
-                        repetition_penalty=self.grpo_config.generate_config.repetition_penalty,
-                        exclude_penalty_tokens=self.grpo_config.generate_config.exclude_penalty_tokens,
-                        device=device,
-                        suppress_tokens=self.grpo_config.generate_config.suppress_tokens,
-                        return_logits=False,
-                        auto_prefix_cache=self.grpo_config.generate_config.auto_prefix_cache
-                    )
+                    gen_chunk_size = self.grpo_config.generate_config.chunked_generate_size or padded_prompt_ids.size(0)
+                    chunk_completions = []
+                    max_comp_len = 0
+                    for start_idx in range(0, padded_prompt_ids.size(0), gen_chunk_size):
+                        chunk_prompts = padded_prompt_ids[start_idx: start_idx + gen_chunk_size]
+                        chunk_masks = prompt_masks[start_idx: start_idx + gen_chunk_size]
+                        chunk_out, _ = batch_generate(
+                            model=unwrapped_model,
+                            tokens=chunk_prompts,
+                            attention_mask=chunk_masks,
+                            max_new_tokens=max_new_tokens,
+                            temperature=self.grpo_config.generate_config.temperature,
+                            top_k=self.grpo_config.generate_config.top_k,
+                            top_p=self.grpo_config.generate_config.top_p,
+                            repetition_penalty=self.grpo_config.generate_config.repetition_penalty,
+                            exclude_penalty_tokens=self.grpo_config.generate_config.exclude_penalty_tokens,
+                            device=device,
+                            suppress_tokens=self.grpo_config.generate_config.suppress_tokens,
+                            return_logits=False,
+                            auto_prefix_cache=self.grpo_config.generate_config.auto_prefix_cache
+                        )
+                        comp = chunk_out[:, prompt_len:]
+                        max_comp_len = max(max_comp_len, comp.shape[1])
+                        chunk_completions.append(comp)
 
-                completion_ids = outputs[:, prompt_len:]
+                    padded_comps = [
+                        F.pad(comp, (0, max_comp_len - comp.shape[1]), value=pad_token_id)
+                        if comp.shape[1] < max_comp_len else comp
+                        for comp in chunk_completions
+                    ]
+                    completion_ids = torch.cat(padded_comps, dim=0)
 
             completion_pad_mask = completion_ids != pad_token_id
             if external_gen_mask is not None:

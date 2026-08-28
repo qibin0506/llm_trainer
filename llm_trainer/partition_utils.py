@@ -1,7 +1,8 @@
 from typing import Optional
-from contextlib import contextmanager, nullcontext
 import itertools
+from contextlib import contextmanager, nullcontext
 from packaging import version
+
 import torch
 from torch import nn
 

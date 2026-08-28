@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 
 import torch
 from llm_model import ModelConfig, VLMConfig
+
 from .tools import FileDataset
 
 
@@ -95,6 +96,7 @@ class DsZeROConfig:
     ignore_unused_parameters: Optional[bool] = False
     communication_data_type: Optional[str] = None  # "fp16" or "bf16"
 
+
 @dataclass(kw_only=True)
 class DsZero0Config(DsZeROConfig):
     """ZeRO Stage 0 配置 (等同于不进行 ZeRO 优化)。"""
@@ -139,6 +141,7 @@ class DsZero3Config(DsZeROConfig):
         zero_quantized_weights (`Optional[bool]`): ZeRO++ QWZ 特性，开启 INT8 权重 All-Gather 传输，减少一半通信量。
         zero_hpz_partition_size (`Optional[int]`): ZeRO++ HPZ 特性，层级切分策略。多机训练时建议设为单台机器的 GPU 数（如 8），消除机器间参数拉取的网络瓶颈。
         zero_quantized_gradients (`Optional[bool]`): ZeRO++ QGZ 特性，开启 INT4/INT8 的梯度 Reduce-Scatter，大幅压缩梯度通信量。
+        save_muon_momentum_buffer_in_memory (`Optional[bool]`): ZeRO-3 下使用 Muon 时，将动量缓冲区常驻内存（配合 NVMe offload 极大提升性能）
     """
     stage: int = field(default=3, init=False)
     sub_group_size: Optional[int] = 1e9
@@ -153,6 +156,7 @@ class DsZero3Config(DsZeROConfig):
     zero_quantized_weights: Optional[bool] = False
     zero_hpz_partition_size: Optional[int] = 1
     zero_quantized_gradients: Optional[bool] = False
+    save_muon_momentum_buffer_in_memory: Optional[bool] = None
 
 
 @dataclass(kw_only=True)
@@ -202,6 +206,7 @@ class DsConfig:
         activation_checkpointing (`Optional[DsActivationCheckpointingConfig]`): 激活重计算设置。
         wall_clock_breakdown (`bool`): 是否打印耗时拆解（Forward/Backward/Comm 等时间的占比分析）。
         flops_profiler (`Optional[DsFlopsProfilerConfig]`): DeepSpeed 算子性能与 TFLOPS 分析器配置。
+        zero_allow_untested_optimizer (`Optional[bool]`): 允许未在 DeepSpeed 官方白名单中测试的自定义优化器（ZeRO-1/2/3 通用）
     """
     zero_config: Optional[DsZeROConfig] = field(default_factory=DsZero3Config)
     fp16_config: Optional[DsFp16Config] = field(default_factory=DsFp16Config)
@@ -210,6 +215,7 @@ class DsConfig:
     activation_checkpointing: Optional[DsActivationCheckpointingConfig] = None
     wall_clock_breakdown: bool = False
     flops_profiler: Optional[DsFlopsProfilerConfig] = None
+    zero_allow_untested_optimizer: Optional[bool] = None
 
 
 @dataclass(kw_only=True)
@@ -233,7 +239,7 @@ class OptimConfig:
     优化器及学习率调度器 (LR Scheduler) 核心配置。
 
     Args:
-        optim_type (`str`): 优化器类型，支持 'adam', 'lion'。
+        optim_type (`str`): 优化器类型，支持 'adam', 'lion', 'muon'。
         auto_optimize_optimizer (`bool`): 如果允许，是否由 DeepSpeed 自行替换并接管 CPU/Fused 优化器实现。
         enable_lr_scheduler (`bool`): 是否启用学习率调度器。
         initial_lr (`float`): 初始学习率 (或经过 warmup 后达到的最大学习率)。
@@ -244,6 +250,11 @@ class OptimConfig:
         min_lr (`Optional[float]`): 余弦退火到达周期末尾时的最小学习率。
         cosine_annealing_period (`Optional[int]`): 余弦退火的一个完整周期的步数。
         cosine_annealing_period_mul (`int`): 周期的乘积系数，控制后续周期是否成倍变长。
+        muon_lr (`Optional[float]`): Muon 专用初始学习率 (建议 0.01 ~ 0.05，默认 0.02)。
+        muon_momentum (`float`): Muon 动量因子 (默认 0.95)。
+        muon_weight_decay (`Optional[float]`): Muon 权重衰减 (若为 None 则复用通用 weight_decay)。
+        muon_ns_steps (`int`): Newton-Schulz 迭代步数 (默认 5)。
+        muon_adjust_lr_fn (`Optional[str]`)： 取值original或match_rms_adamw
     """
     optim_type: str = 'adam'
     auto_optimize_optimizer: bool = True
@@ -256,6 +267,12 @@ class OptimConfig:
     min_lr: Optional[float] = None
     cosine_annealing_period: Optional[int] = None
     cosine_annealing_period_mul: int = 0
+
+    muon_lr: Optional[float] = 0.02
+    muon_momentum: float = 0.95
+    muon_weight_decay: Optional[float] = None
+    muon_ns_steps: int = 5
+    muon_adjust_lr_fn: Optional[str] = None
 
 
 @dataclass(kw_only=True)

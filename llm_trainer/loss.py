@@ -1,10 +1,12 @@
 from typing import Optional, Tuple
 import math
+
 import torch
 from torch import nn
 import torch.distributed as dist
-from torch.utils.checkpoint import checkpoint as torch_checkpoint
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
+
 from .partition_utils import maybe_gather_lm_head_ctx
 
 

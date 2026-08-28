@@ -1,25 +1,16 @@
 from typing import Optional, Mapping, Tuple, Protocol, Dict, Any
 import gc
 import concurrent.futures
+
 import torch
 import torch.distributed as dist
-from llm_model import (
-    LlmModel,
-    ModelConfig
-)
+from llm_model import LlmModel, ModelConfig
 
 from .tools import TrainerTools
 from .train_configs import GenerateConfig
 from .utils import get_dtype, empty_cache
-from .generate_utils import (
-    batch_generate,
-    generate
-)
-from .partition_utils import (
-    get_full_state_dict_on_rank0,
-    unwrap_model,
-    unwrap_model_for_generation
-)
+from .generate_utils import batch_generate, generate
+from .partition_utils import get_full_state_dict_on_rank0, unwrap_model,  unwrap_model_for_generation
 
 
 class GenerationServiceBase:

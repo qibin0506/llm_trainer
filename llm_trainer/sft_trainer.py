@@ -1,4 +1,5 @@
 from typing import Optional, Tuple, List
+
 import torch
 from torch.utils.data import Dataset
 
@@ -6,25 +7,10 @@ from .base_trainer import BaseTrainer
 from .dataset import SFTDataset
 from .tools import TrainerTools
 from .partition_utils import unwrap_model
-
-from llm_model import (
-    VLMConfig,
-    LlmModel,
-    VlmModel
-)
-from .train_configs import (
-    TrainConfig,
-    GenerationService
-)
-from .loss import (
-    ChunkedLMLoss,
-    LMLoss,
-    KDLoss
-)
-from .utils import (
-    get_sft_collate_fn,
-    get_dtype
-)
+from llm_model import VLMConfig, LlmModel, VlmModel
+from .train_configs import TrainConfig, GenerationService
+from .loss import ChunkedLMLoss, LMLoss, KDLoss
+from .utils import get_sft_collate_fn, get_dtype
 
 
 class SFTTrainer(BaseTrainer):

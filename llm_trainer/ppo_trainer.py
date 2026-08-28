@@ -1,17 +1,14 @@
-from typing import Tuple, List, Union, Optional
+from typing import Tuple, List, Union, Optional, Dict, Any
 import gc
 import math
+from itertools import islice
+
 import torch
 import torch.distributed as dist
 from torch.utils.data import Dataset
 import torch.nn as nn
 import torch.nn.functional as F
-from itertools import islice
-
-from llm_model import (
-    LlmModel,
-    VlmModel
-)
+from llm_model import LlmModel, VlmModel
 
 from .base_trainer import BaseTrainer
 from .dataset import RLDataset
@@ -20,13 +17,8 @@ from .tools import TrainerTools
 from .generate_utils import batch_generate
 from .log import Logger
 from .loss import LMLoss
-
-from .train_configs import (
-    TrainConfig,
-    RewardFun,
-    GenerationService,
-    PtxBuilder
-)
+from .parallel import DsParallel
+from .train_configs import  TrainConfig, RewardFun, GenerationService, PtxBuilder
 from .utils import (
     autocast,
     left_pad_sequence,
@@ -36,23 +28,14 @@ from .utils import (
     disable_dropout_in_model,
     calc_position_ids,
     RunningMeanStd,
-    empty_cache
+    empty_cache,
+    _build_deepspeed_kwargs,
+    _build_data_loader_config
 )
-from .checkpoint import (
-    save_checkpoint,
-    save_steps,
-    load_checkpoint
-)
-from .scheduler import (
-    LRScheduler,
-    WarmupCosineAnnealingLRScheduler,
-    CompositeLRScheduler,
-    NoneLRScheduler
-)
-from .partition_utils import (
-    unwrap_model_for_generation,
-    unwrap_model
-)
+from .checkpoint import save_checkpoint, save_steps, load_checkpoint
+from .scheduler import LRScheduler, WarmupCosineAnnealingLRScheduler, CompositeLRScheduler, NoneLRScheduler
+from .partition_utils import  unwrap_model_for_generation, unwrap_model
+from .muon import  MuonWithAdamW, _get_ds_muon
 
 
 class ValueModel(nn.Module):
@@ -188,80 +171,96 @@ class PPOTrainer(BaseTrainer):
                 prefixes=['value_model.']
             )
 
+        optimizer = self._config_optim(train_model, initial_lr)
+
         model, optim = TrainerTools().parallel.process(
             model=train_model,
-            optimizer=self._config_optim(train_model, initial_lr),
+            optimizer=optimizer,
             kwargs=self.parallel_kwargs
         )
 
         return model, optim
 
     def _config_optim(self, model, initial_lr):
-        optim_type = self.train_config.optim_config.optim_type
-        optimizer_cls = self._get_optim_cls()
-
         policy_config = self.train_config.optim_config
         value_config = self.ppo_config.value_optim_config if self.ppo_config.value_optim_config else policy_config
+        optim_cls = self._get_optim_cls()
+        policy_data = self._build_optimizer_param_groups(model.policy_model, policy_config, name_prefix="policy")
+        value_data = self._build_optimizer_param_groups(model.value_model, value_config, name_prefix="value")
+        is_muon = (policy_config.optim_type == 'muon' or value_config.optim_type == 'muon')
 
-        no_decay_name_list = ["bias", "norm.weight"]
-
-        def get_param_groups(module, config, name_prefix):
-            current_betas = config.betas
-            current_weight_decay = config.weight_decay
-
-            if current_betas is None:
-                current_betas = (0.95, 0.98) if optim_type == 'lion' else (0.9, 0.999)
-
-            if current_weight_decay is None:
-                current_weight_decay = 0.015 if optim_type == 'lion' else 0.01
-
-            decay_params = []
-            no_decay_params = []
-
-            for name, param in module.named_parameters():
-                if not param.requires_grad:
-                    continue
-                if any(nd in name for nd in no_decay_name_list):
-                    no_decay_params.append(param)
+        if is_muon:
+            all_muon_groups = []
+            all_adamw_groups = []
+            for data in [policy_data, value_data]:
+                if data["type"] == "muon":
+                    all_muon_groups.extend(data["muon_groups"])
+                    all_adamw_groups.extend(data["adamw_groups"])
                 else:
-                    decay_params.append(param)
+                    all_adamw_groups.extend(data["groups"])
 
-            return [
-                {
-                    "params": decay_params,
-                    "weight_decay": current_weight_decay,
-                    "lr": config.initial_lr,
-                    "betas": current_betas,
-                    "name": f"{name_prefix}_decay"
-                },
-                {
-                    "params": no_decay_params,
-                    "weight_decay": 0.0,
-                    "lr": config.initial_lr,
-                    "betas": current_betas,
-                    "name": f"{name_prefix}_no_decay"
-                }
-            ]
+            muon_wd = policy_config.muon_weight_decay
+            if muon_wd is None:
+                muon_wd = policy_config.weight_decay if policy_config.weight_decay is not None else 0.01
 
-        optimizer_grouped_parameters = []
-        optimizer_grouped_parameters.extend(get_param_groups(model.policy_model, policy_config, "policy"))
-        optimizer_grouped_parameters.extend(get_param_groups(model.value_model, value_config, "value"))
+            if isinstance(TrainerTools().parallel, DsParallel):
+                unified_momentum = policy_config.muon_momentum if policy_config.muon_momentum is not None else (
+                    value_config.muon_momentum if value_config.muon_momentum is not None else 0.95
+                )
+                for group in all_muon_groups:
+                    if group.get("momentum") != unified_momentum:
+                        if TrainerTools().parallel.is_main_process:
+                            Logger.std_log(
+                                f"[ZeRO-3 + Muon] Overriding group '{group.get('name')}' momentum "
+                                f"from {group.get('momentum')} to {unified_momentum} to satisfy ZeRO-3 uniform momentum constraint."
+                            )
+                        group["momentum"] = unified_momentum
 
-        default_betas = policy_config.betas if policy_config.betas else ((0.95, 0.98) if optim_type == 'lion' else (0.9, 0.999))
-        default_weight_decay = policy_config.weight_decay if policy_config.weight_decay else (0.015 if optim_type == 'lion' else 0.01)
+                all_groups = all_muon_groups + all_adamw_groups
+                ds_muon = _get_ds_muon(all_groups)
 
-        return optimizer_cls(
-            optimizer_grouped_parameters,
-            lr=policy_config.initial_lr,
-            betas=default_betas,
-            weight_decay=default_weight_decay
-        )
+                if ds_muon is None:
+                    raise RuntimeError('Current deepspeed is not support muon')
+                return ds_muon
+
+            return MuonWithAdamW(
+                muon_params=all_muon_groups,
+                adamw_params=all_adamw_groups,
+                muon_lr=policy_config.muon_lr if policy_config.muon_lr is not None else 0.02,
+                muon_momentum=policy_config.muon_momentum if policy_config.muon_momentum is not None else 0.95,
+                muon_weight_decay=muon_wd,
+                muon_ns_steps=policy_config.muon_ns_steps if policy_config.muon_ns_steps is not None else 5,
+                muon_adjust_lr_fn=policy_config.muon_adjust_lr_fn,
+                adamw_lr=policy_config.initial_lr,
+                adamw_betas=policy_config.betas if policy_config.betas is not None else (0.9, 0.95),
+                adamw_weight_decay=policy_config.weight_decay if policy_config.weight_decay is not None else 0.01,
+                adamw_cls=optim_cls
+            )
+        else:
+            all_groups = policy_data["groups"] + value_data["groups"]
+            default_betas = policy_config.betas if policy_config.betas else ((0.95, 0.98) if policy_config.optim_type == 'lion' else (0.9, 0.999))
+            default_weight_decay = policy_config.weight_decay if policy_config.weight_decay is not None else (0.015 if policy_config.optim_type == 'lion' else 0.01)
+
+            return optim_cls(
+                all_groups,
+                lr=policy_config.initial_lr,
+                betas=default_betas,
+                weight_decay=default_weight_decay
+            )
 
     def _init_lr_scheduler(self, initial_lr: float, optimizer) -> LRScheduler:
         policy_config = self.train_config.optim_config
-        value_config = self.ppo_config.value_optim_config
-
+        value_config = self.ppo_config.value_optim_config if self.ppo_config.value_optim_config else policy_config
         schedulers = []
+
+        policy_indices = [
+            i for i, g in enumerate(optimizer.param_groups)
+            if g.get('name', '').startswith('policy')
+        ]
+        value_indices = [
+            i for i, g in enumerate(optimizer.param_groups)
+            if g.get('name', '').startswith('value')
+        ]
 
         def create_scheduler(config, group_indices, need_log):
             real_initial_lr = initial_lr if config is None else config.initial_lr
@@ -271,7 +270,6 @@ class PPOTrainer(BaseTrainer):
                 max_lr = config.max_lr
                 cosine_annealing_period = config.cosine_annealing_period
                 cosine_annealing_period_mul = config.cosine_annealing_period_mul
-
                 return WarmupCosineAnnealingLRScheduler(
                     optimizer=optimizer,
                     warmup_iters=warmup_iters,
@@ -286,8 +284,8 @@ class PPOTrainer(BaseTrainer):
             else:
                 return NoneLRScheduler(real_initial_lr)
 
-        schedulers.append(create_scheduler(policy_config, [0, 1], True))
-        schedulers.append(create_scheduler(value_config, [2, 3], False))
+        schedulers.append(create_scheduler(policy_config, policy_indices, True))
+        schedulers.append(create_scheduler(value_config, value_indices, False))
 
         return CompositeLRScheduler(schedulers)
 
@@ -340,10 +338,28 @@ class PPOTrainer(BaseTrainer):
         )
 
     def _convert_train_args(self) -> Tuple[dict, dict, dict]:
-        parallel_kwargs, data_loader_kwargs, sampler_kwargs = super()._convert_train_args()
+        parallel_kwargs: Optional[Dict[str, Any]] = None
+        ds_config = self.train_config.ds_config
 
-        if parallel_kwargs:
-            parallel_kwargs['train_micro_batch_size_per_gpu'] = self.ppo_config.ppo_batch_size
+        if isinstance(TrainerTools().parallel, DsParallel) and ds_config:
+            value_is_muon = (
+                    self.ppo_config.value_optim_config is not None and
+                    self.ppo_config.value_optim_config.optim_type == 'muon'
+            )
+            policy_is_muon = (self.train_config.optim_config.optim_type == 'muon')
+            optim_type = 'muon' if (policy_is_muon or value_is_muon) else self.train_config.optim_config.optim_type
+
+            parallel_kwargs = _build_deepspeed_kwargs(
+                ds_config,
+                self.gradient_accumulation_steps,
+                self.ppo_config.ppo_batch_size,
+                optim_type
+            )
+
+        data_loader_kwargs, sampler_kwargs = _build_data_loader_config(
+            self.train_config.data_loader_config,
+            self.train_config.batch_size
+        )
 
         data_loader_kwargs.update({"collate_fn": lambda x: x})
         return parallel_kwargs, data_loader_kwargs, sampler_kwargs

@@ -1,12 +1,10 @@
 from typing import Union, Optional, List
+
 import torch
 from llm_model import VlmModel, KVCache
+
 from .tools import TrainerTools
-from .utils import (
-    autocast,
-    batch_repeat_image_tok,
-    calc_position_ids
-)
+from .utils import autocast, batch_repeat_image_tok, calc_position_ids
 
 
 def _find_longest_common_prefix(tokens: torch.Tensor) -> int:

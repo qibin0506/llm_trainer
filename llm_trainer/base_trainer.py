@@ -11,45 +11,26 @@ from contextlib import nullcontext
 import torch
 import torch.distributed as dist
 from torch.utils.data import Dataset
+from llm_model import LlmModel, ModelConfig
 
 from .parallel import DsParallel
 from .tools import TrainerTools
 from .partition_utils import unwrap_model_for_generation
 from .generate_utils import generate
-
-from llm_model import (
-    LlmModel,
-    ModelConfig
-)
-from .log import (
-    Logger,
-    _get_log_dir
-)
-from .train_configs import (
-    TrainConfig,
-    DsZero2Config,
-    DsZero3Config,
-    GenerationService
-)
-from .scheduler import (
-    LRScheduler,
-    WarmupCosineAnnealingLRScheduler,
-    NoneLRScheduler
-)
-from .checkpoint import (
-    load_checkpoint,
-    save_checkpoint,
-    load_steps,
-    save_steps,
-)
+from .log import Logger, _get_log_dir
+from .train_configs import TrainConfig, GenerationService
+from .scheduler import LRScheduler, WarmupCosineAnnealingLRScheduler, NoneLRScheduler
+from .checkpoint import load_checkpoint, save_checkpoint, load_steps, save_steps
 from .utils import (
     default_seed,
     set_seed,
     autocast,
     is_bf16_supported,
-    is_fp16_supported,
-    empty_cache
+    empty_cache,
+    _build_deepspeed_kwargs,
+    _build_data_loader_config
 )
+from .muon import MuonWithAdamW, _get_ds_muon
 
 
 class BaseTrainer:
@@ -298,9 +279,11 @@ class BaseTrainer:
         if self.train_config.init_weights_path is not None:
             self._load_external_weights(model, self.train_config.init_weights_path)
 
+        optimizer = self._config_optim(model, initial_lr)
+
         model, optim = TrainerTools().parallel.process(
             model=model,
-            optimizer=self._config_optim(model, initial_lr),
+            optimizer=optimizer,
             kwargs=self.parallel_kwargs
         )
 
@@ -309,48 +292,43 @@ class BaseTrainer:
     def _check_freeze_llm_model(self, model): ...
 
     def _config_optim(self, model, initial_lr):
-        optim_type = self.train_config.optim_config.optim_type
-        optimizer_cls = self._get_optim_cls()
+        optim_config = self.train_config.optim_config
+        optim_cls = self._get_optim_cls()
 
-        betas = self.train_config.optim_config.betas
-        weight_decay = self.train_config.optim_config.weight_decay
+        group_data = self._build_optimizer_param_groups(model, optim_config, name_prefix="base")
+        if group_data["type"] == "muon":
+            muon_wd = optim_config.muon_weight_decay
+            if muon_wd is None:
+                muon_wd = optim_config.weight_decay if optim_config.weight_decay is not None else 0.01
 
-        if betas is None:
-            betas = (0.95, 0.98) if optim_type == 'lion' else (0.9, 0.999)
+            if isinstance(TrainerTools().parallel, DsParallel):
+                all_groups = group_data["muon_groups"] + group_data["adamw_groups"]
+                ds_muon = _get_ds_muon(all_groups)
 
-        if weight_decay is None:
-            weight_decay = 0.015 if optim_type == 'lion' else 0.01
+                if ds_muon is None:
+                    raise RuntimeError('Current deepspeed is not support muon')
+                return ds_muon
 
-        no_decay_name_list = ["bias", "norm.weight"]
-        decay_params = []
-        no_decay_params = []
-
-        for name, param in model.named_parameters():
-            if not param.requires_grad:
-                continue
-
-            if any(nd in name for nd in no_decay_name_list):
-                no_decay_params.append(param)
-            else:
-                decay_params.append(param)
-
-        optimizer_grouped_parameters = [
-            {
-                "params": decay_params,
-                "weight_decay": weight_decay,
-            },
-            {
-                "params": no_decay_params,
-                "weight_decay": 0.0,
-            },
-        ]
-
-        return optimizer_cls(
-            optimizer_grouped_parameters,
-            lr=initial_lr,
-            betas=betas,
-            weight_decay=weight_decay
-        )
+            return MuonWithAdamW(
+                muon_params=group_data["muon_groups"],
+                adamw_params=group_data["adamw_groups"],
+                muon_lr=optim_config.muon_lr if optim_config.muon_lr is not None else 0.02,
+                muon_momentum=optim_config.muon_momentum if optim_config.muon_momentum is not None else 0.95,
+                muon_weight_decay=muon_wd,
+                muon_ns_steps=optim_config.muon_ns_steps if optim_config.muon_ns_steps is not None else 5,
+                muon_adjust_lr_fn=optim_config.muon_adjust_lr_fn,
+                adamw_lr=initial_lr,
+                adamw_betas=optim_config.betas if optim_config.betas is not None else (0.9, 0.95),
+                adamw_weight_decay=optim_config.weight_decay if optim_config.weight_decay is not None else 0.01,
+                adamw_cls=optim_cls
+            )
+        else:
+            return optim_cls(
+                group_data["groups"],
+                lr=initial_lr,
+                betas=optim_config.betas if optim_config.betas is not None else ((0.95, 0.98) if optim_config.optim_type == 'lion' else (0.9, 0.999)),
+                weight_decay=optim_config.weight_decay if optim_config.weight_decay is not None else (0.015 if optim_config.optim_type == 'lion' else 0.01)
+            )
 
     def _get_optim_cls(self):
         optimizer = None
@@ -395,6 +373,84 @@ class BaseTrainer:
 
         return optimizer
 
+    def _build_optimizer_param_groups(self, module: torch.nn.Module, optim_config, name_prefix: str = ""):
+        optim_type = optim_config.optim_type
+        weight_decay = optim_config.weight_decay if optim_config.weight_decay is not None else (
+            0.015 if optim_type == 'lion' else 0.01)
+        lr = optim_config.initial_lr
+        max_lr = optim_config.max_lr
+
+        def _make_group(params, wd, group_name, custom_lr=lr, custom_max_lr=max_lr, custom_wd=None, use_muon=False, momentum=0.95):
+            g = {
+                "params": params,
+                "weight_decay": wd if custom_wd is None else custom_wd,
+                "lr": custom_lr,
+                "max_lr": custom_max_lr,
+                "use_muon": use_muon,
+                "name": f"{name_prefix}_{group_name}"
+            }
+            if use_muon:
+                g["momentum"] = momentum
+            if optim_config.betas is not None:
+                g["betas"] = optim_config.betas
+            else:
+                g["betas"] = (0.95, 0.98) if optim_type == 'lion' else (0.9, 0.999)
+            return g
+
+        if optim_type != 'muon':
+            no_decay_name_list = ["bias", "norm.weight"]
+            decay_params, no_decay_params = [], []
+            for name, param in module.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if any(nd in name for nd in no_decay_name_list):
+                    no_decay_params.append(param)
+                else:
+                    decay_params.append(param)
+
+            raw_groups = [
+                _make_group(decay_params, weight_decay, "decay"),
+                _make_group(no_decay_params, 0.0, "no_decay")
+            ]
+            return {
+                "type": optim_type,
+                "groups": [g for g in raw_groups if len(g["params"]) > 0]
+            }
+
+        muon_lr = optim_config.muon_lr if optim_config.muon_lr is not None else 0.02
+        muon_momentum = optim_config.muon_momentum if optim_config.muon_momentum is not None else 0.95
+        muon_wd = optim_config.muon_weight_decay if optim_config.muon_weight_decay is not None else weight_decay
+        adam_keywords = ["embed", "wte", "wpe", "lm_head", "head", "output", "bias", "norm"]
+        muon_params, adam_decay_params, adam_no_decay_params = [], [], []
+
+        for name, param in module.named_parameters():
+            if not param.requires_grad:
+                continue
+            is_2d = (param.ndim == 2)
+            is_special = any(kw in name.lower() for kw in adam_keywords)
+            if is_2d and not is_special:
+                muon_params.append(param)
+            else:
+                if "bias" in name.lower() or "norm" in name.lower():
+                    adam_no_decay_params.append(param)
+                else:
+                    adam_decay_params.append(param)
+
+        muon_groups = [
+            _make_group(muon_params, muon_wd, "muon", custom_lr=muon_lr, custom_max_lr=muon_lr, use_muon=True,
+                        momentum=muon_momentum)
+        ]
+        adamw_groups = [
+            _make_group(adam_decay_params, weight_decay, "adam_decay", use_muon=False),
+            _make_group(adam_no_decay_params, 0.0, "adam_no_decay", use_muon=False)
+        ]
+
+        return {
+            "type": "muon",
+            "muon_groups": [g for g in muon_groups if len(g["params"]) > 0],
+            "adamw_groups": [g for g in adamw_groups if len(g["params"]) > 0]
+        }
+
     def _init_lr_scheduler(self, initial_lr: float, optimizer) -> LRScheduler:
         if self.train_config.optim_config.enable_lr_scheduler:
             warmup_iters = self.train_config.optim_config.warmup_iters
@@ -437,161 +493,20 @@ class BaseTrainer:
 
     def _convert_train_args(self) -> Tuple[dict, dict, dict]:
         parallel_kwargs: Optional[Dict[str, Any]] = None
-        if isinstance(TrainerTools().parallel, DsParallel) and self.train_config.ds_config:
-            parallel_kwargs = {
-                'gradient_accumulation_steps': self.gradient_accumulation_steps,
-                'gradient_clipping': self.train_config.ds_config.gradient_clipping,
-                'train_micro_batch_size_per_gpu': self.train_config.batch_size
-            }
+        ds_config = self.train_config.ds_config
 
-            if self.train_config.ds_config.wall_clock_breakdown:
-                parallel_kwargs['wall_clock_breakdown'] = True
+        if isinstance(TrainerTools().parallel, DsParallel) and ds_config:
+            parallel_kwargs = _build_deepspeed_kwargs(
+                ds_config,
+                self.gradient_accumulation_steps,
+                self.train_config.batch_size,
+                self.train_config.optim_config.optim_type
+            )
 
-            if (self.train_config.ds_config.flops_profiler
-                    and self.train_config.ds_config.flops_profiler.enabled):
-                flops_cfg = self.train_config.ds_config.flops_profiler
-                parallel_kwargs['flops_profiler'] = {
-                    'enabled': flops_cfg.enabled,
-                    'profile_step': flops_cfg.profile_step,
-                    'module_depth': flops_cfg.module_depth,
-                    'top_modules': flops_cfg.top_modules,
-                    'detailed': flops_cfg.detailed,
-                    'output_file': flops_cfg.output_file
-                }
-
-            if self.train_config.ds_config.zero_config:
-                zero_config = self.train_config.ds_config.zero_config
-                zero_optimization: Dict[str, Any] = {'stage': zero_config.stage}
-
-                if zero_config.allgather_partitions is not None:
-                    zero_optimization['allgather_partitions'] = zero_config.allgather_partitions
-                if zero_config.allgather_bucket_size is not None:
-                    zero_optimization['allgather_bucket_size'] = zero_config.allgather_bucket_size
-                if zero_config.overlap_comm is not None:
-                    zero_optimization['overlap_comm'] = zero_config.overlap_comm
-                if zero_config.reduce_scatter is not None:
-                    zero_optimization['reduce_scatter'] = zero_config.reduce_scatter
-                if zero_config.reduce_bucket_size is not None:
-                    zero_optimization['reduce_bucket_size'] = zero_config.reduce_bucket_size
-                if zero_config.contiguous_gradients is not None:
-                    zero_optimization['contiguous_gradients'] = zero_config.contiguous_gradients
-                if zero_config.ignore_unused_parameters:
-                    zero_optimization['ignore_unused_parameters'] = True
-                if zero_config.communication_data_type:
-                    zero_optimization['communication_data_type'] = zero_config.communication_data_type
-
-                if isinstance(zero_config, (DsZero2Config, DsZero3Config)):
-                    if zero_config.offload_optimizer is not None:
-                        zero_optimization['offload_optimizer'] = {
-                            "device": zero_config.offload_optimizer.device,
-                            "pin_memory": zero_config.offload_optimizer.pin_memory
-                        }
-
-                        if zero_config.offload_optimizer.device == 'nvme':
-                            if zero_config.offload_optimizer.nvme_path: zero_optimization['offload_optimizer']["nvme_path"] = zero_config.offload_optimizer.nvme_path
-                            if zero_config.offload_optimizer.buffer_count: zero_optimization['offload_optimizer']["buffer_count"] = zero_config.offload_optimizer.buffer_count
-                            if zero_config.offload_optimizer.buffer_size: zero_optimization['offload_optimizer']["buffer_size"] = zero_config.offload_optimizer.buffer_size
-                            if zero_config.offload_optimizer.max_in_cpu: zero_optimization['offload_optimizer']["max_in_cpu"] = zero_config.offload_optimizer.max_in_cpu
-                    if zero_config.offload_param is not None:
-                        zero_optimization['offload_param'] = {
-                            "device": zero_config.offload_param.device,
-                            "pin_memory": zero_config.offload_param.pin_memory
-                        }
-
-                        if zero_config.offload_param.device == 'nvme':
-                            if zero_config.offload_param.nvme_path: zero_optimization['offload_param']["nvme_path"] = zero_config.offload_param.nvme_path
-                            if zero_config.offload_param.buffer_count: zero_optimization['offload_param']["buffer_count"] = zero_config.offload_param.buffer_count
-                            if zero_config.offload_param.buffer_size: zero_optimization['offload_param']["buffer_size"] = zero_config.offload_param.buffer_size
-                            if zero_config.offload_param.max_in_cpu: zero_optimization['offload_param']["max_in_cpu"] = zero_config.offload_param.max_in_cpu
-
-                if isinstance(zero_config, DsZero3Config):
-                    if zero_config.sub_group_size is not None:
-                        zero_optimization['sub_group_size'] = zero_config.sub_group_size
-                    if zero_config.stage3_prefetch_bucket_size is not None:
-                        zero_optimization['stage3_prefetch_bucket_size'] = zero_config.stage3_prefetch_bucket_size
-                    if zero_config.stage3_param_persistence_threshold is not None:
-                        zero_optimization['stage3_param_persistence_threshold'] = zero_config.stage3_param_persistence_threshold
-                    if zero_config.stage3_max_live_parameters is not None:
-                        zero_optimization['stage3_max_live_parameters'] = zero_config.stage3_max_live_parameters
-                    if zero_config.stage3_max_reuse_distance is not None:
-                        zero_optimization['stage3_max_reuse_distance'] = zero_config.stage3_max_reuse_distance
-                    if zero_config.stage3_gather_16bit_weights_on_model_save is not None:
-                        zero_optimization['stage3_gather_16bit_weights_on_model_save'] = zero_config.stage3_gather_16bit_weights_on_model_save
-                    if zero_config.memory_efficient_linear is not None:
-                        zero_optimization['memory_efficient_linear'] = zero_config.memory_efficient_linear
-                    if zero_config.zero_quantized_weights:
-                        zero_optimization['zero_quantized_weights'] = True
-                    if zero_config.zero_hpz_partition_size > 1:
-                        zero_optimization['zero_hpz_partition_size'] = zero_config.zero_hpz_partition_size
-                    if zero_config.zero_quantized_gradients:
-                        zero_optimization['zero_quantized_gradients'] = True
-
-                parallel_kwargs['zero_optimization'] = zero_optimization
-
-            compute_dtype = TrainerTools().compute_dtype
-            enable_bf16 = False
-            enable_fp16 = False
-
-            if compute_dtype == 'bf16':
-                enable_bf16 = True
-            elif compute_dtype == 'fp16':
-                enable_fp16 = True
-            elif compute_dtype == 'fp32':
-                pass
-            elif (self.train_config.ds_config.bf16_config is not None
-                    and self.train_config.ds_config.bf16_config.enabled
-                    and is_bf16_supported()):
-                enable_bf16 = True
-            elif self.train_config.ds_config.fp16_config and is_fp16_supported():
-                enable_fp16 = True
-
-            if enable_bf16:
-                bf16: Dict[str, Any] = {'enabled': True}
-                parallel_kwargs['bf16'] = bf16
-            elif enable_fp16:
-                fp16: Dict[str, Any] = {'enabled': True}
-                fp16_config = self.train_config.ds_config.fp16_config
-                if fp16_config:
-                    fp16.update({
-                        'loss_scale': fp16_config.loss_scale,
-                        'loss_scale_window': fp16_config.loss_scale_window,
-                        'initial_scale_power': fp16_config.initial_scale_power,
-                        'hysteresis': fp16_config.hysteresis,
-                        'min_loss_scale': fp16_config.min_loss_scale
-                    })
-
-                    if fp16_config.fp16_opt_level is not None:
-                        fp16['fp16_opt_level'] = fp16_config.fp16_opt_level
-
-                parallel_kwargs['fp16'] = fp16
-
-            if self.train_config.ds_config.activation_checkpointing:
-                activation_checkpointing_config = self.train_config.ds_config.activation_checkpointing
-                activation_checkpointing: Dict[str, Any] = {
-                    'partition_activations': activation_checkpointing_config.partition_activations,
-                    'cpu_checkpointing': activation_checkpointing_config.cpu_checkpointing,
-                    'contiguous_memory_optimization': activation_checkpointing_config.contiguous_memory_optimization,
-                    'synchronize_checkpoint_boundary': activation_checkpointing_config.synchronize_checkpoint_boundary,
-                    'profile': activation_checkpointing_config.profile
-                }
-
-                if activation_checkpointing_config.number_checkpoints is not None:
-                    activation_checkpointing['number_checkpoints'] = activation_checkpointing_config.number_checkpoints
-
-                parallel_kwargs['activation_checkpointing'] = activation_checkpointing
-
-        dataloader_args = self.train_config.data_loader_config
-        data_loader_kwargs = {
-            "batch_size": self.train_config.batch_size,
-            "pin_memory": dataloader_args.pin_memory,
-            "num_workers": dataloader_args.num_workers,
-            "shuffle": dataloader_args.shuffle,
-            "drop_last": True,
-        }
-        sampler_kwargs = {
-            "shuffle": dataloader_args.shuffle,
-            "drop_last": True,
-        }
+        data_loader_kwargs, sampler_kwargs = _build_data_loader_config(
+            self.train_config.data_loader_config,
+            self.train_config.batch_size
+        )
 
         return parallel_kwargs, data_loader_kwargs, sampler_kwargs
 

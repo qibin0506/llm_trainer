@@ -1,7 +1,7 @@
+from typing import Optional
+from abc import ABC, abstractmethod
 import os
 import math
-from abc import ABC, abstractmethod
-from typing import Optional
 
 from .tokenizer import Tokenizer
 from .parallel import DsParallel, NoneParallel

@@ -1,6 +1,7 @@
-import os
-import torch
 from typing import List, Dict, Union
+import os
+
+import torch
 from nano_tokenizer import NanoTokenizer
 
 class Tokenizer:

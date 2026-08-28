@@ -1,5 +1,6 @@
 import os
 from typing import Optional, Union
+
 import torch
 from torch import nn
 from torch.optim import Optimizer

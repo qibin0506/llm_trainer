@@ -1,13 +1,19 @@
-from typing import Union, List, Optional, Tuple
-import random
+from typing import Union, List, Optional, Tuple, Dict, Any
+from dataclasses import asdict
 from contextlib import nullcontext
+import random
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.utils.rnn import pad_sequence
 import torch.nn.functional as F
+
 from .tools import TrainerTools
+from .log import Logger
+from .train_configs import DsConfig, DsZeROConfig, DataLoaderConfig
+
 
 default_seed = 42
 
@@ -60,8 +66,28 @@ def get_dtype():
     return dtype
 
 
-def is_bf16_supported():
-    device_type = TrainerTools().parallel.device_type
+def is_bf16_supported(device: Optional[Union[str, torch.device, torch.Tensor]] = None):
+    if device is not None:
+        if isinstance(device, torch.Tensor):
+            device_type = device.device.type
+        elif isinstance(device, torch.device):
+            device_type = device.type
+        else:
+            device_type = str(device).split(':')[0]
+    else:
+        try:
+            device_type = TrainerTools().parallel.device_type
+        except Exception:
+            if torch.cuda.is_available():
+                device_type = 'cuda'
+            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                device_type = 'mps'
+            elif hasattr(torch, 'mlu') and torch.mlu.is_available():
+                device_type = 'mlu'
+            elif hasattr(torch, 'npu') and torch.npu.is_available():
+                device_type = 'npu'
+            else:
+                device_type = 'cpu'
 
     if device_type == 'cuda':
         if hasattr(torch.cuda, 'is_bf16_supported'):
@@ -74,7 +100,7 @@ def is_bf16_supported():
                 return False
 
     if device_type == 'mlu':
-        if hasattr(torch.mlu, 'is_bf16_supported'):
+        if hasattr(torch, 'mlu') and hasattr(torch.mlu, 'is_bf16_supported'):
             return torch.mlu.is_bf16_supported()
         return False
 
@@ -675,6 +701,118 @@ def _zero_pad_sequences(sequences: list[torch.Tensor], side: str = "left") -> to
         padding = (pad_len, 0) if side == "left" else (0, pad_len)
         padded_sequences.append(F.pad(seq, padding))
     return torch.stack(padded_sequences, dim=0)
+
+
+def _build_deepspeed_kwargs(ds_config: DsConfig, gradient_accumulation_steps, batch_size, optim_type) -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {
+        'gradient_accumulation_steps': gradient_accumulation_steps,
+        'gradient_clipping': ds_config.gradient_clipping,
+        'train_micro_batch_size_per_gpu': batch_size
+    }
+
+    if ds_config.wall_clock_breakdown:
+        kwargs['wall_clock_breakdown'] = True
+
+    if ds_config.zero_allow_untested_optimizer is not None:
+        kwargs['zero_allow_untested_optimizer'] = ds_config.zero_allow_untested_optimizer
+
+    if ds_config.flops_profiler and ds_config.flops_profiler.enabled:
+        kwargs['flops_profiler'] = {k: v for k, v in asdict(ds_config.flops_profiler).items() if v is not None}
+
+    if ds_config.zero_config:
+        zero_opt = _build_zero_config(ds_config.zero_config)
+        kwargs['zero_optimization'] = zero_opt
+
+        if optim_type == 'muon':
+            if kwargs.get('zero_allow_untested_optimizer') is None:
+                kwargs['zero_allow_untested_optimizer'] = True
+
+            if ds_config.zero_config.stage == 3 and zero_opt.get('reduce_scatter', False):
+                zero_opt['reduce_scatter'] = False
+                if TrainerTools().parallel.is_main_process:
+                    Logger.std_log("[ZeRO-3 + Muon] Automatically disabled reduce_scatter.")
+
+            is_cpu_offload = zero_opt.get('offload_optimizer', {}).get('device') == 'cpu'
+            if ds_config.zero_config.stage in (1, 2) and is_cpu_offload and zero_opt.get('reduce_scatter', False):
+                zero_opt['reduce_scatter'] = False
+                if TrainerTools().parallel.is_main_process:
+                    Logger.std_log("[ZeRO-1/2 CPU Offload + Muon] Automatically disabled reduce_scatter.")
+
+    compute_dtype = TrainerTools().compute_dtype
+    enable_bf16 = False
+    enable_fp16 = False
+
+    if compute_dtype == 'bf16':
+        enable_bf16 = True
+    elif compute_dtype == 'fp16':
+        enable_fp16 = True
+    elif compute_dtype == 'fp32':
+        pass
+    elif ds_config.bf16_config and ds_config.bf16_config.enabled and is_bf16_supported():
+        enable_bf16 = True
+    elif ds_config.fp16_config and is_fp16_supported():
+        enable_fp16 = True
+
+    if enable_bf16:
+        kwargs['bf16'] = {'enabled': True}
+    elif enable_fp16:
+        fp16_dict = {'enabled': True}
+        if ds_config.fp16_config is not None:
+            fp16_dict.update({
+                k: v for k, v in asdict(ds_config.fp16_config).items() if v is not None and k != 'enabled'
+            })
+        kwargs['fp16'] = fp16_dict
+
+    if ds_config.activation_checkpointing:
+        kwargs['activation_checkpointing'] = {
+            k: v for k, v in asdict(ds_config.activation_checkpointing).items() if v is not None
+        }
+
+    return kwargs
+
+
+def _build_zero_config(zero_config: DsZeROConfig) -> Dict[str, Any]:
+    zero_opt = {k: v for k, v in asdict(zero_config).items() if v is not None}
+
+    for offload_key in ('offload_optimizer', 'offload_param'):
+        offload_cfg = getattr(zero_config, offload_key, None)
+        if offload_cfg is not None:
+            offload_dict = {
+                "device": offload_cfg.device,
+                "pin_memory": offload_cfg.pin_memory
+            }
+
+            if offload_cfg.device == 'nvme':
+                if offload_cfg.nvme_path is not None:
+                    offload_dict["nvme_path"] = offload_cfg.nvme_path
+                if offload_cfg.buffer_count is not None:
+                    offload_dict["buffer_count"] = offload_cfg.buffer_count
+                if offload_key == 'offload_param':
+                    if offload_cfg.buffer_size is not None:
+                        offload_dict["buffer_size"] = offload_cfg.buffer_size
+                    if offload_cfg.max_in_cpu is not None:
+                        offload_dict["max_in_cpu"] = offload_cfg.max_in_cpu
+
+            zero_opt[offload_key] = offload_dict
+
+    return zero_opt
+
+
+def _build_data_loader_config(dataloader_args: DataLoaderConfig, batch_size):
+    data_loader_kwargs = {
+        "batch_size": batch_size,
+        "pin_memory": dataloader_args.pin_memory,
+        "num_workers": dataloader_args.num_workers,
+        "shuffle": dataloader_args.shuffle,
+        "drop_last": True,
+    }
+
+    sampler_kwargs = {
+        "shuffle": dataloader_args.shuffle,
+        "drop_last": True,
+    }
+
+    return data_loader_kwargs, sampler_kwargs
 
 
 class RunningMeanStd(nn.Module):

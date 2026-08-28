@@ -1,30 +1,19 @@
 from typing import Tuple, List, Optional
 import gc
 import math
+from itertools import islice
+
 import torch
 from torch.utils.data import Dataset
-from itertools import islice
 
 from .base_trainer import BaseTrainer
 from .dataset import DPODataset
 from .loss import DPOLoss
 from .tools import TrainerTools
 from .log import Logger
-from .train_configs import (
-    TrainConfig,
-    GenerationService
-)
-from .utils import (
-    autocast,
-    get_dpo_collate_fn,
-    log_softmax,
-    disable_dropout_in_model,
-    empty_cache
-)
-from .checkpoint import (
-    save_checkpoint,
-    save_steps,
-)
+from .train_configs import TrainConfig, GenerationService
+from .utils import autocast, get_dpo_collate_fn, log_softmax, disable_dropout_in_model, empty_cache
+from .checkpoint import save_checkpoint, save_steps
 
 
 class DPOTrainer(BaseTrainer):

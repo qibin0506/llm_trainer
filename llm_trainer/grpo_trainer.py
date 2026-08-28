@@ -1,11 +1,12 @@
 from typing import Tuple, List, Optional
 import gc
 import math
+from itertools import islice
+
 import torch
 import torch.distributed as dist
 from torch.utils.data import Dataset
 import torch.nn.functional as F
-from itertools import islice
 
 from .base_trainer import BaseTrainer
 from .dataset import RLDataset
@@ -13,13 +14,7 @@ from .loss import GRPOLoss, LMLoss
 from .tools import TrainerTools
 from .generate_utils import batch_generate
 from .log import Logger
-
-from .train_configs import (
-    TrainConfig,
-    RewardFun,
-    GenerationService,
-    PtxBuilder
-)
+from .train_configs import TrainConfig, RewardFun, GenerationService, PtxBuilder
 from .utils import (
     autocast,
     left_pad_sequence,
@@ -29,14 +24,9 @@ from .utils import (
     calc_position_ids,
     empty_cache
 )
-from .checkpoint import (
-    save_checkpoint,
-    save_steps,
-)
-from .partition_utils import (
-    unwrap_model_for_generation,
-    unwrap_model
-)
+from .checkpoint import save_checkpoint, save_steps
+from .partition_utils import unwrap_model_for_generation, unwrap_model
+
 
 class GRPOTrainer(BaseTrainer):
     """

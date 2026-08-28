@@ -1,8 +1,9 @@
-import torch
-from torch.utils.data import Dataset
 import pickle
 import csv
 import json
+
+import torch
+from torch.utils.data import Dataset
 import numpy as np
 
 from .tools import TrainerTools

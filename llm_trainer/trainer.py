@@ -1,4 +1,5 @@
 from typing import List, Tuple, Optional
+
 import torch
 from torch.utils.data import Dataset
 
@@ -6,16 +7,9 @@ from .base_trainer import BaseTrainer
 from .utils import pretrain_collate_fn
 from .dataset import PretrainDataset
 from .partition_utils import unwrap_model
+from .train_configs import TrainConfig, GenerationService
+from .loss import ChunkedLMLoss, LMLoss, KDLoss
 
-from .train_configs import (
-    TrainConfig,
-    GenerationService
-)
-from .loss import (
-    ChunkedLMLoss,
-    LMLoss,
-    KDLoss
-)
 
 class Trainer(BaseTrainer):
     """

@@ -9,24 +9,34 @@
 2. [项目结构](#-项目结构)
 3. [环境准备与环境变量配置](#-环境准备与环境变量配置)
 4. [数据格式与 Tokenizer 规范](#-数据格式与-tokenizer-规范)
-5. [多硬件与分布式训练配置](#-多硬件与分布式训练配置)
+5. [优化器与调度器 (Muon / AdamW / Lion 混合优化)](#-优化器与调度器-muon--adamw--lion-混合优化)
+    * [1. Muon 优化器与智能混合参数分组](#1-muon-优化器与智能混合参数分组)
+    * [2. 多学习率协同调度 (Multi-Group LR Scaling)](#2-多学习率协同调度-multi-group-lr-scaling)
+    * [3. DeepSpeed ZeRO-3 / Offload 与 Muon 深度协同](#3-deepspeed-zero-3--offload-与-muon-深度协同)
+6. [多硬件与分布式训练配置](#-多硬件与分布式训练配置)
     * [硬件支持 (CUDA/NPU/MLU/MPS)](#硬件支持)
     * [DeepSpeed ZeRO-2 / ZeRO-3 & Offload 配置](#deepspeed-zero-2--zero-3--offload-配置)
-6. [核心训练模块指南](#-核心训练模块指南)
+7. [核心训练模块指南](#-核心训练模块指南)
     * [1. 预训练 (Pretrain Trainer & 分块交叉熵)](#1-预训练-pretrain-trainer)
     * [2. 监督微调 (SFT Trainer - ATF 与分块损失)](#2-监督微调-sft-trainer---llm--vlm)
     * [3. 偏好对齐 (DPO / ORPO / SimPO Trainer)](#3-偏好对齐-dpo--orpo--simpo-trainer)
     * [4. 近端策略优化 (PPO Trainer & Rollout分块)](#4-近端策略优化-ppo-trainer)
     * [5. 组相对策略优化 (GRPO Trainer & 前沿变体)](#5-组相对策略优化-grpo-trainer--前沿变体)
-7. [自定义生成服务 (Generation Services)](#-自定义生成服务-generation-services)
-8. [实用工具 (Tools & Utilities)](#-实用工具-tools--utilities)
-9. [附录：全量参数配置详解](#-附录)
+8. [自定义生成服务 (Generation Services)](#-自定义生成服务-generation-services)
+9. [实用工具 (Tools & Utilities)](#-实用工具-tools--utilities)
+10. [附录：全量参数配置详解](#-附录)
 
 ---
 
 ## 🔥 项目特性
 
 * **全流程算法支持**：覆盖 Pretrain、SFT、DPO/ORPO/SimPO、PPO 以及 DeepSeek-R1 核心的 GRPO 及其衍生算子（BNPO, Dr-GRPO, CISPO, DAPO, LUSPO, SAPO, VESPO）。
+* **新一代正交动量优化器 (Muon Optimizer) 与混合优化支持**：
+  - **极分解正交更新**：原生实现 5 阶 Newton-Schulz 迭代（`MuonOptim`），支持 `torch.compile` 编译加速，显著提升大模型预训练与强化学习阶段的收敛速度与稳定性。
+  - **智能混合参数分组 (Muon + AdamW)**：框架自动分离 2D 线性层矩阵（分配给 Muon 进行正交动量更新）与 1D 向量、Embedding、LM Head、LayerNorm/RMSNorm 及 Bias（分配给 AdamW/Lion），完全无需繁琐的手动配置。
+  - **多学习率协同调度 (Multi-Group LR Scaling)**：内置比例学习率调度机制，Muon（如 `0.02`）与 AdamW（如 `1e-3`）即使基准学习率相差数十倍，其在 Warmup 和余弦退火阶段仍能保持严格按比例同步缩放。
+  - **DeepSpeed ZeRO-1/2/3 深度适配**：无缝对接 DeepSpeed `MuonWithAuxAdam`，针对 ZeRO-3 与 CPU Offload 自动规避 `reduce_scatter` 限制，支持 `save_muon_momentum_buffer_in_memory`（常驻内存避免 NVMe 频繁换入换出）及 `zero_allow_untested_optimizer`。
+  - **RL 全阶段支持**：PPO (Actor/Critic 独立或联合配置) 与 GRPO 均可一键开启 `optim_type='muon'`。
 * **Active Token Filtering (ATF) & Chunked Cross Entropy (CCE)**：
   - **动态 Token 筛选**：在 SFT/Pretrain 阶段自动过滤 `-100` 掩码（Prompt/Padding），仅将有效 Token 送入投影层，砍掉 $70\% \sim 90\%$ 的无用 GEMM 计算。
   - **分块交叉熵 + 梯度检查点**：支持 `chunked_cross_entropy_size`，在前向阶段完全避免具象化超大 $[B, S, V]$ 的 Logits 显存。
@@ -47,12 +57,13 @@
 
 ```text
 ├── __init__.py             # 统一导出入口
-├── base_trainer.py         # 训练器基类 (生命周期管理、梯度累积、Checkpoint、return_logits调度)
+├── base_trainer.py         # 训练器基类 (生命周期管理、梯度累积、Checkpoint、优化器与参数分组管理)
 ├── trainer.py              # 预训练 Trainer (支持 ChunkedLMLoss 分块交叉熵)
 ├── sft_trainer.py          # 监督微调 SFT Trainer (支持 Active Token Filtering 与 VLM)
 ├── dpo_trainer.py          # 偏好对齐 DPO Trainer (支持 DPO, ORPO, SimPO)
-├── ppo_trainer.py          # 强化学习 PPO Trainer (支持 Value Model, GAE, 生成与评估分块与 Whitening)
+├── ppo_trainer.py          # 强化学习 PPO Trainer (支持 Value Model, GAE, 生成与评估分块, Muon 混合优化)
 ├── grpo_trainer.py         # 强化学习 GRPO Trainer (支持组内归一化、生成与评估分块及多种前沿 Loss)
+├── muon.py                 # Muon 优化器实现 (Newton-Schulz 正交迭代, MuonWithAdamW 及 DeepSpeed 集成)
 ├── train_configs.py        # 全局配置类 dataclasses (Optim, DsConfig, GenerateConfig, Protocols)
 ├── parallel.py             # 分布式并行抽象层 (DsParallel, NoneParallel, 多后端适配)
 ├── generation_service.py   # 生成服务 (SyncCentral, Parallel, MultiTurnRL)
@@ -63,10 +74,10 @@
 ├── partition_utils.py      # ZeRO-3 权重 Gather、maybe_gather_lm_head_ctx、Unwrap 与跨 Rank 同步
 ├── checkpoint.py           # Checkpoint / Steps 序列化与恢复
 ├── ds_checkpoint.py        # DeepSpeed Checkpoint 管理
-├── scheduler.py            # Warmup Cosine LR 调度器及复合调度器
+├── scheduler.py            # Warmup Cosine LR 调度器 (支持多参数组比例缩放) 及复合调度器
 ├── tools.py                # 辅助工具 (权重格式转换, 步数计算, 数据量估算)
 ├── log.py                  # 日志记录器
-└── utils.py                # 常用数学算子, Mask 算子, 硬件辅助算子
+└── utils.py                # 常用数学算子, Mask 算子, 硬件辅助算子, DeepSpeed 配置构建器
 ```
 
 ---
@@ -139,7 +150,43 @@ export CHECKPOINT_DIR="./output_ckpts"
 
 ---
 
-## ⚡ 多硬件与分布式训练配置
+## ⚡ 优化器与调度器 (Muon / AdamW / Lion 混合优化)
+
+框架支持 **AdamW**、**Lion** 以及前沿的 **Muon** 优化器，并提供了参数自动路由与跨组比例退火调度机制。
+
+### 1. Muon 优化器与智能混合参数分组
+Muon 对 2D 权重矩阵使用极分解正交化更新，但不能直接作用于 1D 偏置、LayerNorm、Embedding 或 LM Head。框架内置了**自动参数路由机制**：
+- **2D 隐藏层投影矩阵**（如 `q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj` 等）：自动路由至 `Muon` 组，使用 `muon_lr`、`muon_momentum` 及 5 阶 Newton-Schulz 正交迭代更新。
+- **Embedding / LM Head / Norm / Bias / 1D 参数**：自动路由至 `AdamW` 衰减或非衰减组，使用 `initial_lr` 及 `betas` 更新。
+
+```python
+from train_configs import OptimConfig
+
+# 配置 Muon 优化器 (自动混合 AdamW)
+optim_config = OptimConfig(
+    optim_type='muon',
+    initial_lr=1e-3,                      # 适用于 AdamW 参数组（Embedding/Norm/Head/Bias）的学习率
+    muon_lr=0.02,                         # 适用于 Muon 2D 矩阵权重专属学习率（建议 0.01 ~ 0.05）
+    muon_momentum=0.95,                   # Muon 动量
+    muon_ns_steps=5,                      # Newton-Schulz 迭代阶数
+    muon_adjust_lr_fn='match_rms_adamw',  # 可选: 'original' 或 'match_rms_adamw' (按矩阵维度自适应调大学习率)
+    weight_decay=0.01,
+    enable_lr_scheduler=True,
+    warmup_iters=200,
+    cosine_annealing_period=5000
+)
+```
+
+### 2. 多学习率协同调度 (Multi-Group LR Scaling)
+当 Muon (`muon_lr=0.02`) 与 AdamW (`initial_lr=0.001`) 混合使用时，`WarmupCosineAnnealingLRScheduler` 会根据每个参数组各自的 `max_lr` 执行**比例衰减**（`lr_group = max_lr_group * (current_lr / max_lr)`），确保不同组在 Warmup、余弦退火及多周期重置时保持步调完全一致。
+
+### 3. DeepSpeed ZeRO-3 / Offload 与 Muon 深度协同
+- **自动兼容降级**：在 ZeRO-3 或 ZeRO-1/2 开启 CPU Offload 模式下，框架会自动将 `reduce_scatter` 置为 `False` 并开启 `zero_allow_untested_optimizer=True`，彻底解决 DeepSpeed 对自定义优化器的通信断言限制。
+- **NVMe 极致性能优化**：在 ZeRO-3 启用 NVMe Offload 时，可通过 `DsZero3Config(save_muon_momentum_buffer_in_memory=True)` 将 Muon 动量缓冲区常驻系统内存，避免高频磁盘 I/O 带来的性能骤降。
+
+---
+
+## 🚀 多硬件与分布式训练配置
 
 ### 硬件支持
 框架自动根据设备类型选择最优后端：
@@ -159,12 +206,14 @@ from train_configs import (
 # 构建 ZeRO-3 CPU Offload 配置
 ds_config = DsConfig(
     gradient_clipping=1.0,
+    zero_allow_untested_optimizer=True, # 允许自定义优化器 (如 Muon)
     zero_config=DsZero3Config(
         stage3_prefetch_bucket_size='auto',
         stage3_param_persistence_threshold='auto',
         offload_optimizer=DsOffloadConfig(device='cpu', pin_memory=True),
         offload_param=DsOffloadConfig(device='cpu', pin_memory=True),
         zero_quantized_weights=False, # ZeRO++ 特性
+        save_muon_momentum_buffer_in_memory=True # 使用 Muon 时的内存驻留优化
     ),
     bf16_config=DsBf16Config(enabled=True),
     activation_checkpointing=DsActivationCheckpointingConfig(
@@ -178,7 +227,7 @@ ds_config = DsConfig(
 
 ## 🔍 核心训练模块指南
 
-所有 Trainer 均继承自 `BaseTrainer`，内置断点续训 (Resume)、混合精度 (AMP)、自动学习率调度、日志记录与定时 Evaluation 评估。
+所有 Trainer 均继承自 `BaseTrainer`，内置断点续训 (Resume)、混合精度 (AMP)、Muon/AdamW 优化器智能配置、自动学习率调度、日志记录与定时 Evaluation 评估。
 
 ---
 
@@ -196,7 +245,11 @@ train_config = TrainConfig(
     dataset_block_size=4096,
     file_dataset=["path/to/data1.npy", "path/to/data2.npy"],
     model_config=your_model_config,
-    optim_config=OptimConfig(initial_lr=3e-4, optim_type='adam'),
+    optim_config=OptimConfig(
+        optim_type='muon',              # 支持 'adam', 'lion', 'muon'
+        initial_lr=1e-3,
+        muon_lr=0.02
+    ),
     pretrain_config=PretrainConfig(
         gradient_accumulation_steps=4,
         chunked_cross_entropy_size=1024 # 开启分块计算 (建议 512 ~ 2048)
@@ -231,7 +284,7 @@ train_config = TrainConfig(
     dataset_block_size=2048,
     file_dataset=["path/to/sft_data.jsonl"],
     model_config=llm_model_config,
-    optim_config=OptimConfig(initial_lr=2e-5),
+    optim_config=OptimConfig(initial_lr=2e-5, optim_type='adam'),
     sft_config=SFTConfig(
         mask_prompt=True,                 # 开启 Prompt 掩码
         gradient_accumulation_steps=2,
@@ -314,6 +367,7 @@ trainer.train()
 ### 4. 近端策略优化 (PPO Trainer)
 
 PPO 包含了 Actor (Policy) 模型与 Critic (Value) 模型，采用 GAE 优势估计，支持 Running Mean/Std 归一化、Advantage 白化（Whitening）与 KL 散度惩罚。
+- 支持 Policy 与 Value 模型独立配置优化器类型（例如 Policy 使用 `muon`，Value 使用 `adam` 或 `muon`）。
 - 支持配置 `GenerateConfig.chunked_generate_size` 在自回归采样生成阶段按分块执行，降低并发 KV Cache 显存峰值。
 - 支持配置 `PPOConfig.chunked_log_probs_size` 在计算 Policy / Reference Log-probs 及 Value 评估阶段按分块执行，防止长序列显存溢出。
 
@@ -326,6 +380,12 @@ def reward_function(prompt_ids, completion_ids, gt_answer_ids):
     # 返回 List[float] (1D Outcome Reward) 或 List[List[float]] (2D Process/Dense Reward)
     return [compute_score(c, g) for c, g in zip(completion_ids, gt_answer_ids)]
 
+train_config.optim_config = OptimConfig(
+    optim_type='muon', 
+    initial_lr=1e-4, 
+    muon_lr=0.02
+)
+
 train_config.ppo_config = PPOConfig(
     ppo_epochs=1,
     ppo_batch_size=2,
@@ -333,7 +393,10 @@ train_config.ppo_config = PPOConfig(
     chunked_log_probs_size=2,          # 估值与 Log-probs 评估阶段分批执行，消除峰值显存
     ref_model_weights_path="path/to/ref_model",
     value_model_weights_path="path/to/value_model",
-    value_optim_config=OptimConfig(initial_lr=1e-5), # Critic 独立学习率
+    value_optim_config=OptimConfig(
+        optim_type='adam', 
+        initial_lr=1e-5                # Critic 独立优化器配置
+    ), 
     kl_beta=0.02,
     clip_eps=0.1,
     vf_coef=0.1,
@@ -370,7 +433,7 @@ GRPO (Group Relative Policy Optimization) 是 DeepSeek-R1 的核心强化学习�
 
 ```python
 from grpo_trainer import GRPOTrainer
-from train_configs import TrainConfig, GRPOConfig, GenerateConfig
+from train_configs import TrainConfig, GRPOConfig, GenerateConfig, OptimConfig
 
 def reward_function(prompt_ids, completion_ids, gt_answer_ids):
     # 针对 batch_size * group_size 条样本计算奖励 (支持 1D 标量或 2D 稠密打分)
@@ -384,6 +447,12 @@ def reward_function(prompt_ids, completion_ids, gt_answer_ids):
 def ptx_builder(prompt_ids_list, gt_answer_ids_list):
     # 返回拼接好的 Prompt + Answer Tensor 列表
     return [torch.cat([p, a]) for p, a in zip(prompt_ids_list, gt_answer_ids_list)]
+
+train_config.optim_config = OptimConfig(
+    optim_type='muon',
+    initial_lr=5e-4,
+    muon_lr=0.01
+)
 
 train_config.grpo_config = GRPOConfig(
     grpo_epochs=1,
@@ -522,7 +591,7 @@ policy_state_dict = extract_policy_weights_from_ppo(model_config, ppo_checkpoint
 | `file_dataset` | `FileDataset` | **必填** | 训练数据集文件列表或 Dataset 接口实例。 |
 | `dataset_block_size` | `int` | **必填** | 序列截断/打包的最大 Token 长度。 |
 | `data_loader_config` | `DataLoaderConfig` | `DataLoaderConfig()` | PyTorch DataLoader 的加载配置（如 worker 进程数、shuffle 等）。 |
-| `optim_config` | `OptimConfig` | `OptimConfig()` | 优化器（Adam/Lion）与学习率调度器参数。 |
+| `optim_config` | `OptimConfig` | `OptimConfig()` | 优化器（Adam/Lion/Muon）与学习率调度器参数。 |
 | `ds_config` | `DsConfig` | `DsConfig()` | DeepSpeed 分布式引擎配置（含 ZeRO、精度与检查点）。 |
 | `eval_config` | `GenerateConfig` | `GenerateConfig()` | 训练过程中触发 Evaluation 阶段时的生成控制参数。 |
 | `save_interval` | `int` | `100` | 每隔多少个 global batch step 触发一次保存 checkpoint。 |
@@ -542,17 +611,22 @@ policy_state_dict = extract_policy_weights_from_ppo(model_config, ppo_checkpoint
 
 | 参数名 | 类型 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- |
-| `optim_type` | `str` | `'adam'` | 优化器类型，可选 `'adam'` 或 `'lion'`。 |
+| `optim_type` | `str` | `'adam'` | 优化器类型，可选 `'adam'`, `'lion'`, `'muon'`。 |
 | `auto_optimize_optimizer` | `bool` | `True` | 在 DeepSpeed 模式下是否自动替换为 Fused/CPU 优化器实现。 |
 | `enable_lr_scheduler` | `bool` | `False` | 是否启用 Warmup Cosine 余弦退火学习率调度器。 |
-| `initial_lr` | `float` | **必填** | 初始学习率（或经过 Warmup 后达到的峰值学习率）。 |
+| `initial_lr` | `float` | **必填** | 初始学习率（或经过 Warmup 后达到的峰值学习率；在使用 Muon 时作为 AdamW 组的基础学习率）。 |
 | `weight_decay` | `Optional[float]` | `None` | L2 正则化权重衰减系数（若为 `None`，Adam 默认为 0.01，Lion 默认为 0.015）。 |
-| `betas` | `Optional[Tuple[float, float]]` | `None` | 优化器的 Beta 动量参数（若为 `None`，Adam 默认为 `(0.9, 0.999)`，Lion 为 `(0.95, 0.98)`）。 |
+| `betas` | `Optional[Tuple[float, float]]` | `None` | 优化器的 Beta 动量参数（若为 `None`，Adam 默认为 `(0.9, 0.999)`，Lion 为 `(0.95, 0.98)`；Muon 的 AdamW 分支默认为 `(0.9, 0.95)`）。 |
 | `warmup_iters` | `Optional[int]` | `None` | 学习率线性预热的 Step 步数。 |
-| `max_lr` | `Optional[float]` | `None` | 调度器允许的最大学习率。 |
-| `min_lr` | `Optional[float]` | `None` | 余弦退火到达周期末尾时的最小下限学习率。 |
+| `max_lr` | `Optional[float]` | `None` | 调度器允许的最大学习率（默认与 `initial_lr` 相同）。 |
+| `min_lr` | `Optional[float]` | `None` | 余弦退火到达周期末尾时的最小下限学习率（调度器内部默认为 `0.0`）。 |
 | `cosine_annealing_period` | `Optional[int]` | `None` | 余弦退火单周期包含的总 Step 步数。 |
 | `cosine_annealing_period_mul` | `int` | `0` | 周期退火乘积系数；为 `0` 时表示不重复周期，超出后维持 `min_lr`。 |
+| `muon_lr` | `Optional[float]` | `0.02` | Muon 专用的初始学习率（通常建议 `0.01` ~ `0.05`），专门用于更新 2D 隐藏层权重矩阵。 |
+| `muon_momentum` | `float` | `0.95` | Muon 的 Nesterov 动量因子。 |
+| `muon_weight_decay` | `Optional[float]` | `None` | Muon 专属权重衰减系数；若为 `None` 则自动复用通用的 `weight_decay`（或 `0.01`）。 |
+| `muon_ns_steps` | `int` | `5` | Muon 进行 5 阶 Newton-Schulz 极分解正交迭代的步数。 |
+| `muon_adjust_lr_fn` | `Optional[str]` | `None` | 针对不同矩阵维度的学习率自适应调整函数，可选 `'original'`（按 $\sqrt{\max(1, A/B)}$ 缩放）或 `'match_rms_adamw'`（按 $0.2\sqrt{\max(A, B)}$ 匹配 AdamW RMS 尺度）。 |
 
 ### 2.2 数据加载配置 (`DataLoaderConfig`)
 
@@ -629,7 +703,7 @@ policy_state_dict = extract_policy_weights_from_ppo(model_config, ppo_checkpoint
 | `ppo_batch_size` | `int` | **必填** | PPO 内部计算前向/反向时的 Micro-batch 大小。 |
 | `ref_model_weights_path` | `Optional[str]` | `None` | 参考模型的初始化权重路径。 |
 | `value_model_weights_path` | `Optional[str]` | `None` | Critic (Value) 模型的初始化权重路径。 |
-| `value_optim_config` | `Optional[OptimConfig]` | `None` | 为 Critic 模型配置的独立优化器与学习率设置。 |
+| `value_optim_config` | `Optional[OptimConfig]` | `None` | 为 Critic 模型配置的独立优化器与学习率设置（支持独立配置 Muon 或 AdamW）。 |
 | `gradient_accumulation_steps` | `int` | `1` | 梯度累积步数。 |
 | `chunked_log_probs_size` | `Optional[int]` | `None` | 评估/前向阶段（计算旧策略及参考模型 Log Prob 和 Value）的 Batch 分块大小，用于降低显存峰值。 |
 | `gamma` | `float` | `1.0` | GAE 优势估计中的折扣因子 $\gamma$。 |
@@ -686,6 +760,7 @@ policy_state_dict = extract_policy_weights_from_ppo(model_config, ppo_checkpoint
 | `activation_checkpointing` | `Optional[DsActivationCheckpointingConfig]` | `None` | 激活检查点（显存重计算）高级选项。 |
 | `wall_clock_breakdown` | `bool` | `False` | 是否输出前向/反向/通信耗时的柱状分析日志。 |
 | `flops_profiler` | `Optional[DsFlopsProfilerConfig]` | `None` | 算子耗时与 TFLOPS 剖析器。 |
+| `zero_allow_untested_optimizer` | `Optional[bool]` | `None` | 允许未在 DeepSpeed 官方白名单中测试的自定义优化器（ZeRO-1/2/3 通用；使用 `optim_type='muon'` 时若未指定，框架会自动开启为 `True`）。 |
 
 ### 4.2 ZeRO 阶段配置项 (`DsZeROConfig` 及子类)
 
@@ -693,7 +768,7 @@ policy_state_dict = extract_policy_weights_from_ppo(model_config, ppo_checkpoint
 - `allgather_partitions` (`bool`, 默认 `True`): 是否自动 Gather 收集分布式的参数。
 - `allgather_bucket_size` (`int`, 默认 `5e8`): All-Gather 通信桶字节大小。
 - `overlap_comm` (`bool`, 默认 `True`): 是否开启通信与计算重叠（Overlap）。
-- `reduce_scatter` (`bool`, 默认 `True`): 是否在 Backward 阶段使用 Reduce-Scatter 操作聚合梯度。
+- `reduce_scatter` (`bool`, 默认 `True`): 是否在 Backward 阶段使用 Reduce-Scatter 操作聚合梯度（若使用 Muon 且在 ZeRO-3 / CPU Offload 模式下，框架会自动设为 `False` 以保证安全）。
 - `reduce_bucket_size` (`Union[str, int]`, 默认 `5e8`): Reduce-Scatter 通信桶大小。
 - `contiguous_gradients` (`bool`, 默认 `True`): 是否在连续显存块中分配梯度。
 - `ignore_unused_parameters` (`bool`, 默认 `False`): 是否忽略无梯度的参数（RLHF 旁路时建议设为 `True`）。
@@ -716,6 +791,7 @@ policy_state_dict = extract_policy_weights_from_ppo(model_config, ppo_checkpoint
 - `zero_quantized_weights` (`bool`, 默认 `False`): **ZeRO++ QWZ** 特性，开启 INT8 权重 All-Gather 传输，减少一半通信量。
 - `zero_hpz_partition_size` (`int`, 默认 `1`): **ZeRO++ HPZ** 特性，层级切分策略。多机训练时建议设为单机 GPU 数（如 8），消除跨节点拉取权重的网络瓶颈。
 - `zero_quantized_gradients` (`bool`, 默认 `False`): **ZeRO++ QGZ** 特性，开启 INT4/INT8 的梯度 Reduce-Scatter 压缩。
+- `save_muon_momentum_buffer_in_memory` (`Optional[bool]`, 默认 `None`): **ZeRO-3 + Muon 优化特性**。将 Muon 动量缓冲区常驻内存（配合 NVMe offload 极大提升吞吐并降低磁盘换入换出开销）。
 
 ### 4.3 参数/优化器状态卸载配置 (`DsOffloadConfig`)
 

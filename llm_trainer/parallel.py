@@ -16,109 +16,59 @@ except ImportError:
 from .log import Logger
 
 
-def _get_optimal_backend():
-    user_backend = os.environ.get('USER_BACKEND', '')
-    if user_backend != '':
-        return user_backend
-
-    if hasattr(torch, 'mlu') and torch.mlu.is_available() and hasattr(dist, 'is_cncl_available') and dist.is_cncl_available():
-        return 'cncl'
-
-    if hasattr(dist, 'is_hccl_available') and dist.is_hccl_available():
-        return 'hccl'
-
-    if torch.cuda.is_available() and dist.is_nccl_available():
-        return 'nccl'
-
-    return 'gloo'
+def _detect_device_and_backend() -> Tuple[str, str]:
+    user_backend = os.environ.get('USER_BACKEND', '').strip()
+    if hasattr(torch, 'mlu') and torch.mlu.is_available():
+        return 'mlu', user_backend or ('cncl' if hasattr(dist, 'is_cncl_available') and dist.is_cncl_available() else 'gloo')
+    elif hasattr(torch, 'npu') and torch.npu.is_available():
+        return 'npu', user_backend or ('hccl' if hasattr(dist, 'is_hccl_available') and dist.is_hccl_available() else 'gloo')
+    elif torch.cuda.is_available():
+        return 'cuda', user_backend or ('nccl' if dist.is_nccl_available() else 'gloo')
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        return 'mps', user_backend or 'gloo'
+    else:
+        return 'cpu', user_backend or 'gloo'
 
 
 class Parallel(ABC):
-    def __init__(
-            self,
-            _init_process_group: bool = True,
-            _use_parallel: bool = True
-    ):
-        self._initialize(_init_process_group, _use_parallel)
-
-    def _initialize(
-            self,
-            _init_process_group: bool,
-            _use_parallel: bool
-    ):
+    def __init__(self, init_process_group: bool = True, use_parallel: bool = True):
         self._global_rank: int = int(os.environ.get('RANK', -1))
         self._local_rank: int = int(os.environ.get('LOCAL_RANK', -1))
-        self.dist_backend = _get_optimal_backend()
+        self._world_size: int = int(os.environ.get('WORLD_SIZE', 1))
 
-        if self._global_rank == -1:
-            _use_parallel = False
-
-        self._use_parallel: bool = _use_parallel and self._global_rank != -1
-
+        self.device_type, self.dist_backend = _detect_device_and_backend()
+        self._use_parallel: bool = use_parallel and (self._global_rank != -1)
         self._sampler: Optional[DistributedSampler] = None
         self.model: Optional[nn.Module] = None
 
-        try:
-            if torch.cuda.is_available():
+        self._setup_hardware()
+        if self._use_parallel and init_process_group and not dist.is_initialized():
+            dist.init_process_group(backend=self.dist_backend)
+
+        Logger.std_log(
+            f'backend={self.dist_backend}, global_rank={self.global_rank}, '
+            f'local_rank={self.local_rank}, world_size={self.world_size}, '
+            f'device_type={self.device_type}, device={self.device}'
+        )
+
+    def _setup_hardware(self):
+        if self.device_type == 'cuda':
+            try:
                 torch.set_float32_matmul_precision('high')
                 torch.backends.cuda.matmul.allow_tf32 = True
                 torch.backends.cudnn.allow_tf32 = True
-        except: ...
+            except: ...
 
-        if self._use_parallel:
-            if self.dist_backend == 'nccl':
-                self.device_type = 'cuda'
-                self.device = f'cuda:{self._local_rank}'
-                torch.cuda.set_device(self.device)
-            elif self.dist_backend == 'cncl':
-                self.device_type = 'mlu'
-                self.device = f'mlu:{self._local_rank}'
-                torch.mlu.set_device(self.device)
-            elif self.dist_backend == 'hccl':
-                self.device_type = 'npu'
-                self.device = f'npu:{self._local_rank}'
-                torch.npu.set_device(self.device)
-            else:
-                # gloo
-                if hasattr(torch, 'mlu') and torch.mlu.is_available():
-                    self.device_type = 'mlu'
-                    self.device = f'mlu:{self._local_rank}'
-                    torch.mlu.set_device(self.device)
-                elif hasattr(torch, 'npu') and torch.npu.is_available():
-                    self.device_type = 'npu'
-                    self.device = f'npu:{self._local_rank}'
-                    torch.npu.set_device(self.device)
-                elif torch.cuda.is_available():
-                    self.device_type = 'cuda'
-                    self.device = f'cuda:{self._local_rank}'
-                    torch.cuda.set_device(self.device)
-                elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-                    self.device_type = 'mps'
-                    self.device = 'mps'
-                else:
-                    self.device_type = 'cpu'
-                    self.device = 'cpu'
-
-            if _init_process_group:
-                dist.init_process_group(backend=self.dist_backend)
+        if self._use_parallel and self._local_rank != -1:
+            self.device = f"{self.device_type}:{self._local_rank}"
+            if self.device_type == 'cuda':
+                torch.cuda.set_device(self._local_rank)
+            elif self.device_type == 'npu':
+                torch.npu.set_device(self._local_rank)
+            elif self.device_type == 'mlu':
+                torch.mlu.set_device(self._local_rank)
         else:
-            if hasattr(torch, 'mlu') and torch.mlu.is_available():
-                self.device_type = 'mlu'
-                self.device = "mlu"
-            elif hasattr(torch, 'npu') and torch.npu.is_available():
-                self.device_type = 'npu'
-                self.device = "npu"
-            elif torch.cuda.is_available():
-                self.device_type = 'cuda'
-                self.device = "cuda"
-            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                self.device_type = 'mps'
-                self.device = "mps"
-            else:
-                self.device_type = 'cpu'
-                self.device = "cpu"
-
-        Logger.std_log(f'backend={self.dist_backend}, global_rank={self._global_rank}, local_rank={self._local_rank}, world_size={self.world_size}, device_type={self.device_type}, device={self.device}')
+            self.device = self.device_type
 
     @abstractmethod
     def process(
@@ -151,15 +101,14 @@ class Parallel(ABC):
 
     def synchronize(self):
         if self._use_parallel:
-            if self.device_type == 'cuda':
-                torch.cuda.synchronize(device=self.device)
-            elif self.device_type == 'npu':
+            if self.device_type == 'cuda' and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            elif self.device_type == 'npu' and hasattr(torch, 'npu'):
                 torch.npu.synchronize()
-            elif self.device_type == 'mlu':
+            elif self.device_type == 'mlu' and hasattr(torch, 'mlu'):
                 torch.mlu.synchronize()
-            elif self.device_type == 'mps':
+            elif self.device_type == 'mps' and hasattr(torch, 'mps'):
                 torch.mps.synchronize()
-            else: ...
 
     def destroy(self):
         if self._use_parallel:
@@ -188,7 +137,7 @@ class Parallel(ABC):
         if self._use_parallel:
             if dist.is_initialized():
                 return dist.get_world_size()
-            return int(os.environ.get('WORLD_SIZE', 1))
+            return self._world_size
         return 1
 
     def wait(self, msg=None):
@@ -203,12 +152,12 @@ class Parallel(ABC):
 
 class DsParallel(Parallel):
     def __init__(self):
-        super().__init__()
-
-        if deepspeed:
-            deepspeed.init_distributed(dist_backend=self.dist_backend)
-        else:
+        if not deepspeed:
             raise ImportError("DeepSpeed not installed.")
+
+        super().__init__(init_process_group=False)
+        if self._use_parallel and not dist.is_initialized():
+            deepspeed.init_distributed(dist_backend=self.dist_backend)
 
     def process(
             self,
@@ -237,7 +186,7 @@ class DsParallel(Parallel):
 
 class NoneParallel(Parallel):
     def __init__(self):
-        super().__init__(_use_parallel=False)
+        super().__init__(init_process_group=False, use_parallel=False)
 
     def process(
             self,

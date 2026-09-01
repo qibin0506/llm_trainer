@@ -248,8 +248,8 @@ class DPODataset(Dataset):
             chosen_id = chosen_raw
             rejected_id = rejected_raw
 
-        if isinstance(chosen_id, np.ndarray): chosen_id = chosen_id.tolist()
-        if isinstance(rejected_id, np.ndarray): rejected_id = rejected_id.tolist()
+        if isinstance(chosen_id, (np.ndarray, torch.Tensor)): chosen_id = chosen_id.tolist()
+        if isinstance(rejected_id, (np.ndarray, torch.Tensor)): rejected_id = rejected_id.tolist()
 
         return {
             'chosen': chosen_id[:self.block_size],

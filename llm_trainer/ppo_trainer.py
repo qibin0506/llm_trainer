@@ -34,7 +34,7 @@ from .utils import (
 )
 from .checkpoint import save_checkpoint, save_steps, load_checkpoint
 from .scheduler import LRScheduler, WarmupCosineAnnealingLRScheduler, CompositeLRScheduler, NoneLRScheduler
-from .partition_utils import  unwrap_model_for_generation, unwrap_model
+from .partition_utils import  unwrap_model_for_generation
 from .muon import  MuonWithAdamW, _get_ds_muon
 
 
@@ -47,7 +47,8 @@ class ValueModel(nn.Module):
         self.value_head.bias.data.zero_()
 
     def forward(self, *args, **kwargs) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        outputs = self.base_model(*args, **kwargs)
+        base_kwargs = {k: v for k, v in kwargs.items() if k not in ('return_logits', 'logits_to_keep')}
+        outputs = self.base_model(*args, return_logits=False, **base_kwargs)
         # [batch_size, seq_len, hidden_size]
         last_hidden_state = outputs['hidden_states']
         # [batch_size, seq_len, 1]
@@ -107,11 +108,6 @@ class PPOTrainer(BaseTrainer):
         if self.ppo_config.normalize_rewards:
             if self.ppo_config.normalize_method == 'RunningMeanStd':
                 self.reward_normalizer = RunningMeanStd(shape=()).to(TrainerTools().parallel.device)
-
-            if self.ppo_config.whiten_rewards:
-                self.ppo_config.whiten_rewards = False
-                if TrainerTools().parallel.is_main_process:
-                    Logger.std_log('WARN: ppo_config.normalize_rewards is enabled, ppo_config.whiten_rewards must be disabled.')
 
         super().__init__(
             train_config=train_config,
@@ -415,27 +411,22 @@ class PPOTrainer(BaseTrainer):
             model,
             input_ids: torch.Tensor,
             attention_mask: Optional[torch.Tensor],
-            prompt_len: int,
             completion_ids: torch.Tensor,
             chunk_size: Optional[int] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        unwrapped = unwrap_model(model)
-        policy_model = unwrapped.policy_model
-        policy_lm_head = unwrap_model(policy_model).lm_head
-
         def _step_forward(inp_ids, att_mask, comp_ids):
             pos_ids = calc_position_ids(att_mask)
+            comp_len = comp_ids.size(1)
             policy_output, value_output = model(
                 inp_ids,
                 attention_mask=att_mask,
                 position_ids=pos_ids,
                 forward_type='both',
-                return_logits=False
+                return_logits=True,
+                logits_to_keep=comp_len + 1
             )
 
-            h_completion = policy_output['hidden_states'][:, prompt_len - 1: -1]
-            logits_completion = policy_lm_head(h_completion).float()
-
+            logits_completion = policy_output['logits'][:, :-1, :][:, -comp_len:, :].float()
             log_probs = log_softmax(logits_completion, comp_ids)
             values = value_output[0]
 
@@ -461,25 +452,21 @@ class PPOTrainer(BaseTrainer):
             model,
             input_ids: torch.Tensor,
             attention_mask: Optional[torch.Tensor],
-            prompt_len: int,
             completion_ids: torch.Tensor,
             chunk_size: Optional[int] = None
     ) -> torch.Tensor:
-        unwrapped = unwrap_model(model)
-        lm_head = unwrapped.lm_head
-
         def _step_forward(inp_ids, att_mask, comp_ids):
             pos_ids = calc_position_ids(att_mask)
+            comp_len = comp_ids.size(1)
             outputs = model(
                 inp_ids,
                 attention_mask=att_mask,
                 position_ids=pos_ids,
-                return_logits=False
+                return_logits=True,
+                logits_to_keep=comp_len + 1
             )
 
-            h_completion = outputs['hidden_states'][:, prompt_len - 1: -1]
-            logits_completion = lm_head(h_completion).float()
-
+            logits_completion = outputs['logits'][:, :-1, :][:, -comp_len:, :].float()
             log_probs = log_softmax(logits_completion, comp_ids)
 
             return log_probs
@@ -615,7 +602,6 @@ class PPOTrainer(BaseTrainer):
                     self.train_model,
                     full_ids,
                     full_attention_mask,
-                    prompt_len,
                     completion_ids,
                     chunk_size
                 )
@@ -625,7 +611,6 @@ class PPOTrainer(BaseTrainer):
                         self.ref_model,
                         full_ids,
                         full_attention_mask,
-                        prompt_len,
                         completion_ids,
                         chunk_size
                     )
@@ -749,23 +734,19 @@ class PPOTrainer(BaseTrainer):
         loss_mask = rollout_data['loss_mask']
         completion_pad_mask = rollout_data['completion_pad_mask']
 
-        prompt_len = prompt_ids.shape[1]
         batch_size = prompt_ids.shape[0]
+        comp_len = completion_ids.shape[1]
 
-        values_for_gae = old_values[:, prompt_len - 1: -1]
-        assert values_for_gae.shape[1] == completion_ids.shape[1]
+        comp_values = old_values[:, -(comp_len + 1):]
+        values_for_gae = comp_values[:, :-1]
+        assert values_for_gae.shape[1] == comp_len
 
         # completion_pad_mask 统计每行有效 token 数量 K (范围 1 ~ max_comp_len)
         valid_lengths = completion_pad_mask.sum(dim=-1).clamp(min=1)  # [batch_size]
-        last_token_pos_in_full = prompt_len + valid_lengths - 1  # [batch_size]
 
         # 提取有效末尾位置对应的 Value，作为真实的未终止状态截断引导值
         batch_indices = torch.arange(batch_size, device=prompt_ids.device)
-        last_values = old_values[batch_indices, last_token_pos_in_full]  # [batch_size]
-
-        if self.ppo_config.whiten_rewards:
-            rewards = masked_whiten(rewards, loss_mask, shift_mean=False)
-            rewards = torch.masked_fill(rewards, ~loss_mask, 0.0)
+        last_values = comp_values[batch_indices, valid_lengths]  # [batch_size]
 
         advantages, returns = self._compute_advantages_and_returns(
             rewards, values_for_gae, last_values, completion_pad_mask, dones
@@ -789,9 +770,6 @@ class PPOTrainer(BaseTrainer):
         global_micro_batch_idx = 0
         has_ptx = self.ptx_criterion is not None and len(ptx_data) > 0
 
-        unwrapped = unwrap_model(self.train_model)
-        policy_lm_head = unwrap_model(unwrapped.policy_model).lm_head
-
         for ppo_epoch in range(self.ppo_config.ppo_epochs):
             indices = torch.randperm(batch_size, device=TrainerTools().parallel.device)
 
@@ -810,19 +788,19 @@ class PPOTrainer(BaseTrainer):
                 mb_position_ids = calc_position_ids(mb_attention_mask)
 
                 with autocast(TrainerTools().parallel.device_type):
+                    mb_comp_len = mb_completion_ids.size(1)
                     policy_output, value_output = self.train_model(
                         mb_input_ids,
                         attention_mask=mb_attention_mask,
-                        position_ids = mb_position_ids,
-                        forward_type = 'both',
-                        return_logits = False
+                        position_ids=mb_position_ids,
+                        forward_type='both',
+                        return_logits=True,
+                        logits_to_keep=mb_comp_len + 1
                     )
 
-                    h_completion = policy_output['hidden_states'][:, prompt_len - 1: -1]
-                    logits_completion = policy_lm_head(h_completion).float()
-
+                    logits_completion = policy_output['logits'][:, :-1, :][:, -mb_comp_len:, :].float()
                     current_log_probs = log_softmax(logits_completion, mb_completion_ids)
-                    current_values = value_output[0][:, prompt_len - 1: -1]
+                    current_values = value_output[0][:, -(mb_comp_len + 1): -1]
                     value_aux_loss = value_output[1]
 
                     loss, actor_loss, value_loss, approx_kl, clip_frac, entropy = self.criterion(
@@ -876,11 +854,23 @@ class PPOTrainer(BaseTrainer):
                 ppo_loss_unscaled = loss + aux_loss
                 ptx_loss_unscaled = self.ppo_config.ptx_coef * ptx_loss + ptx_aux_loss
 
+                is_last_mini_batch = (
+                    ppo_epoch == self.ppo_config.ppo_epochs - 1
+                    and (i + ppo_batch_size >= batch_size)
+                )
+
                 if self.is_ds:
-                    need_update_step = self.train_model.is_gradient_accumulation_boundary()
+                    if is_last_mini_batch:
+                        self.train_model.set_gradient_accumulation_boundary(True)
+                        need_update_step = True
+                    else:
+                        need_update_step = self.train_model.is_gradient_accumulation_boundary()
                 else:
                     global_micro_batch_idx += 1
-                    need_update_step = (global_micro_batch_idx % self.gradient_accumulation_steps == 0)
+                    need_update_step = (
+                        global_micro_batch_idx % self.gradient_accumulation_steps == 0
+                        or is_last_mini_batch
+                    )
 
                 if has_ptx:
                     self._backward_loss(ppo_loss_unscaled, self.gradient_accumulation_steps, step=False)
@@ -904,10 +894,9 @@ class PPOTrainer(BaseTrainer):
                 total_micro_batches_processed += 1
 
                 if need_update_step:
-                    self._update_step()
+                    self._update_step(is_last_step=is_last_mini_batch)
 
-        if not self.is_ds and (global_micro_batch_idx % self.gradient_accumulation_steps != 0):
-            self._update_step()
+
 
         if total_micro_batches_processed > 0:
             for key in ppo_stats:

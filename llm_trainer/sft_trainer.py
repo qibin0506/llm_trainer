@@ -129,14 +129,14 @@ class SFTTrainer(BaseTrainer):
 
         return criterion, KDLoss() if self.sft_config.kd_config else None
 
-    def _calc_loss(self, inputs, attention_mask, result, labels) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def _calc_loss(self, inputs, attention_mask, result, labels, model: Optional[torch.nn.Module] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         kd_config = self.sft_config.kd_config
         has_kd = (kd_config is not None and kd_config.kd_coef > 0.0)
 
         # calc loss
         if isinstance(self.criterion, ChunkedLMLoss):
-            unwrapped = unwrap_model(self.train_model)
-            lm_head = unwrapped.lm_head
+            head_model = model if model is not None else unwrap_model(self.train_model)
+            lm_head = head_model.lm_head
             teacher_logits = None
             kd_coef = 0.0
 
@@ -149,7 +149,7 @@ class SFTTrainer(BaseTrainer):
                 hidden_states=result['hidden_states'],
                 lm_head_weight=lm_head.weight,
                 labels=labels,
-                lm_head_bias=lm_head.bias,
+                lm_head_bias=getattr(lm_head, 'bias', None),
                 teacher_logits=teacher_logits,
                 kd_coef=kd_coef
             )

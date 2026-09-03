@@ -35,10 +35,11 @@ def _chunk_ce_kd_forward(
     if t_logits_chunk is not None and kd_coef > 0.0:
         valid = (lbl_chunk != ignore_index).float()
         t_probs = F.softmax(t_logits_chunk.float(), dim=-1)
-        # 避免 0.0 * (-inf) 产生 NaN
-        safe_prod = torch.where(t_probs > 0, t_probs * s_log_p, torch.zeros_like(s_log_p))
+        safe_s_log_p = torch.clamp(s_log_p, min=-100.0)
+        safe_prod = torch.where(t_probs > 0, t_probs * safe_s_log_p, torch.zeros_like(safe_s_log_p))
 
-        per_token_kd = -torch.sum(safe_prod, dim=-1) * valid
+        per_token_kd = -torch.sum(safe_prod, dim=-1)
+        per_token_kd = torch.where(valid > 0, per_token_kd, torch.zeros_like(per_token_kd))
         chunk_kd_loss = per_token_kd.sum()
 
         chunk_total_loss = (1.0 - kd_coef) * chunk_ce_loss + kd_coef * chunk_kd_loss
@@ -207,14 +208,15 @@ class KDLoss(nn.Module):
         labels = labels[..., 1:].contiguous()
 
         teacher_probs = F.softmax(teacher_logits, dim=-1, dtype=torch.float32)
-        inf_mask = torch.isinf(logits)
 
         logprobs = F.log_softmax(logits, dim=-1, dtype=torch.float32)
-        prod_probs = torch.masked_fill(teacher_probs * logprobs, inf_mask, 0)
+        safe_logprobs = torch.clamp(logprobs, min=-100.0)
+        prod_probs = torch.where(teacher_probs > 0, teacher_probs * safe_logprobs, torch.zeros_like(safe_logprobs))
 
         x = torch.sum(prod_probs, dim=-1).view(-1)
         mask = (labels != self.ignore_index).float().view(-1)
-        distil_loss = -torch.sum(x * mask) / torch.sum(mask).clamp(min=1.0)
+        safe_x = torch.where(mask > 0, x, torch.zeros_like(x))
+        distil_loss = -torch.sum(safe_x) / torch.sum(mask).clamp(min=1.0)
 
         return distil_loss
 

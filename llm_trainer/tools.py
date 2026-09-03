@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Union, List, Sequence
 from abc import ABC, abstractmethod
 import os
 import math
@@ -56,29 +56,37 @@ class FileDataset(ABC):
 def estimate_data_size(
         file_dataset: FileDataset,
         block_size: int,
-        type: str
-) -> int:
+        type: str,
+        return_per_file: bool = False
+) -> Union[int, List[int]]:
     """
-    估计数据集大小
+    估计数据集大小。
+
+    Args:
+        file_dataset (FileDataset): 文件数据集对象。
+        block_size (int): 序列最大长度。
+        type (str): 训练阶段类型 ('pretrain', 'sft', 'dpo', 'ppo', 'grpo')。
+        return_per_file (bool): 若为 True，返回各文件独立的样本量列表 [len_f0, len_f1, ...]；
+                               若为 False，返回总样本量 int（保持向后兼容）。
     """
-    data_size = 0
+    file_sizes = []
     files_count = len(file_dataset)
 
     if type == 'sft':
         from .dataset import SFTDataset
         for idx in range(files_count):
             dataset = SFTDataset(file_dataset[idx], block_size)
-            data_size += len(dataset)
+            file_sizes.append(len(dataset))
     elif type == 'dpo':
         from .dataset import DPODataset
         for idx in range(files_count):
             dataset = DPODataset(file_dataset[idx], block_size)
-            data_size += len(dataset)
+            file_sizes.append(len(dataset))
     elif type == 'grpo' or type == 'ppo':
         from .dataset import RLDataset
         for idx in range(files_count):
             dataset = RLDataset(file_dataset[idx])
-            data_size += len(dataset)
+            file_sizes.append(len(dataset))
     else:
         from .dataset import PretrainDataset
         for idx in range(files_count):
@@ -87,9 +95,11 @@ def estimate_data_size(
                 block_size,
                 block_size
             )
-            data_size += len(dataset)
+            file_sizes.append(len(dataset))
 
-    return data_size
+    if return_per_file:
+        return file_sizes
+    return sum(file_sizes)
 
 
 def extract_policy_weights_from_ppo(model_config, ppo_weights):
@@ -121,16 +131,29 @@ def extract_value_weights_from_ppo(model_config, ppo_weights):
 def compute_lr_scheduler_steps(
         train_stage: str,
         epochs: int,
-        all_data_size: int,
+        all_data_size: Union[int, Sequence[int]],
         batch_size: int,
         gradient_accumulation_steps: int,
         warmup_rate: float,
         **kwargs
 ):
     world_size = TrainerTools().parallel.world_size
+    batch_per_step_all_gpus = batch_size * world_size
+
+    # 支持从 kwargs 中显式传入各文件样本量列表
+    data_sizes_per_file = kwargs.get('data_sizes_per_file', None)
+    if data_sizes_per_file is not None and isinstance(data_sizes_per_file, (list, tuple)):
+        all_data_size = data_sizes_per_file
 
     # 基础 dataloader 的总 batch 数量（每个 GPU 上的 batch 数）
-    dataloader_batches_per_gpu = epochs * (all_data_size // (batch_size * world_size))
+    # 当数据集拆分为多个文件时，每个文件独立构建 DataLoader 并执行 drop_last=True 截断
+    if isinstance(all_data_size, (list, tuple)):
+        batches_per_gpu_per_epoch = sum(
+            size // batch_per_step_all_gpus for size in all_data_size
+        )
+        dataloader_batches_per_gpu = epochs * batches_per_gpu_per_epoch
+    else:
+        dataloader_batches_per_gpu = epochs * (all_data_size // batch_per_step_all_gpus)
 
     if train_stage in ['pretrain', 'midtrain', 'sft', 'dpo']:
         # DPO 和常规的 SFT/Pretrain 更新逻辑一致：直接在 dataloader batch 级别上做梯度累积
@@ -159,7 +182,8 @@ def compute_lr_scheduler_steps(
     else:
         train_batch_per_world = dataloader_batches_per_gpu / gradient_accumulation_steps
 
-    train_batch_per_world = math.floor(train_batch_per_world)
+    # 由于最后一个 step (is_last_step) 会强制更新未满足完整 gas 的余数 batch，因此总步数向上取整与实际执行步数对齐
+    train_batch_per_world = math.ceil(train_batch_per_world)
     warmup_iters = int(warmup_rate * train_batch_per_world)
 
     max_warmup_iters = kwargs.get('max_warmup_iters', -1)

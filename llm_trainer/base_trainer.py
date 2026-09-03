@@ -15,7 +15,7 @@ from llm_model import LlmModel, ModelConfig
 
 from .parallel import DsParallel
 from .tools import TrainerTools
-from .partition_utils import unwrap_model_for_generation
+from .partition_utils import unwrap_model_for_generation, unwrap_model, ForwardRedirection
 from .generate_utils import generate
 from .log import Logger, _get_log_dir
 from .train_configs import TrainConfig, GenerationService
@@ -77,7 +77,7 @@ class BaseTrainer:
         self.resume_file_idx = 0
         self.resume_batch_idx = 0
 
-
+        self._forward_redirection = ForwardRedirection()
         self.logger = Logger('log.txt')
 
         self.parallel_kwargs, self.data_loader_kwargs, self.sampler_kwargs = self._convert_train_args()
@@ -541,7 +541,31 @@ class BaseTrainer:
 
     def _create_dataset(self, file_idx) -> Tuple[Dataset, str]: ...
 
-    def _calc_loss(self, inputs, attention_mask, result, labels) -> Tuple[torch.Tensor, Optional[torch.Tensor]]: ...
+    def _calc_loss(self, inputs, attention_mask, result, labels, model: Optional[torch.nn.Module] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]: ...
+
+    def _step_forward_and_loss(
+            self,
+            model: torch.nn.Module,
+            inputs: torch.Tensor,
+            attention_mask: Optional[torch.Tensor],
+            pixel_values: Optional[torch.Tensor],
+            labels: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        result = model(
+            inputs,
+            attention_mask=attention_mask,
+            pixel_values=pixel_values,
+            return_logits=self.return_logits
+        )
+
+        loss, ce_loss = self._calc_loss(inputs, attention_mask, result, labels, model=model)
+        if result.get('aux_loss') is not None:
+            aux_loss = result['aux_loss'].to(loss.dtype)
+        else:
+            aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
+
+        total_loss_unscaled = loss + aux_loss
+        return total_loss_unscaled, ce_loss, aux_loss
 
     def _backward_loss(self, total_loss_unscaled, gradient_accumulation_steps, step = True):
         if isinstance(TrainerTools().parallel, DsParallel):
@@ -576,6 +600,9 @@ class BaseTrainer:
 
     def _need_update_step(self, batches_accumulated, is_last_step=False):
         if self.is_ds:
+            if is_last_step:
+                self.train_model.set_gradient_accumulation_boundary(True)
+                return True
             return self.train_model.is_gradient_accumulation_boundary()
 
         if self.gradient_accumulation_steps > 1:
@@ -583,7 +610,7 @@ class BaseTrainer:
 
         return True
 
-    def _update_step(self):
+    def _update_step(self, is_last_step: bool = False):
         self._apply_grad_clipping()
         overflow = False
 
@@ -591,6 +618,11 @@ class BaseTrainer:
             self._apply_step()
             if hasattr(self.train_model, 'optimizer') and hasattr(self.train_model.optimizer, 'overflow'):
                 overflow = self.train_model.optimizer.overflow
+
+            if is_last_step:
+                self.train_model._is_gradient_accumulation_boundary = None
+                if hasattr(self.train_model, 'micro_steps'):
+                    self.train_model.micro_steps = 0
         else:
             scale_before = self.scaler.get_scale()
             self._apply_step()
@@ -785,21 +817,25 @@ class BaseTrainer:
                         pixel_values = self._get_pixel_values(batch_data)
 
                         with autocast(TrainerTools().parallel.device_type):
-                            result = self.train_model(
-                                inputs,
-                                attention_mask=attention_mask,
-                                pixel_values=pixel_values,
-                                return_logits=self.return_logits
-                            )
-
-                            # calc loss
-                            loss, ce_loss = self._calc_loss(inputs, attention_mask, result, labels)
-                            if result['aux_loss'] is not None:
-                                aux_loss = result['aux_loss'].to(loss.dtype)
+                            if self.is_ds:
+                                unwrapped = unwrap_model(self.train_model)
+                                total_loss_unscaled, ce_loss, aux_loss = self._forward_redirection(
+                                    self.train_model,
+                                    unwrapped,
+                                    self._step_forward_and_loss,
+                                    inputs,
+                                    attention_mask,
+                                    pixel_values,
+                                    labels
+                                )
                             else:
-                                aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
-
-                        total_loss_unscaled = loss + aux_loss
+                                total_loss_unscaled, ce_loss, aux_loss = self._step_forward_and_loss(
+                                    self.train_model,
+                                    inputs,
+                                    attention_mask,
+                                    pixel_values,
+                                    labels
+                                )
 
                         is_last_step = (
                             epoch == self.train_config.n_epochs - 1
@@ -816,7 +852,7 @@ class BaseTrainer:
                         batches_accumulated += 1
 
                         if need_update_step:
-                            self._update_step()
+                            self._update_step(is_last_step=is_last_step)
                             global_steps_since_last_save += 1
                             global_steps_since_last_eval += 1
 

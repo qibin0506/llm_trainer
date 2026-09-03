@@ -404,7 +404,6 @@ class PPOConfig:
         missing_eos_penalty (`Optional[float]`): 针对模型未能正常生成 EOS (结束符) 的硬性奖励惩罚值。
         normalize_rewards (`bool`): 是否在喂给 GAE 前对环境 Reward 进行标准化。
         normalize_method (`str`): Reward 标准化方法，"RunningMeanStd" (流式均值方差) 或 "BatchStd" (当前批次方差)。
-        whiten_rewards (`bool`): 是否对 GAE 计算后的优势 (Advantage) 进行白化处理。
         generate_config (`GenerateConfig`): PPO Rollout 交互生成数据时的解码策略。
     """
     ppo_epochs: int
@@ -425,7 +424,6 @@ class PPOConfig:
     missing_eos_penalty: Optional[float] = None
     normalize_rewards: bool = False
     normalize_method: str = 'RunningMeanStd'
-    whiten_rewards: bool = True
     generate_config: GenerateConfig = field(default_factory=GenerateConfig)
 
 

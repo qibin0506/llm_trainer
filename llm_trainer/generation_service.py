@@ -413,9 +413,7 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
         trajectories = [[] for _ in range(batch_size)]
         generation_masks = [[] for _ in range(batch_size)]
 
-        with torch.no_grad(), unwrap_model_for_generation(model) as unwrapped_model:
-            gen_model = getattr(unwrapped_model, 'policy_model', unwrapped_model)
-
+        with torch.no_grad():
             for turn in range(self.max_turns):
                 for i in range(batch_size):
                     if not loop_dones[i]:
@@ -470,19 +468,49 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
 
                 actual_chunk_size = generate_config.chunked_generate_size or active_prompts.shape[0]
 
-                if 0 < actual_chunk_size < active_prompts.shape[0]:
-                    all_outputs = []
-                    for chunk_start in range(0, active_prompts.shape[0], actual_chunk_size):
-                        chunk_prompts = active_prompts[chunk_start: chunk_start + actual_chunk_size]
-                        chunk_mask = attention_mask[chunk_start: chunk_start + actual_chunk_size]
-                        chunk_pixel_values = None
-                        if active_pixel_values is not None:
-                            chunk_pixel_values = active_pixel_values[chunk_start: chunk_start + actual_chunk_size]
+                with unwrap_model_for_generation(model) as unwrapped_model:
+                    gen_model = getattr(unwrapped_model, 'policy_model', unwrapped_model)
 
-                        chunk_out, _ = batch_generate(
+                    if 0 < actual_chunk_size < active_prompts.shape[0]:
+                        all_outputs = []
+                        for chunk_start in range(0, active_prompts.shape[0], actual_chunk_size):
+                            chunk_prompts = active_prompts[chunk_start: chunk_start + actual_chunk_size]
+                            chunk_mask = attention_mask[chunk_start: chunk_start + actual_chunk_size]
+                            chunk_pixel_values = None
+                            if active_pixel_values is not None:
+                                chunk_pixel_values = active_pixel_values[chunk_start: chunk_start + actual_chunk_size]
+
+                            chunk_out, _ = batch_generate(
+                                model=gen_model,
+                                tokens=chunk_prompts,
+                                attention_mask=chunk_mask,
+                                max_new_tokens=remaining_max_tokens,
+                                temperature=generate_config.temperature,
+                                top_p=generate_config.top_p,
+                                top_k=generate_config.top_k,
+                                repetition_penalty=generate_config.repetition_penalty,
+                                exclude_penalty_tokens=generate_config.exclude_penalty_tokens,
+                                suppress_tokens=generate_config.suppress_tokens,
+                                device=device,
+                                pixel_values=chunk_pixel_values,
+                                tokens_per_image=tokens_per_image,
+                                auto_prefix_cache=generate_config.auto_prefix_cache,
+                                return_logits=False
+                            )
+                            all_outputs.append(chunk_out)
+
+                        max_out_len = max(o.shape[1] for o in all_outputs)
+                        padded_outputs = []
+                        for o in all_outputs:
+                            if o.shape[1] < max_out_len:
+                                o = torch.nn.functional.pad(o, (0, max_out_len - o.shape[1]), value=pad_token_id)
+                            padded_outputs.append(o)
+                        outputs = torch.cat(padded_outputs, dim=0)
+                    else:
+                        outputs, _ = batch_generate(
                             model=gen_model,
-                            tokens=chunk_prompts,
-                            attention_mask=chunk_mask,
+                            tokens=active_prompts,
+                            attention_mask=attention_mask,
                             max_new_tokens=remaining_max_tokens,
                             temperature=generate_config.temperature,
                             top_p=generate_config.top_p,
@@ -491,38 +519,13 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
                             exclude_penalty_tokens=generate_config.exclude_penalty_tokens,
                             suppress_tokens=generate_config.suppress_tokens,
                             device=device,
-                            pixel_values=chunk_pixel_values,
+                            pixel_values=active_pixel_values,
                             tokens_per_image=tokens_per_image,
                             auto_prefix_cache=generate_config.auto_prefix_cache,
                             return_logits=False
                         )
-                        all_outputs.append(chunk_out)
 
-                    max_out_len = max(o.shape[1] for o in all_outputs)
-                    padded_outputs = []
-                    for o in all_outputs:
-                        if o.shape[1] < max_out_len:
-                            o = torch.nn.functional.pad(o, (0, max_out_len - o.shape[1]), value=pad_token_id)
-                        padded_outputs.append(o)
-                    outputs = torch.cat(padded_outputs, dim=0)
-                else:
-                    outputs, _ = batch_generate(
-                        model=gen_model,
-                        tokens=active_prompts,
-                        attention_mask=attention_mask,
-                        max_new_tokens=remaining_max_tokens,
-                        temperature=generate_config.temperature,
-                        top_p=generate_config.top_p,
-                        top_k=generate_config.top_k,
-                        repetition_penalty=generate_config.repetition_penalty,
-                        exclude_penalty_tokens=generate_config.exclude_penalty_tokens,
-                        suppress_tokens=generate_config.suppress_tokens,
-                        device=device,
-                        pixel_values=active_pixel_values,
-                        tokens_per_image=tokens_per_image,
-                        auto_prefix_cache=generate_config.auto_prefix_cache,
-                        return_logits=False
-                    )
+                empty_cache()
 
                 next_prompts_list = [None] * batch_size
                 tasks = []

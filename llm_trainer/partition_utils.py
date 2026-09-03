@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Callable, Any
 import itertools
 from contextlib import contextmanager, nullcontext
 from packaging import version
@@ -151,13 +151,13 @@ def maybe_gather_lm_head_ctx(*params: Optional[torch.nn.Parameter]):
     非 ZeRO-3 环境下直接返回 nullcontext()，零额外开销。
     """
     is_zero3 = False
-    if isinstance(TrainerTools().parallel, DsParallel):
-        try:
-            import deepspeed
-            if deepspeed.zero.partition_parameters.is_zero_param(params[0] if params else None):
-                is_zero3 = True
-        except Exception:
-            pass
+    try:
+        import deepspeed
+        p = params[0] if params else None
+        if p is not None and deepspeed.zero.partition_parameters.is_zero_param(p):
+            is_zero3 = True
+    except Exception:
+        pass
 
     if not is_zero3:
         return nullcontext()
@@ -177,6 +177,39 @@ def maybe_gather_lm_head_ctx(*params: Optional[torch.nn.Parameter]):
         return deepspeed.zero.GatheredParameters(list(to_gather.values()))
     except:
         return nullcontext()
+
+
+class ForwardRedirection:
+    """
+    将一个外部计算方法（如 _calc_loss / step）重定向到 wrapper_module (DeepSpeedEngine / DDP)
+    的 forward() 内部执行，使所有的张量与参数计算被分布式引擎的生命周期完整包裹。
+    """
+    def __call__(
+        self,
+        wrapper_module: nn.Module,
+        original_module: nn.Module,
+        method: Callable,
+        *args: Any,
+        **kwargs: Any
+    ):
+        original_forward = original_module.forward
+
+        def wrapped_forward(*_args: Any, **_kwargs: Any) -> Any:
+            # 在真正进入用户逻辑前恢复原始 forward，避免内部递归调用被拦截
+            original_module.forward = original_forward
+            # 执行注入的完整计算（首个参数注入解包后的原始模型，实现显式传参解耦）
+            return method(original_module, *_args, **_kwargs)
+
+        # 临时替换原始内层模型的 forward
+        original_module.forward = wrapped_forward
+        try:
+            # 调用外层包装引擎（DeepSpeedEngine / DDP），触发引擎的完整 forward prologue/epilogue 与 hook 注册
+            output = wrapper_module(*args, **kwargs)
+        finally:
+            # 保证即便发生异常也能恢复原始 forward
+            original_module.forward = original_forward
+
+        return output
 
 
 # def get_ds_state_dict(

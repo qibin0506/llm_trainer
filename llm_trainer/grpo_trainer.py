@@ -25,7 +25,7 @@ from .utils import (
     empty_cache
 )
 from .checkpoint import save_checkpoint, save_steps
-from .partition_utils import unwrap_model_for_generation, unwrap_model
+from .partition_utils import unwrap_model_for_generation
 
 
 class GRPOTrainer(BaseTrainer):
@@ -163,7 +163,6 @@ class GRPOTrainer(BaseTrainer):
             model,
             input_ids: torch.Tensor,
             attention_mask: Optional[torch.Tensor],
-            prompt_len: int,
             completion_ids: torch.Tensor,
             chunk_size: Optional[int] = None
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -172,21 +171,18 @@ class GRPOTrainer(BaseTrainer):
         1. 采用 Active Token Filtering：跳过 Prompt 的 lm_head 矩阵乘法
         2. 支持 chunk_size 配置：None 为全量计算，整数则分块计算
         """
-        unwrapped = unwrap_model(model)
-        lm_head = unwrapped.lm_head
-
         def _step_forward(inp_ids, att_mask, comp_ids):
             pos_ids = calc_position_ids(att_mask)
+            comp_len = comp_ids.size(1)
             outputs = model(
                 input_ids=inp_ids,
                 attention_mask=att_mask,
                 position_ids=pos_ids,
-                return_logits=False
+                return_logits=True,
+                logits_to_keep=comp_len + 1
             )
 
-            h_completion = outputs['hidden_states'][:, prompt_len - 1: -1]
-            logits_completion = lm_head(h_completion).float()
-
+            logits_completion = outputs['logits'][:, :-1, :][:, -comp_len:, :].float()
             log_probs = log_softmax(logits_completion, comp_ids)
             aux_loss = outputs['aux_loss']
 
@@ -210,29 +206,27 @@ class GRPOTrainer(BaseTrainer):
 
         return total_log_probs, total_aux_loss
 
-    def _compute_group_relative_advantages(self, rewards):
+    def _compute_group_relative_advantages(self, rewards: torch.Tensor) -> torch.Tensor:
         group_size = self.grpo_config.group_size
+        rewards_fp32 = torch.nan_to_num(rewards.float(), nan=0.0)
 
-        # Reshape rewards to group by prompt
-        # [batch, group_size]
-        rewards_by_group = rewards.view(-1, group_size)
+        # Reshape rewards to group by prompt: [batch, group_size]
+        rewards_by_group = rewards_fp32.view(-1, group_size)
 
-        # Compute mean and standard deviation for each prompt group
-        # [batch]
+        # Compute mean and standard deviation for each prompt group: [batch]
         group_means = rewards_by_group.mean(dim=1)
         group_stds = torch.nan_to_num(rewards_by_group.std(dim=1, unbiased=False), nan=0.0)
 
-        # Expand the means and stds to match the original flat rewards tensor shape
-        # [batch*group_size]
+        # Expand the means and stds to match the original flat rewards tensor shape: [batch*group_size]
         expanded_means = group_means.repeat_interleave(group_size)
         expanded_stds = group_stds.repeat_interleave(group_size)
 
-        # Normalize rewards to get advantages
-        # [batch*group_size]
-        advantages = (rewards - expanded_means) / (expanded_stds + 1e-4)
+        is_flat = expanded_stds < 1e-6
+        norm_adv = (rewards_fp32 - expanded_means) / (expanded_stds + 1e-4)
+        advantages = torch.where(is_flat, torch.zeros_like(norm_adv), norm_adv)
+        advantages = torch.nan_to_num(advantages, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # [batch*group_size, 1]
-        return advantages.unsqueeze(1)  # Add dimension for token-wise operations
+        return advantages.to(dtype=rewards.dtype).unsqueeze(1)
 
     def _generate_rollout_data(self, batch_data: List[dict]):
         prompt_ids = [item["prompt"] for item in batch_data]
@@ -347,13 +341,13 @@ class GRPOTrainer(BaseTrainer):
             chunk_size = self.grpo_config.chunked_log_probs_size
             with autocast(TrainerTools().parallel.device_type):
                 old_log_probs, _ = self._compute_completion_log_probs(
-                    self.train_model, input_ids, attention_mask, prompt_len, completion_ids, chunk_size
+                    self.train_model, input_ids, attention_mask, completion_ids, chunk_size
                 )
 
             if self.ref_model:
                 with autocast(TrainerTools().parallel.device_type):
                     ref_log_probs, _ = self._compute_completion_log_probs(
-                        self.ref_model, input_ids, attention_mask, prompt_len, completion_ids, chunk_size
+                        self.ref_model, input_ids, attention_mask, completion_ids, chunk_size
                     )
             else:
                 ref_log_probs = None
@@ -417,7 +411,6 @@ class GRPOTrainer(BaseTrainer):
         ptx_data = rollout_data['ptx_data']
 
         total_samples = input_ids.shape[0]
-        prompt_len = input_ids.shape[1] - completion_ids.shape[1]
 
         grpo_stats = {
             "loss": 0.0,
@@ -452,7 +445,7 @@ class GRPOTrainer(BaseTrainer):
 
                 with autocast(TrainerTools().parallel.device_type):
                     log_probs, aux_loss = self._compute_completion_log_probs(
-                        self.train_model, mb_input_ids, mb_attention_mask, prompt_len, mb_completion_ids
+                        self.train_model, mb_input_ids, mb_attention_mask, mb_completion_ids
                     )
 
                     loss, clip_frac = self.criterion(
@@ -510,11 +503,23 @@ class GRPOTrainer(BaseTrainer):
                 grpo_loss_unscaled = loss + aux_loss
                 ptx_loss_unscaled = self.grpo_config.ptx_coef * ptx_loss + ptx_aux_loss
 
+                is_last_mini_batch = (
+                    grpo_epoch == self.grpo_config.grpo_epochs - 1
+                    and (i + grpo_batch_size >= total_samples)
+                )
+
                 if self.is_ds:
-                    need_update_step = self.train_model.is_gradient_accumulation_boundary()
+                    if is_last_mini_batch:
+                        self.train_model.set_gradient_accumulation_boundary(True)
+                        need_update_step = True
+                    else:
+                        need_update_step = self.train_model.is_gradient_accumulation_boundary()
                 else:
                     global_micro_batch_idx += 1
-                    need_update_step = (global_micro_batch_idx % self.gradient_accumulation_steps == 0)
+                    need_update_step = (
+                        global_micro_batch_idx % self.gradient_accumulation_steps == 0
+                        or is_last_mini_batch
+                    )
 
                 if has_ptx:
                     self._backward_loss(grpo_loss_unscaled, self.gradient_accumulation_steps, step=False)
@@ -533,10 +538,8 @@ class GRPOTrainer(BaseTrainer):
                 total_micro_batches_processed += 1
 
                 if need_update_step:
-                    self._update_step()
+                    self._update_step(is_last_step=is_last_mini_batch)
 
-        if not self.is_ds and (global_micro_batch_idx % self.gradient_accumulation_steps != 0):
-            self._update_step()
 
         if total_micro_batches_processed > 0:
             for key in ["loss", "moe_aux_loss", "ptx_loss",

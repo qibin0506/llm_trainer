@@ -295,7 +295,7 @@ class DPOTrainer(BaseTrainer):
                         batches_accumulated += 1
 
                         if need_update_step:
-                            self._update_step()
+                            self._update_step(is_last_step=is_last_step)
                             global_steps_since_last_save += 1
                             global_steps_since_last_eval += 1
 

@@ -400,7 +400,6 @@ train_config.ppo_config = PPOConfig(
     kl_beta=0.02,
     clip_eps=0.1,
     vf_coef=0.1,
-    whiten_rewards=True,               # 默认启用 Advantage 白化
     normalize_rewards=False,
     generate_config=GenerateConfig(
         max_seq_len=512, 
@@ -717,7 +716,6 @@ policy_state_dict = extract_policy_weights_from_ppo(model_config, ppo_checkpoint
 | `missing_eos_penalty` | `Optional[float]` | `None` | 当生成的回答未能包含 EOS 结束符时的硬性扣分惩罚值。 |
 | `normalize_rewards` | `bool` | `False` | 是否在送入 GAE 前对 Reward 进行标准化。 |
 | `normalize_method` | `str` | `'RunningMeanStd'` | Reward 标准化算法：`'RunningMeanStd'` 或 `'BatchStd'`。 |
-| `whiten_rewards` | `bool` | `True` | 是否对 GAE 计算得出的 Advantage 优势值进行白化（Whitening）处理。 |
 | `generate_config` | `GenerateConfig` | `GenerateConfig()` | PPO 采样 Rollout 生成数据时的自回归解码参数（可在此配置 `chunked_generate_size`）。 |
 
 ### 3.5 组相对策略优化配置 (`GRPOConfig`)

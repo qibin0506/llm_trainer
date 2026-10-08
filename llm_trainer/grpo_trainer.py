@@ -309,6 +309,11 @@ class GRPOTrainer(BaseTrainer):
         turn_rewards = torch.zeros(batch_size, max_turns + 1, device=device, dtype=torch.float32)
         turn_rewards.scatter_add_(dim=1, index=valid_turn_ids, src=masked_rewards)
 
+        # 标记各样本在每个交互轮次是否实际存在模型 Action（解决异构轮次下的虚假 0 统计偏差）
+        turn_active = torch.zeros(batch_size, max_turns + 1, dtype=torch.bool, device=device)
+        turn_active.scatter_(dim=1, index=valid_turn_ids, value=True)
+        turn_active = turn_active[:, 1:]  # [batch_size, max_turns]
+
         # 3. 按因果时序反向累积计算各轮次的未来折现回报 (Turn-level Return-to-Go)
         # G_{i, k} = R_{i, k} + gamma * G_{i, k+1}
         turn_returns = torch.zeros(batch_size, max_turns + 1, device=device, dtype=torch.float32)
@@ -317,25 +322,41 @@ class GRPOTrainer(BaseTrainer):
             running_return = turn_rewards[:, k] + gamma * running_return
             turn_returns[:, k] = running_return
 
-        # 4. 组内对齐基线：按同 Prompt 组和同一交互轮次，分别计算基线均值与方差
+        # 4. 组内对齐基线：严格仅在各组内【实际发生交互的活跃样本】之间计算均值与方差
         # 提取有效轮次 1..max_turns，形状为 [num_groups, group_size, max_turns]
         returns_by_group = turn_returns[:, 1:].view(-1, group_size, max_turns)
-        group_means = returns_by_group.mean(dim=1, keepdim=True)  # [num_groups, 1, max_turns]
+        active_by_group = turn_active.view(-1, group_size, max_turns)
+        active_mask = active_by_group.float()
+        active_counts = active_mask.sum(dim=1, keepdim=True)  # [num_groups, 1, max_turns]
+
+        # 仅对同组内活跃参与该轮交互的样本计算基线均值
+        masked_returns = returns_by_group * active_mask
+        group_means = masked_returns.sum(dim=1, keepdim=True) / active_counts.clamp(min=1.0)
+
+        # 仅对同组内活跃样本计算方差与标准差
+        diff_sq = ((returns_by_group - group_means) ** 2) * active_mask
+        var = diff_sq.sum(dim=1, keepdim=True) / active_counts.clamp(min=1.0)
+        group_stds = torch.sqrt(var)
+
+        # 至少需要 2 个活跃候选才能构成组内相对比较，否则方差无意义
+        valid_group = (active_counts >= 2) & (group_stds > 1e-6)
 
         scale_rewards = self.grpo_config.scale_rewards
         if scale_rewards is None:
             scale_rewards = (self.grpo_config.loss_type != "dr_grpo")
 
         if scale_rewards:
-            group_stds = torch.nan_to_num(
-                returns_by_group.std(dim=1, unbiased=False, keepdim=True),
-                nan=0.0
-            )
-            is_flat = group_stds < 1e-6
-            turn_adv = (returns_by_group - group_means) / (group_stds + 1e-4)
-            turn_adv = torch.where(is_flat, torch.zeros_like(turn_adv), turn_adv)
+            norm_adv = (returns_by_group - group_means) / (group_stds + 1e-4)
+            turn_adv = torch.where(valid_group, norm_adv, torch.zeros_like(returns_by_group))
         else:
-            turn_adv = returns_by_group - group_means
+            turn_adv = torch.where(
+                active_counts >= 2,
+                returns_by_group - group_means,
+                torch.zeros_like(returns_by_group)
+            )
+
+        # 严格将非活跃轮次的优势值置零
+        turn_adv = turn_adv * active_mask
 
         # 5. 将各轮次标准化优势值精确广播映射回对应 Action Token
         turn_adv = turn_adv.view(batch_size, max_turns)

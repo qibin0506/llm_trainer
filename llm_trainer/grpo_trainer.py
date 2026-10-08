@@ -511,7 +511,7 @@ class GRPOTrainer(BaseTrainer):
         if feedbacks_list is not None:
             extra_reward_kwargs['feedbacks'] = feedbacks_list
 
-        raw_rewards = self._call_reward_func(
+        raw_rewards = self.reward_func(
             repeated_prompt_ids,
             completion_ids.cpu(),
             repeated_gt_answer_ids,

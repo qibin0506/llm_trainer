@@ -739,7 +739,7 @@ class PPOTrainer(BaseTrainer):
             if feedbacks_list is not None:
                 extra_reward_kwargs['feedbacks'] = feedbacks_list
 
-            raw_env_rewards = self._call_reward_func(
+            raw_env_rewards = self.reward_func(
                 prompt_ids,
                 completion_ids.cpu(),
                 gt_answer_ids,

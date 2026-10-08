@@ -3,7 +3,6 @@ import os
 import copy
 import gc
 import math
-import inspect
 import importlib.metadata
 from packaging import version
 from itertools import islice
@@ -540,32 +539,6 @@ class BaseTrainer:
 
         return parallel_kwargs
 
-    def _call_reward_func(
-            self,
-            prompt_ids: List[torch.Tensor],
-            completion_ids: torch.Tensor,
-            gt_answer_ids: List[Optional[torch.Tensor]],
-            **extra_kwargs
-    ) -> Union[List[float], List[List[float]], torch.Tensor]:
-        if not hasattr(self, 'reward_func') or self.reward_func is None:
-            raise RuntimeError("reward_func is not defined on trainer.")
-
-        try:
-            sig = inspect.signature(self.reward_func)
-            has_var_keyword = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
-            if has_var_keyword:
-                return self.reward_func(prompt_ids, completion_ids, gt_answer_ids, **extra_kwargs)
-
-            accepted_kwargs = {
-                k: v for k, v in extra_kwargs.items()
-                if k in sig.parameters
-            }
-            return self.reward_func(prompt_ids, completion_ids, gt_answer_ids, **accepted_kwargs)
-        except (ValueError, TypeError):
-            try:
-                return self.reward_func(prompt_ids, completion_ids, gt_answer_ids, **extra_kwargs)
-            except TypeError:
-                return self.reward_func(prompt_ids, completion_ids, gt_answer_ids)
 
     def _create_dataset(self, file_idx) -> Tuple[Dataset, str]: ...
 

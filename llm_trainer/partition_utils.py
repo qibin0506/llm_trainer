@@ -12,24 +12,31 @@ from .parallel import DsParallel
 
 @contextmanager
 def unwrap_model_for_generation(model: nn.Module):
-    """
-    解包model用于生成
-    """
-    if isinstance(TrainerTools().parallel, DsParallel):
-        import deepspeed
-        assert isinstance(model, deepspeed.DeepSpeedEngine)
+    unwrapped_model = unwrap_model(model)
+    is_gradient_checkpointing = unwrapped_model.is_gradient_checkpointing
 
-        if model.zero_optimization_stage() == 3:
-            with deepspeed.zero.GatheredParameters(model.parameters()):
-                _remove_hooks(model)
-                try:
-                    yield unwrap_model(model)
-                finally:
-                    _add_hooks(model)
+    if is_gradient_checkpointing:
+        unwrapped_model.gradient_checkpointing_disable()
+
+    try:
+        if isinstance(TrainerTools().parallel, DsParallel):
+            import deepspeed
+            assert isinstance(model, deepspeed.DeepSpeedEngine)
+
+            if model.zero_optimization_stage() == 3:
+                with deepspeed.zero.GatheredParameters(model.parameters()):
+                    _remove_hooks(model)
+                    try:
+                        yield unwrap_model(model)
+                    finally:
+                        _add_hooks(model)
+            else:
+                yield unwrapped_model
         else:
-            yield unwrap_model(model)
-    else:
-        yield model
+            yield unwrapped_model
+    finally:
+        if is_gradient_checkpointing:
+            unwrapped_model.gradient_checkpointing_enable()
 
 
 def sync_model_state_dict(
@@ -127,7 +134,8 @@ def get_full_state_dict_on_rank0(
         import deepspeed
         if isinstance(model, deepspeed.DeepSpeedEngine):
             return _get_ds_full_state_dict_on_rank0(model, max_elements_per_chunk)
-    except Exception: ...
+    except (ImportError, ModuleNotFoundError):
+        pass
 
     if TrainerTools().parallel.is_main_process:
         return {k: v.cpu().clone() for k, v in unwrap_model(model).state_dict().items()}

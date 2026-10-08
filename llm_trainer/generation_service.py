@@ -1,6 +1,7 @@
-from typing import Optional, Mapping, Tuple, Protocol, Dict, Any
+from typing import Optional, Mapping, Tuple, Protocol, Dict, Any, List
 import gc
 import concurrent.futures
+import inspect
 
 import torch
 import torch.distributed as dist
@@ -204,7 +205,7 @@ class ParallelGenerationService(GenerationServiceBase):
                 flush_bucket(dtype)
                 if TrainerTools().parallel.is_main_process:
                     src_tensor = state_dict[name] if (state_dict is not None and name in state_dict) else param.data
-                    src_tensor = src_tensor.to(comm_device, non_blocking=True)
+                    src_tensor = src_tensor.to(comm_device, dtype=param.dtype, non_blocking=True)
                 else:
                     src_tensor = torch.empty_like(param.data, device=comm_device)
                 dist.broadcast(src_tensor, src=0)
@@ -217,7 +218,7 @@ class ParallelGenerationService(GenerationServiceBase):
 
             if TrainerTools().parallel.is_main_process:
                 src_tensor = state_dict[name] if (state_dict is not None and name in state_dict) else param.data
-                buffer[offset: offset + numel].copy_(src_tensor.view(-1))
+                buffer[offset: offset + numel].copy_(src_tensor.reshape(-1))
 
             params_list.append((name, param, numel, param.shape))
             bucket_offsets[dtype] += numel
@@ -340,11 +341,20 @@ class EnvironmentStep(Protocol):
     """
     多轮 RL 交互环境协议。
     """
-    def __call__(self, generated_text: str) -> Tuple[bool, str]:
+    def __call__(
+            self,
+            sample_idx: int,
+            prompt_ids: List[int],
+            history_tokens: List[int],
+            generated_text: str
+    ) -> Tuple[bool, str]:
         """
         根据模型生成的文本执行环境交互（如：运行代码、验证公式、调用 API）。
 
         Args:
+            sample_idx (int): 样本在当前批次中的索引。
+            prompt_ids (List[int]): 样本初始 Prompt Token IDs（去除 padding）。
+            history_tokens (List[int]): 之前轮次累积的历史 Token IDs（包含历史生成内容与环境反馈）。
             generated_text (str): 模型在当前轮次生成的文本内容。
 
         Returns:
@@ -369,12 +379,39 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
             env_step: EnvironmentStep,
             format_feedback: FeedbackFormatter,
             max_turns: int = 3,
-            max_consecutive_errors: int = 3
+            max_consecutive_errors: int = 3,
+            env_timeout: Optional[float] = 30.0,
+            max_workers: Optional[int] = None
     ):
         self.env_step = env_step
         self.format_feedback = format_feedback
         self.max_turns = max_turns
         self.max_consecutive_errors = max_consecutive_errors
+        self.env_timeout = env_timeout
+        self.max_workers = max_workers
+
+        self._env_step_accepts_context = True
+        try:
+            sig = inspect.signature(self.env_step)
+            pos_params = [
+                p for p in sig.parameters.values()
+                if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+            ]
+            if len(pos_params) == 1:
+                self._env_step_accepts_context = False
+        except Exception:
+            pass
+
+    def _call_env_step(
+            self,
+            sample_idx: int,
+            prompt_ids: List[int],
+            history_tokens: List[int],
+            generated_text: str
+    ) -> Tuple[bool, str]:
+        if self._env_step_accepts_context:
+            return self.env_step(sample_idx, prompt_ids, history_tokens, generated_text)
+        return self.env_step(generated_text)  # type: ignore
 
     def _safe_left_unpad(self, seq: torch.Tensor, pad_id: int) -> torch.Tensor:
         non_pad_mask = seq != pad_id
@@ -405,6 +442,15 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
 
         batch_size = prompt_ids.shape[0]
         current_prompts = prompt_ids
+        initial_prompts = [
+            self._safe_left_unpad(prompt_ids[i], pad_token_id).cpu().tolist()
+            for i in range(batch_size)
+        ]
+
+        # 统一以当前 Batch 的最大 Prompt 长度为基准，计算整条轨迹在 Trainer 端允许的最大完成预算
+        # 确保与 Trainer 端 left_pad 后的 max_new_tokens = max_seq_len - prompt_len 严格契合，杜绝事后静默截断
+        initial_max_prompt_len = prompt_ids.shape[1]
+        max_completion_budget = max(generate_config.max_seq_len - initial_max_prompt_len, 1)
 
         loop_dones = [False] * batch_size
         terminals = [False] * batch_size
@@ -412,13 +458,21 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
 
         trajectories = [[] for _ in range(batch_size)]
         generation_masks = [[] for _ in range(batch_size)]
+        last_feedbacks = ["" for _ in range(batch_size)]
 
-        with torch.no_grad():
+        # 自动将 pad_token 加进 suppress_tokens，防止采样出 pad 导致与训练时 attention mask 产生语义偏移
+        effective_suppress_tokens = list(generate_config.suppress_tokens or [])
+        if pad_token_id not in effective_suppress_tokens:
+            effective_suppress_tokens.append(pad_token_id)
+
+        with torch.no_grad(), unwrap_model_for_generation(model) as unwrapped_model:
+            gen_model = getattr(unwrapped_model, 'policy_model', unwrapped_model)
+
             for turn in range(self.max_turns):
                 for i in range(batch_size):
                     if not loop_dones[i]:
                         actual_len = (current_prompts[i] != pad_token_id).sum().item()
-                        if actual_len >= generate_config.max_seq_len:
+                        if actual_len >= generate_config.max_seq_len or len(trajectories[i]) >= max_completion_budget:
                             loop_dones[i] = True
 
                 local_all_done = torch.tensor(1 if all(loop_dones) else 0, device=device)
@@ -457,73 +511,74 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
                     if (attention_mask == 0).all():
                         attention_mask[:, -1] = 1
 
-                    local_remaining_max_tokens = max(generate_config.max_seq_len - cur_prompt_len, 1)
+                    # 计算活跃样本的最大剩余预算，避免生成步数超出序列预算限制
+                    max_active_budget = max(
+                        (max(max_completion_budget - len(trajectories[i]), 1) for i in active_indices),
+                        default=1
+                    )
+                    local_remaining_max_tokens = min(
+                        max(generate_config.max_seq_len - cur_prompt_len, 1),
+                        max_active_budget
+                    )
 
-                if TrainerTools().parallel.world_size > 1:
-                    max_token_tensor = torch.tensor([local_remaining_max_tokens], dtype=torch.long, device=device)
-                    dist.all_reduce(max_token_tensor, op=dist.ReduceOp.MAX)
-                    remaining_max_tokens = max_token_tensor.item()
-                else:
-                    remaining_max_tokens = local_remaining_max_tokens
+                # 直接使用本地剩余容量限制，避免多卡 all_reduce MAX 导致 prompt 较长的 rank 超出 max_seq_len
+                remaining_max_tokens = local_remaining_max_tokens
 
                 actual_chunk_size = generate_config.chunked_generate_size or active_prompts.shape[0]
 
-                with unwrap_model_for_generation(model) as unwrapped_model:
-                    gen_model = getattr(unwrapped_model, 'policy_model', unwrapped_model)
+                if 0 < actual_chunk_size < active_prompts.shape[0]:
+                    all_outputs = []
+                    for chunk_start in range(0, active_prompts.shape[0], actual_chunk_size):
+                        chunk_prompts = active_prompts[chunk_start: chunk_start + actual_chunk_size]
+                        chunk_mask = attention_mask[chunk_start: chunk_start + actual_chunk_size]
+                        chunk_pixel_values = None
+                        if active_pixel_values is not None:
+                            chunk_pixel_values = active_pixel_values[chunk_start: chunk_start + actual_chunk_size]
 
-                    if 0 < actual_chunk_size < active_prompts.shape[0]:
-                        all_outputs = []
-                        for chunk_start in range(0, active_prompts.shape[0], actual_chunk_size):
-                            chunk_prompts = active_prompts[chunk_start: chunk_start + actual_chunk_size]
-                            chunk_mask = attention_mask[chunk_start: chunk_start + actual_chunk_size]
-                            chunk_pixel_values = None
-                            if active_pixel_values is not None:
-                                chunk_pixel_values = active_pixel_values[chunk_start: chunk_start + actual_chunk_size]
-
-                            chunk_out, _ = batch_generate(
-                                model=gen_model,
-                                tokens=chunk_prompts,
-                                attention_mask=chunk_mask,
-                                max_new_tokens=remaining_max_tokens,
-                                temperature=generate_config.temperature,
-                                top_p=generate_config.top_p,
-                                top_k=generate_config.top_k,
-                                repetition_penalty=generate_config.repetition_penalty,
-                                exclude_penalty_tokens=generate_config.exclude_penalty_tokens,
-                                suppress_tokens=generate_config.suppress_tokens,
-                                device=device,
-                                pixel_values=chunk_pixel_values,
-                                tokens_per_image=tokens_per_image,
-                                auto_prefix_cache=generate_config.auto_prefix_cache,
-                                return_logits=False
-                            )
-                            all_outputs.append(chunk_out)
-
-                        max_out_len = max(o.shape[1] for o in all_outputs)
-                        padded_outputs = []
-                        for o in all_outputs:
-                            if o.shape[1] < max_out_len:
-                                o = torch.nn.functional.pad(o, (0, max_out_len - o.shape[1]), value=pad_token_id)
-                            padded_outputs.append(o)
-                        outputs = torch.cat(padded_outputs, dim=0)
-                    else:
-                        outputs, _ = batch_generate(
+                        chunk_out, _ = batch_generate(
                             model=gen_model,
-                            tokens=active_prompts,
-                            attention_mask=attention_mask,
+                            tokens=chunk_prompts,
+                            attention_mask=chunk_mask,
                             max_new_tokens=remaining_max_tokens,
                             temperature=generate_config.temperature,
                             top_p=generate_config.top_p,
                             top_k=generate_config.top_k,
                             repetition_penalty=generate_config.repetition_penalty,
                             exclude_penalty_tokens=generate_config.exclude_penalty_tokens,
-                            suppress_tokens=generate_config.suppress_tokens,
+                            suppress_tokens=effective_suppress_tokens,
                             device=device,
-                            pixel_values=active_pixel_values,
+                            pixel_values=chunk_pixel_values,
                             tokens_per_image=tokens_per_image,
                             auto_prefix_cache=generate_config.auto_prefix_cache,
                             return_logits=False
                         )
+                        all_outputs.append(chunk_out)
+
+                    max_out_len = max(o.shape[1] for o in all_outputs)
+                    padded_outputs = []
+                    for o in all_outputs:
+                        if o.shape[1] < max_out_len:
+                            o = torch.nn.functional.pad(o, (0, max_out_len - o.shape[1]), value=pad_token_id)
+                        padded_outputs.append(o)
+                    outputs = torch.cat(padded_outputs, dim=0)
+                else:
+                    outputs, _ = batch_generate(
+                        model=gen_model,
+                        tokens=active_prompts,
+                        attention_mask=attention_mask,
+                        max_new_tokens=remaining_max_tokens,
+                        temperature=generate_config.temperature,
+                        top_p=generate_config.top_p,
+                        top_k=generate_config.top_k,
+                        repetition_penalty=generate_config.repetition_penalty,
+                        exclude_penalty_tokens=generate_config.exclude_penalty_tokens,
+                        suppress_tokens=effective_suppress_tokens,
+                        device=device,
+                        pixel_values=active_pixel_values,
+                        tokens_per_image=tokens_per_image,
+                        auto_prefix_cache=generate_config.auto_prefix_cache,
+                        return_logits=False
+                    )
 
                 empty_cache()
 
@@ -541,32 +596,75 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
 
                         new_tokens = outputs[local_idx, cur_prompt_len:]
                         valid_new_tokens = new_tokens[new_tokens != pad_token_id].tolist()
+
+                        # 严格限制本轮有效生成 token 数量不超过该样本的总完成预算
+                        rem_budget = max(max_completion_budget - len(trajectories[global_idx]), 0)
+                        if len(valid_new_tokens) > rem_budget:
+                            valid_new_tokens = valid_new_tokens[:rem_budget]
+                            loop_dones[global_idx] = True
+
                         generated_text = tokenizer.decode(valid_new_tokens)
+
+                        history_tokens = list(trajectories[global_idx])
 
                         trajectories[global_idx].extend(valid_new_tokens)
                         generation_masks[global_idx].extend([True] * len(valid_new_tokens))
 
-                        tasks.append((global_idx, valid_new_tokens, generated_text))
+                        if len(trajectories[global_idx]) >= max_completion_budget:
+                            loop_dones[global_idx] = True
+
+                        tasks.append((global_idx, valid_new_tokens, initial_prompts[global_idx], history_tokens, generated_text))
 
                 results_dict = {}
                 if tasks:
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(tasks))) as executor:
+                    workers = self.max_workers if (self.max_workers and self.max_workers > 0) else min(32, max(1, len(tasks)))
+                    executor = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+                    try:
                         future_to_idx = {
-                            executor.submit(self.env_step, text): (idx, toks)
-                            for (idx, toks, text) in tasks
+                            executor.submit(self._call_env_step, idx, p_ids, hist_toks, text): (idx, toks)
+                            for (idx, toks, p_ids, hist_toks, text) in tasks
                         }
-                        for future in concurrent.futures.as_completed(future_to_idx):
-                            idx, valid_new_tokens = future_to_idx[future]
-                            try:
-                                is_done, feedback = future.result()
-                                is_exception = False
-                            except Exception as e:
-                                is_done, feedback = False, f"Error: {str(e)}"
-                                is_exception = True
 
-                            results_dict[idx] = (is_done, feedback, valid_new_tokens, is_exception)
+                        if self.env_timeout is not None and self.env_timeout > 0:
+                            done, not_done = concurrent.futures.wait(
+                                future_to_idx.keys(),
+                                timeout=self.env_timeout
+                            )
+
+                            for future in done:
+                                idx, valid_new_tokens = future_to_idx[future]
+                                try:
+                                    is_done, feedback = future.result()
+                                    is_exception = False
+                                except Exception as e:
+                                    is_done, feedback = False, f"Error: {str(e)}"
+                                    is_exception = True
+                                results_dict[idx] = (is_done, feedback, valid_new_tokens, is_exception)
+
+                            for future in not_done:
+                                idx, valid_new_tokens = future_to_idx[future]
+                                future.cancel()
+                                is_done, feedback = False, f"TimeoutError: Environment step exceeded timeout of {self.env_timeout}s"
+                                is_exception = True
+                                results_dict[idx] = (is_done, feedback, valid_new_tokens, is_exception)
+                        else:
+                            for future in concurrent.futures.as_completed(future_to_idx):
+                                idx, valid_new_tokens = future_to_idx[future]
+                                try:
+                                    is_done, feedback = future.result()
+                                    is_exception = False
+                                except Exception as e:
+                                    is_done, feedback = False, f"Error: {str(e)}"
+                                    is_exception = True
+                                results_dict[idx] = (is_done, feedback, valid_new_tokens, is_exception)
+                    finally:
+                        try:
+                            executor.shutdown(wait=False, cancel_futures=True)
+                        except TypeError:
+                            executor.shutdown(wait=False)
 
                 for idx, (is_done, feedback, valid_new_tokens, is_exception) in results_dict.items():
+                    last_feedbacks[idx] = feedback
                     if len(valid_new_tokens) == 0:
                         is_exception = True
 
@@ -579,20 +677,31 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
                         terminals[idx] = True
                         loop_dones[idx] = True
 
+                    # 若样本已经结束交互（任务完成/连续异常/达到上限）或已是最后一轮，无需追加尾部 feedback 也无需构造下一轮 prompt
+                    if loop_dones[idx] or turn == self.max_turns - 1:
+                        loop_dones[idx] = True
+                        next_prompts_list[idx] = torch.tensor([pad_token_id], dtype=torch.long, device=device)
+                        continue
+
                     unpadded_prompt = self._safe_left_unpad(current_prompts[idx], pad_token_id)
 
-                    feedback_text = self.format_feedback(feedback)
-                    feedback_tokens = tokenizer.encode(feedback_text)
+                    try:
+                        feedback_text = self.format_feedback(feedback)
+                        feedback_tokens = tokenizer.encode(feedback_text)
+                    except Exception as e:
+                        feedback_text = f"\nError formatting feedback: {str(e)}\n"
+                        feedback_tokens = tokenizer.encode(feedback_text)
 
-                    remaining_capacity = generate_config.max_seq_len - len(unpadded_prompt) - len(valid_new_tokens) - 1
+                    remaining_capacity = max_completion_budget - len(trajectories[idx])
                     if remaining_capacity <= 0:
                         loop_dones[idx] = True
                         feedback_tokens = []
                     else:
                         feedback_tokens = feedback_tokens[:remaining_capacity]
 
-                    trajectories[idx].extend(feedback_tokens)
-                    generation_masks[idx].extend([False] * len(feedback_tokens))
+                    if feedback_tokens:
+                        trajectories[idx].extend(feedback_tokens)
+                        generation_masks[idx].extend([False] * len(feedback_tokens))
 
                     next_prompt = torch.cat([
                         unpadded_prompt,
@@ -602,7 +711,7 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
                         next_prompt = next_prompt[:generate_config.max_seq_len]
                     next_prompts_list[idx] = next_prompt
 
-                    if turn == self.max_turns - 1 or next_prompt.size(0) >= generate_config.max_seq_len:
+                    if len(trajectories[idx]) >= max_completion_budget or next_prompt.size(0) >= generate_config.max_seq_len:
                         loop_dones[idx] = True
 
                 if not all(loop_dones) and active_indices:
@@ -622,5 +731,6 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
         return {
             'completions': trajectories,
             'dones': terminals,
-            'generation_masks': generation_masks
+            'generation_masks': generation_masks,
+            'feedbacks': last_feedbacks
         }

@@ -61,7 +61,7 @@ class PretrainDataset(Dataset):
             self.input_ids = torch.tensor(tokens, dtype=torch.int32)
             del tokens
         else:
-            raise Exception(f'unsupported file type for {file_path}')
+            raise ValueError(f"Unsupported file type for {file_path}")
 
         if len(self.input_ids) < block_size:
             self.length = 0
@@ -139,7 +139,7 @@ class SFTDataset(Dataset):
             with open(file_path, 'rb') as f:
                 self.input_ids = pickle.load(f)
         else:
-            raise Exception(f'unsupported file type for {file_path}')
+            raise ValueError(f"Unsupported file type for {file_path}")
 
         if image_tags_file_path:
             with open(image_tags_file_path, 'r') as f:
@@ -230,7 +230,7 @@ class DPODataset(Dataset):
             with open(file_path, 'rb') as f:
                 self.data = pickle.load(f)
         else:
-            raise Exception(f'unsupported file type for {file_path}')
+            raise ValueError(f"Unsupported file type for {file_path}")
 
     def __len__(self):
         return len(self.data)
@@ -300,7 +300,7 @@ class RLDataset(Dataset):
             with open(file_path, 'rb') as f:
                 self.data = pickle.load(f)
         else:
-            raise Exception(f'unsupported file type for {file_path}')
+            raise ValueError(f"Unsupported file type for {file_path}")
 
     def __len__(self):
         return len(self.data)

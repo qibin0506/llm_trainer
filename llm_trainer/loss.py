@@ -301,17 +301,21 @@ class PPOLoss(nn.Module):
             self,
             clip_eps: float,
             vf_coef: float,
-            huber_delta: float = 1.0
+            huber_delta: float = 1.0,
+            value_clip_eps: Optional[float] = None
     ):
         """
         初始化PPO损失函数。
-        :param clip_eps: PPO裁剪范围的epsilon值。
+        :param clip_eps: PPO策略裁剪范围的epsilon值。
         :param vf_coef: 价值函数损失的系数。
+        :param huber_delta: Huber Loss 的阈值。
+        :param value_clip_eps: 价值函数裁剪范围的epsilon值。若为 None 则默认使用 clip_eps；若 <= 0 则禁用价值裁剪。
         """
         super().__init__()
         self.clip_eps = clip_eps
         self.vf_coef = vf_coef
         self.huber_delta = huber_delta
+        self.value_clip_eps = value_clip_eps if value_clip_eps is not None else clip_eps
 
     def forward(
             self,
@@ -348,12 +352,14 @@ class PPOLoss(nn.Module):
         mask = mask.float()
         value_mask = value_mask.float()
 
-        # Value Loss (价值损失) with clipping
-        values_clipped = old_values + torch.clamp(values - old_values, -self.clip_eps, self.clip_eps)
-
-        vf_loss_unclipped = F.smooth_l1_loss(values, returns, reduction='none', beta=self.huber_delta)
-        vf_loss_clipped = F.smooth_l1_loss(values_clipped, returns, reduction='none', beta=self.huber_delta)
-        value_loss = torch.max(vf_loss_unclipped, vf_loss_clipped)
+        # Value Loss (价值损失) with optional independent clipping
+        if self.value_clip_eps is not None and self.value_clip_eps > 0:
+            values_clipped = old_values + torch.clamp(values - old_values, -self.value_clip_eps, self.value_clip_eps)
+            vf_loss_unclipped = F.smooth_l1_loss(values, returns, reduction='none', beta=self.huber_delta)
+            vf_loss_clipped = F.smooth_l1_loss(values_clipped, returns, reduction='none', beta=self.huber_delta)
+            value_loss = torch.max(vf_loss_unclipped, vf_loss_clipped)
+        else:
+            value_loss = F.smooth_l1_loss(values, returns, reduction='none', beta=self.huber_delta)
 
         # Apply mask and average
         value_loss = 0.5 * (value_loss * value_mask).sum() / value_mask.sum().clamp(min=1.0)
@@ -382,8 +388,9 @@ class PPOLoss(nn.Module):
             logratios = log_probs - old_log_probs
             approx_kl = torch.sum(((torch.exp(logratios) - 1) - logratios) * mask) / mask.sum().clamp(min=1.0)
 
-            # 计算裁剪比例
-            clipped = ratio.gt(1.0 + self.clip_eps) | ratio.lt(1.0 - self.clip_eps)
+            # 计算裁剪比例：只有 A>0 且 r>1+eps，或者 A<0 且 r<1-eps 时才真正触发有效截断
+            clipped = ((advantages > 0) & ratio.gt(1.0 + self.clip_eps)) | \
+                      ((advantages < 0) & ratio.lt(1.0 - self.clip_eps))
             clip_frac = torch.sum(clipped.float() * mask) / mask.sum().clamp(min=1.0)
 
             entropy = -torch.sum(log_probs * mask) / mask.sum().clamp(min=1.0)
@@ -470,7 +477,8 @@ class GRPOLoss(nn.Module):
             ref_log_probs: torch.Tensor,
             completion_mask: torch.Tensor,
             advantages: torch.Tensor,
-            completion_len: int
+            completion_len: int,
+            avg_tokens_per_micro_batch: Optional[float] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         log_probs = log_probs.float()
         old_log_probs = old_log_probs.float()
@@ -493,7 +501,8 @@ class GRPOLoss(nn.Module):
         else:
             log_importance_weights = log_ratio
 
-        coef_1 = torch.exp(log_importance_weights)
+        raw_coef = torch.exp(log_importance_weights)
+        coef_1 = raw_coef
 
         if self.loss_type == "cispo":
             clamped_ratios = torch.clamp(coef_1, max=1 + self.clip_eps_high).detach()
@@ -521,9 +530,11 @@ class GRPOLoss(nn.Module):
             per_token_loss = -phi_seq * advantages * log_probs
 
         elif self.loss_type in ["grpo", "bnpo", "dr_grpo", "dapo", "luspo"]:
-            coef_2 = torch.clamp(coef_1, 1 - self.clip_eps_low, 1 + self.clip_eps_high)
+            coef_2 = torch.clamp(raw_coef, 1 - self.clip_eps_low, 1 + self.clip_eps_high)
             if self.delta is not None:
-                coef_1 = torch.clamp(coef_1, max=self.delta)
+                coef_1 = torch.clamp(raw_coef, max=self.delta)
+            else:
+                coef_1 = raw_coef
 
             per_token_loss1 = coef_1 * advantages
             per_token_loss2 = coef_2 * advantages
@@ -537,7 +548,10 @@ class GRPOLoss(nn.Module):
         if self.loss_type in ["grpo", "sapo"]:
             loss = ((per_token_loss * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)).mean()
         elif self.loss_type in ["bnpo", "cispo", "dapo", "vespo"]:
-            loss = (per_token_loss * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
+            if avg_tokens_per_micro_batch is not None and avg_tokens_per_micro_batch > 0:
+                loss = (per_token_loss * completion_mask).sum() / avg_tokens_per_micro_batch
+            else:
+                loss = (per_token_loss * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
         elif self.loss_type == "dr_grpo":
             completion_len = max(completion_len, 1)
             loss = (per_token_loss * completion_mask).sum() / (per_token_loss.size(0) * completion_len)
@@ -547,7 +561,18 @@ class GRPOLoss(nn.Module):
             loss = ((per_token_loss * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)).mean()
 
         with torch.no_grad():
-            is_clipped = (coef_1 > 1 + self.clip_eps_high) | (coef_1 < 1 - self.clip_eps_low)
+            if self.loss_type in ["grpo", "bnpo", "dr_grpo", "dapo", "luspo"]:
+                is_clipped = (
+                    (advantages > 0) & (raw_coef > 1 + self.clip_eps_high) |
+                    (advantages < 0) & (raw_coef < 1 - self.clip_eps_low)
+                )
+            elif self.loss_type == "cispo":
+                is_clipped = raw_coef > 1 + self.clip_eps_high
+            else:
+                is_clipped = (
+                    (advantages > 0) & (raw_coef > 1 + self.clip_eps_high) |
+                    (advantages < 0) & (raw_coef < 1 - self.clip_eps_low)
+                )
             clip_frac = (is_clipped.float() * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
 
         return loss, clip_frac

@@ -38,13 +38,34 @@ from .partition_utils import  unwrap_model_for_generation
 from .muon import  MuonWithAdamW, _get_ds_muon
 
 
+class ValueHead(nn.Linear):
+    def reset_parameters(self):
+        # ZeRO-3 safe: runs inside nn.Linear.__init__ before deepspeed.zero.Init post-hook partitions parameters
+        nn.init.normal_(self.weight, mean=0.0, std=0.01)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+
 class ValueModel(nn.Module):
     def __init__(self, base_model: Union[LlmModel, VlmModel]):
         super().__init__()
         self.base_model = base_model
-        self.value_head = nn.Linear(base_model.config.hidden_size, 1, bias=True)
-        self.value_head.weight.data.normal_(mean=0.0, std=0.01)
-        self.value_head.bias.data.zero_()
+
+        # 冻结 base_model.lm_head：ValueModel 仅利用 hidden_states 通过 value_head 输出标量，
+        # 绝不调用 base_model.lm_head。若不冻结，优化器会为极其庞大的 lm_head (vocab_size * hidden_size)
+        # 分配全量状态（如 AdamW 的 exp_avg, exp_avg_sq 等），浪费数 GB 至十数 GB 显存。
+        # 注意：如果启用了 tie_word_embeddings，lm_head.weight 与 embed_tokens.weight 共享，则不可冻结。
+        if hasattr(self.base_model, 'lm_head'):
+            is_tied = (
+                hasattr(self.base_model, 'embed_tokens')
+                and hasattr(self.base_model.lm_head, 'weight')
+                and (self.base_model.lm_head.weight is getattr(self.base_model.embed_tokens, 'weight', None))
+            )
+            if not is_tied:
+                for p in self.base_model.lm_head.parameters():
+                    p.requires_grad = False
+
+        self.value_head = ValueHead(base_model.config.hidden_size, 1, bias=True)
 
     def forward(self, *args, **kwargs) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         base_kwargs = {k: v for k, v in kwargs.items() if k not in ('return_logits', 'logits_to_keep')}
@@ -60,8 +81,19 @@ class ValueModel(nn.Module):
 class PolicyAndValueModelWrapper(nn.Module):
     def __init__(self, policy_model: nn.Module, value_model: nn.Module):
         super().__init__()
+        self.is_gradient_checkpointing = False
         self.policy_model = policy_model
         self.value_model = value_model
+
+    def gradient_checkpointing_enable(self, checkpoint_func=None):
+        self.is_gradient_checkpointing = True
+        self.policy_model.gradient_checkpointing_enable(checkpoint_func)
+        self.value_model.base_model.gradient_checkpointing_enable(checkpoint_func)
+
+    def gradient_checkpointing_disable(self):
+        self.is_gradient_checkpointing = False
+        self.policy_model.gradient_checkpointing_disable()
+        self.value_model.base_model.gradient_checkpointing_disable()
 
     def forward(self, *args, forward_type='both', **kwargs):
         if forward_type == 'policy':
@@ -125,21 +157,30 @@ class PPOTrainer(BaseTrainer):
         self.ref_model = self._init_ref_model()
         self.criterion, self.ptx_criterion = self._init_loss()
 
+        # 校验生成采样参数与策略求值分布的一致性
+        gen_cfg = self.ppo_config.generate_config
+        if gen_cfg.top_p < 1.0 or (gen_cfg.top_k is not None and gen_cfg.top_k > 0) or gen_cfg.repetition_penalty != 1.0:
+            if TrainerTools().parallel.is_main_process:
+                Logger.std_log(
+                    f"WARN: Rollout generate_config uses truncation or penalties (top_p={gen_cfg.top_p}, "
+                    f"top_k={gen_cfg.top_k}, repetition_penalty={gen_cfg.repetition_penalty}). "
+                    f"This creates discrepancy between the sampling distribution and the un-truncated log_softmax evaluation. "
+                    f"For on-policy RL, top_p=1.0, top_k=None, and repetition_penalty=1.0 are recommended."
+                )
+
     def _init_train_model_and_optim(self, initial_lr: float):
         with self._new_model_context(self.parallel_kwargs):
             policy_model = self._new_model(self.train_config)
             value_model = ValueModel(self._new_model(self.train_config))
 
-        if self.train_config.gradient_checkpointing:
+        train_model = PolicyAndValueModelWrapper(policy_model, value_model)
+
+        if self.train_config.is_gradient_checkpointing:
             if self.is_ds:
                 import deepspeed
-                policy_model.gradient_checkpointing_enable(checkpoint_func=deepspeed.checkpointing.checkpoint)
-                value_model.base_model.gradient_checkpointing_enable(checkpoint_func=deepspeed.checkpointing.checkpoint)
+                train_model.gradient_checkpointing_enable(checkpoint_func=deepspeed.checkpointing.checkpoint)
             else:
-                policy_model.gradient_checkpointing_enable()
-                value_model.base_model.gradient_checkpointing_enable()
-
-        train_model = PolicyAndValueModelWrapper(policy_model, value_model)
+                train_model.gradient_checkpointing_enable()
 
         if TrainerTools().parallel.is_main_process:
             for name, model in zip(['policy', 'value'], [policy_model, value_model]):
@@ -216,7 +257,7 @@ class PPOTrainer(BaseTrainer):
                 ds_muon = _get_ds_muon(all_groups)
 
                 if ds_muon is None:
-                    raise RuntimeError('Current deepspeed is not support muon')
+                    raise RuntimeError('Current DeepSpeed version does not support Muon optimizer.')
                 return ds_muon
 
             return MuonWithAdamW(
@@ -286,6 +327,16 @@ class PPOTrainer(BaseTrainer):
         return CompositeLRScheduler(schedulers)
 
     def _init_ref_model(self):
+        if self.ppo_config.kl_beta == 0.0:
+            return None
+
+        if not self.ppo_config.ref_model_weights_path:
+            raise ValueError(
+                "PPO `kl_beta` > 0 requires a reference model to compute KL penalty, "
+                "but `ref_model_weights_path` is not configured! "
+                "Please configure `ref_model_weights_path` in PPOConfig to prevent using randomly initialized weights in distributed training."
+            )
+
         parallel_kwargs = self._init_ref_model_args(self.train_config.model_config)
         with self._new_model_context(parallel_kwargs):
             ref_model = self._new_model(self.train_config)
@@ -294,8 +345,7 @@ class PPOTrainer(BaseTrainer):
         for param in ref_model.parameters():
             param.requires_grad = False
 
-        if self.ppo_config.ref_model_weights_path is not None:
-            self._load_external_weights(ref_model, self.ppo_config.ref_model_weights_path)
+        self._load_external_weights(ref_model, self.ppo_config.ref_model_weights_path)
 
         ref_model, _ = TrainerTools().parallel.process(
             model=ref_model,
@@ -315,7 +365,8 @@ class PPOTrainer(BaseTrainer):
         ppo_criterion = PPOLoss(
             clip_eps=self.ppo_config.clip_eps,
             vf_coef=self.ppo_config.vf_coef,
-            huber_delta=self.ppo_config.huber_delta
+            huber_delta=self.ppo_config.huber_delta,
+            value_clip_eps=self.ppo_config.value_clip_eps
         )
 
         ptx_criterion = None
@@ -374,37 +425,56 @@ class PPOTrainer(BaseTrainer):
             last_values: torch.Tensor,
             completion_mask: torch.Tensor,
             dones: torch.Tensor,
+            action_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         rewards = rewards.float()
         values = values.float()
         last_values = last_values.float()
         completion_mask = completion_mask.float()
 
+        # action_mask 标识真实的动作决策 Token（在多轮 Agent 中排除环境 Feedback，在单轮中等价于 completion_mask）
+        if action_mask is None:
+            action_mask = completion_mask.bool()
+        else:
+            action_mask = action_mask.bool() & completion_mask.bool()
+
         gamma, lam = self.ppo_config.gamma, self.ppo_config.lam
         advantages = torch.zeros_like(rewards)
-        last_gae_lam = 0
         seq_len = rewards.size(1)
-        values = values * completion_mask
+        batch_size = rewards.size(0)
+        device = rewards.device
+
+        # 方案 1：跨轮单步桥接 GAE (Action-level Bridge GAE)
+        # 将环境反馈区间视为单步外部状态转移，避免在连续环境 token 上重复乘以 (gamma * lam)
+        has_next_action = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        next_action_val = torch.zeros(batch_size, dtype=torch.float32, device=device)
+        next_action_adv = torch.zeros(batch_size, dtype=torch.float32, device=device)
 
         for t in reversed(range(seq_len)):
-            if t == seq_len - 1:
-                # 序列最末尾 step：若 dones=True 则置 0.0，否则使用修正后的 last_values
-                next_values = torch.where(dones, 0.0, last_values)
-                next_non_terminal = torch.zeros_like(dones, dtype=torch.float)
-            else:
-                # 判断下一个 token 是否已经是 padding
-                is_padding_next = (completion_mask[:, t + 1] == 0.0)
-                # 如果下一 token 是 pad，说明当前 t 就是该样本的最后有效 token
-                next_values_if_end = torch.where(dones, 0.0, last_values)
-                next_values = torch.where(is_padding_next, next_values_if_end, values[:, t + 1])
-                next_non_terminal = completion_mask[:, t + 1]
+            is_action = action_mask[:, t]  # [batch_size] bool
 
-            delta = rewards[:, t] + gamma * next_values - values[:, t]
-            last_gae_lam = delta + gamma * lam * last_gae_lam * next_non_terminal
-            advantages[:, t] = last_gae_lam
+            # 若未来存在下一动作，直接桥接下一动作起始状态的 Value 与 Advantage；
+            # 若不存在（整条轨迹末尾），则依据 dones 判断是否为自然终止态 (0.0) 或截断引导值 (last_values)
+            next_val = torch.where(
+                has_next_action,
+                next_action_val,
+                torch.where(dones, 0.0, last_values)
+            )
+            next_adv = torch.where(has_next_action, next_action_adv, 0.0)
+            next_discount = torch.where(has_next_action, gamma * lam, 0.0)
+
+            delta = rewards[:, t] + gamma * next_val - values[:, t]
+            adv = delta + next_discount * next_adv
+
+            # 仅对真实的 Action Token 记录 advantage 并更新反向状态
+            advantages[:, t] = torch.where(is_action, adv, 0.0)
+
+            next_action_val = torch.where(is_action, values[:, t], next_action_val)
+            next_action_adv = torch.where(is_action, adv, next_action_adv)
+            has_next_action = has_next_action | is_action
 
         returns = advantages + values
-        return advantages * completion_mask, returns * completion_mask
+        return advantages * action_mask.float(), returns * action_mask.float()
 
     def _compute_log_probs_and_values(
             self,
@@ -503,13 +573,24 @@ class PPOTrainer(BaseTrainer):
         prompt_masks = self._calc_attention_mask(padded_prompt_ids)
         prompt_len = padded_prompt_ids.shape[1]
 
-        max_new_tokens = self.ppo_config.generate_config.max_seq_len - prompt_len
-        if max_new_tokens <= 0:
-            raise ValueError(
-                f"Prompt length ({prompt_len}) >= max_seq_len ({self.ppo_config.generate_config.max_seq_len})."
-            )
+        max_seq_len = self.ppo_config.generate_config.max_seq_len
+        if prompt_len >= max_seq_len:
+            max_allowed_prompt_len = max(1, max_seq_len - 16)
+            if TrainerTools().parallel.is_main_process:
+                Logger.std_log(
+                    f"WARN: [Rank {TrainerTools().parallel.global_rank}] Prompt length ({prompt_len}) >= max_seq_len ({max_seq_len}). "
+                    f"Truncating prompt to last {max_allowed_prompt_len} tokens to leave generation budget and prevent rank abort."
+                )
+            padded_prompt_ids = padded_prompt_ids[:, -max_allowed_prompt_len:]
+            prompt_masks = self._calc_attention_mask(padded_prompt_ids)
+            prompt_len = padded_prompt_ids.shape[1]
+
+        max_new_tokens = max(1, max_seq_len - prompt_len)
 
         external_gen_mask = None
+        dones_list = None
+        feedbacks_list = None
+        padded_gen_masks = []
 
         with torch.no_grad():
             if self.generation_service is not None:
@@ -521,6 +602,7 @@ class PPOTrainer(BaseTrainer):
                 completion_ids_list = service_output['completions']
                 dones_list = service_output.get('dones', None)
                 gen_masks_list = service_output.get('generation_masks', None)
+                feedbacks_list = service_output.get('feedbacks', None)
 
                 if gen_masks_list is not None:
                     assert len(gen_masks_list) == len(completion_ids_list)
@@ -535,6 +617,19 @@ class PPOTrainer(BaseTrainer):
                 max_comp_len = max((len(c) for c in completion_ids_list), default=0)
                 if max_comp_len == 0:
                     max_comp_len = 1
+
+                if max_comp_len > max_new_tokens:
+                    if TrainerTools().parallel.is_main_process:
+                        Logger.std_log(
+                            f"WARN: generation_service returned completions of length {max_comp_len} "
+                            f"exceeding max_new_tokens ({max_new_tokens}). Completions will be truncated, "
+                            f"and terminal status will be invalidated for truncated sequences."
+                        )
+                    if dones is not None:
+                        for idx, comp in enumerate(completion_ids_list):
+                            if len(comp) > max_new_tokens:
+                                dones[idx] = False
+
                 max_comp_len = min(max_comp_len, max_new_tokens)
 
                 for idx, comp in enumerate(completion_ids_list):
@@ -631,11 +726,52 @@ class PPOTrainer(BaseTrainer):
                 kl_rewards = -self.ppo_config.kl_beta * kl
                 rewards += kl_rewards.to(rewards.dtype) * loss_mask
 
-            raw_env_rewards = self.reward_func(prompt_ids, completion_ids.cpu(), gt_answer_ids)
+            if dones is not None:
+                dones_list = dones.cpu().tolist()
+
+            extra_reward_kwargs = {}
+            if dones_list is not None:
+                extra_reward_kwargs['dones'] = dones_list
+            if padded_gen_masks:
+                extra_reward_kwargs['generation_masks'] = padded_gen_masks
+            elif external_gen_mask is not None:
+                extra_reward_kwargs['generation_masks'] = external_gen_mask.cpu()
+            if feedbacks_list is not None:
+                extra_reward_kwargs['feedbacks'] = feedbacks_list
+
+            raw_env_rewards = self._call_reward_func(
+                prompt_ids,
+                completion_ids.cpu(),
+                gt_answer_ids,
+                **extra_reward_kwargs
+            )
             if isinstance(raw_env_rewards, torch.Tensor):
                 env_rewards_tensor = raw_env_rewards.to(device=device, dtype=torch.float32)
             else:
                 env_rewards_tensor = torch.tensor(raw_env_rewards, device=device, dtype=torch.float32)
+
+            # 统一计算每个样本在模型生成区域（action tokens）的最后一个有效 Token 位置与结束符判断
+            gen_indices = torch.where(
+                loss_mask,
+                torch.arange(completion_ids.size(1), device=device).unsqueeze(0),
+                torch.tensor(-1, device=device)
+            )
+            last_token_indices = gen_indices.max(dim=1).values
+            valid_indices_mask = last_token_indices >= 0
+            batch_range = torch.arange(padded_prompt_ids.size(0), device=device)
+
+            # 解耦：判断模型最终输出是否正常包含 EOS 结束符（而非依赖环境 MDP 的自然终止状态 dones）
+            if external_gen_mask is not None:
+                # 多轮 Agent 模式：以模型最后一个有效 action token 是否为 eos_token_id 判定是否正常结束
+                last_action_tokens = torch.where(
+                    valid_indices_mask,
+                    completion_ids[batch_range, last_token_indices.clamp(min=0)],
+                    torch.tensor(pad_token_id, device=device)
+                )
+                has_eos = (last_action_tokens == eos_token_id) & valid_indices_mask
+            else:
+                # 单轮模式：只要 completion 中包含 eos_token_id 即视为正常结束
+                has_eos = torch.any(completion_ids == eos_token_id, dim=1)
 
             if env_rewards_tensor.dim() == 2:
                 # 2D 逐 Token / 分步稠密序列奖励 [batch_size, seq_len]
@@ -644,15 +780,9 @@ class PPOTrainer(BaseTrainer):
                 )
 
                 if self.ppo_config.missing_eos_penalty is not None:
-                    gen_indices = torch.where(
-                        loss_mask,
-                        torch.arange(completion_ids.size(1), device=device).unsqueeze(0),
-                        torch.tensor(-1, device=device)
-                    )
-                    last_token_indices = gen_indices.max(dim=1).values
-                    missing_eos_mask = ~dones & (last_token_indices >= 0)
+                    missing_eos_mask = (~has_eos) & valid_indices_mask
                     if missing_eos_mask.any():
-                        m_batch = torch.arange(padded_prompt_ids.size(0), device=device)[missing_eos_mask]
+                        m_batch = batch_range[missing_eos_mask]
                         m_last = last_token_indices[missing_eos_mask]
                         env_rewards_tensor[m_batch, m_last] -= self.ppo_config.missing_eos_penalty
 
@@ -661,15 +791,15 @@ class PPOTrainer(BaseTrainer):
                 raw_reward_mean = env_rewards_masked.sum(dim=1).mean()
 
                 if self.ppo_config.normalize_rewards:
+                    # 基于整条轨迹的累计回报 (Trajectory Return) 进行尺度缩放，
+                    # 避免将海量全零 Token 纳入方差统计导致 batch_std 被严重稀释进而将奖励错误放大数十倍
+                    trajectory_returns = env_rewards_masked.sum(dim=-1)
                     if self.reward_normalizer:
-                        # 仅提取 valid token 的 reward 更新 RunningMeanStd
-                        valid_rewards = env_rewards_masked[loss_mask]
-                        self.reward_normalizer.update(valid_rewards)
+                        self.reward_normalizer.update(trajectory_returns)
                         env_rewards_masked = self.reward_normalizer(env_rewards_masked, shift_mean=False) * loss_mask.float()
                     else:
-                        valid_rewards = env_rewards_masked[loss_mask]
-                        if valid_rewards.numel() > 1:
-                            batch_std = valid_rewards.std()
+                        if trajectory_returns.numel() > 1:
+                            batch_std = trajectory_returns.std()
                             if not torch.isnan(batch_std) and batch_std > 1e-8:
                                 env_rewards_masked = (env_rewards_masked / batch_std) * loss_mask.float()
 
@@ -678,7 +808,7 @@ class PPOTrainer(BaseTrainer):
             elif env_rewards_tensor.dim() == 1:
                 # 1D 轨迹级标量奖励 [batch_size]
                 if self.ppo_config.missing_eos_penalty is not None:
-                    env_rewards_tensor[~dones] -= self.ppo_config.missing_eos_penalty
+                    env_rewards_tensor[~has_eos] -= self.ppo_config.missing_eos_penalty
 
                 raw_reward_mean = env_rewards_tensor.mean()
 
@@ -692,17 +822,8 @@ class PPOTrainer(BaseTrainer):
                             batch_std = 1.0
                         env_rewards_tensor = (env_rewards_tensor - raw_reward_mean) / batch_std
 
-                gen_indices = torch.where(
-                    loss_mask,
-                    torch.arange(completion_ids.size(1), device=device).unsqueeze(0),
-                    torch.tensor(-1, device=device)
-                )
-
-                last_token_indices = gen_indices.max(dim=1).values
-                valid_indices_mask = last_token_indices >= 0
-
                 if valid_indices_mask.any():
-                    valid_batch_indices = torch.arange(padded_prompt_ids.size(0), device=device)[valid_indices_mask]
+                    valid_batch_indices = batch_range[valid_indices_mask]
                     valid_last_token_indices = last_token_indices[valid_indices_mask]
                     valid_env_rewards = env_rewards_tensor[valid_indices_mask]
                     rewards[valid_batch_indices, valid_last_token_indices] += valid_env_rewards
@@ -749,7 +870,7 @@ class PPOTrainer(BaseTrainer):
         last_values = comp_values[batch_indices, valid_lengths]  # [batch_size]
 
         advantages, returns = self._compute_advantages_and_returns(
-            rewards, values_for_gae, last_values, completion_pad_mask, dones
+            rewards, values_for_gae, last_values, completion_pad_mask, dones, action_mask=loss_mask
         )
 
         advantages_whitened = masked_whiten(advantages, loss_mask, shift_mean=True)
@@ -780,7 +901,6 @@ class PPOTrainer(BaseTrainer):
                 mb_attention_mask = attention_mask[mini_batch_indices]
                 mb_completion_ids = completion_ids[mini_batch_indices]
                 mb_loss_mask = loss_mask[mini_batch_indices]
-                mb_completion_pad_mask = completion_pad_mask[mini_batch_indices]
                 mb_old_log_probs = old_log_probs[mini_batch_indices]
                 mb_values = values_for_gae[mini_batch_indices]
                 mb_returns = returns[mini_batch_indices]
@@ -811,12 +931,12 @@ class PPOTrainer(BaseTrainer):
                         returns=mb_returns,
                         advantages=mb_advantages,
                         mask=mb_loss_mask,
-                        value_mask=mb_completion_pad_mask
+                        value_mask=mb_loss_mask
                     )
 
                     with torch.no_grad():
-                        value_mean = (mb_values * mb_completion_pad_mask).sum() / mb_completion_pad_mask.sum().clamp(min=1.0)
-                        return_mean = (mb_returns * mb_completion_pad_mask).sum() / mb_completion_pad_mask.sum().clamp(min=1.0)
+                        value_mean = (mb_values * mb_loss_mask).sum() / mb_loss_mask.sum().clamp(min=1.0)
+                        return_mean = (mb_returns * mb_loss_mask).sum() / mb_loss_mask.sum().clamp(min=1.0)
                         value_error = value_mean - return_mean
                         completion_len = mb_loss_mask.sum(dim=-1).float().mean()
 
@@ -940,7 +1060,27 @@ class PPOTrainer(BaseTrainer):
 
                 for batch, batch_data in enumerate(data_iterator):
                     batch = skip_batches + batch
-                    rollout_data = self._generate_rollout_data(batch_data)
+                    rollout_data = None
+                    rollout_error = None
+
+                    try:
+                        rollout_data = self._generate_rollout_data(batch_data)
+                    except Exception as e:
+                        rollout_error = e
+
+                    # 跨卡同步本批次 Rollout 是否在所有 Rank 上均成功完成，防止单卡崩溃引发死锁
+                    if TrainerTools().parallel.parallel_train:
+                        has_rollout_err = torch.tensor(1 if rollout_error is not None else 0, device=TrainerTools().parallel.device, dtype=torch.int32)
+                        dist.all_reduce(has_rollout_err, op=dist.ReduceOp.MAX)
+                        if has_rollout_err.item() > 0:
+                            if rollout_error is not None:
+                                self._on_exception(rollout_error, epoch, batch)
+                            else:
+                                if TrainerTools().parallel.is_main_process:
+                                    Logger.std_log(f"WARN: Rollout failed on a peer rank in epoch {epoch}, batch {batch + 1}. Aborting to prevent collective deadlock.")
+                                raise RuntimeError(f"Rollout failed on a peer rank in epoch {epoch}, batch {batch + 1}.")
+                    elif rollout_error is not None:
+                        self._on_exception(rollout_error, epoch, batch)
 
                     try:
                         ppo_stats = self._ppo_learning_phase(rollout_data)

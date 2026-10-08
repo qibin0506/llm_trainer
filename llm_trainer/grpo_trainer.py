@@ -91,10 +91,44 @@ class GRPOTrainer(BaseTrainer):
                     "Your `loss_importance_sampling_level` setting will be ignored for the Gamma weights computation."
                 )
 
+        # 校验 clip_eps 与重要性采样级别的匹配性
+        if self.grpo_config.loss_importance_sampling_level == "sequence" and self.grpo_config.loss_clip_eps > 0.05:
+            if TrainerTools().parallel.is_main_process:
+                Logger.std_log(
+                    f"WARN: `loss_importance_sampling_level` is 'sequence' (e.g. GSPO/LUSPO), but `loss_clip_eps` is set to "
+                    f"{self.grpo_config.loss_clip_eps} (> 0.05). For sequence-level importance sampling, smaller epsilons "
+                    f"(such as 3e-4 ~ 4e-4) are standard to prevent ratio explosion. Please verify your config."
+                )
+        elif self.grpo_config.loss_importance_sampling_level == "token" and self.grpo_config.loss_clip_eps < 1e-2:
+            if TrainerTools().parallel.is_main_process:
+                Logger.std_log(
+                    f"WARN: `loss_importance_sampling_level` is 'token', but `loss_clip_eps` is set to "
+                    f"{self.grpo_config.loss_clip_eps} (< 0.01). This will cause severe over-clipping for token-level GRPO. "
+                    f"Consider using standard clip epsilon (e.g. 0.2)."
+                )
+
+        # 校验生成采样参数与策略求值分布的一致性
+        gen_cfg = self.grpo_config.generate_config
+        if gen_cfg.top_p < 1.0 or (gen_cfg.top_k is not None and gen_cfg.top_k > 0) or gen_cfg.repetition_penalty != 1.0:
+            if TrainerTools().parallel.is_main_process:
+                Logger.std_log(
+                    f"WARN: Rollout generate_config uses truncation or penalties (top_p={gen_cfg.top_p}, "
+                    f"top_k={gen_cfg.top_k}, repetition_penalty={gen_cfg.repetition_penalty}). "
+                    f"This creates discrepancy between the sampling distribution and the un-truncated log_softmax evaluation. "
+                    f"For on-policy RL, top_p=1.0, top_k=None, and repetition_penalty=1.0 are recommended."
+                )
+
     def _init_ref_model(self):
         # beta == 0，不需要ref_model
         if self.grpo_config.loss_beta == 0.0:
             return None
+
+        if not self.grpo_config.ref_model_weights_path:
+            raise ValueError(
+                "GRPO `loss_beta` > 0 requires a reference model to compute KL divergence, "
+                "but `ref_model_weights_path` is not configured! "
+                "Please configure `ref_model_weights_path` in GRPOConfig to prevent using randomly initialized weights in distributed training."
+            )
 
         parallel_kwargs = self._init_ref_model_args(self.train_config.model_config)
         with self._new_model_context(parallel_kwargs):
@@ -104,8 +138,7 @@ class GRPOTrainer(BaseTrainer):
         for param in ref_model.parameters():
             param.requires_grad = False
 
-        if self.grpo_config.ref_model_weights_path is not None:
-            self._load_external_weights(ref_model, self.grpo_config.ref_model_weights_path)
+        self._load_external_weights(ref_model, self.grpo_config.ref_model_weights_path)
 
         ref_model, _ = TrainerTools().parallel.process(
             model=ref_model,
@@ -215,18 +248,106 @@ class GRPOTrainer(BaseTrainer):
 
         # Compute mean and standard deviation for each prompt group: [batch]
         group_means = rewards_by_group.mean(dim=1)
-        group_stds = torch.nan_to_num(rewards_by_group.std(dim=1, unbiased=False), nan=0.0)
-
-        # Expand the means and stds to match the original flat rewards tensor shape: [batch*group_size]
         expanded_means = group_means.repeat_interleave(group_size)
-        expanded_stds = group_stds.repeat_interleave(group_size)
 
-        is_flat = expanded_stds < 1e-6
-        norm_adv = (rewards_fp32 - expanded_means) / (expanded_stds + 1e-4)
-        advantages = torch.where(is_flat, torch.zeros_like(norm_adv), norm_adv)
+        # 判断是否进行标准差 (std) 缩放：
+        # 若 scale_rewards 为 None，当 loss_type == 'dr_grpo' 时默认设为 False（符合 Dr. GRPO 算法规范），其他模式默认设为 True
+        scale_rewards = self.grpo_config.scale_rewards
+        if scale_rewards is None:
+            scale_rewards = (self.grpo_config.loss_type != "dr_grpo")
+
+        if scale_rewards:
+            group_stds = torch.nan_to_num(rewards_by_group.std(dim=1, unbiased=False), nan=0.0)
+            expanded_stds = group_stds.repeat_interleave(group_size)
+
+            is_flat = expanded_stds < 1e-6
+            norm_adv = (rewards_fp32 - expanded_means) / (expanded_stds + 1e-4)
+            advantages = torch.where(is_flat, torch.zeros_like(norm_adv), norm_adv)
+        else:
+            # Dr. GRPO 核心改动：去掉组内 std 归一化，仅做均值中心化
+            advantages = rewards_fp32 - expanded_means
+
         advantages = torch.nan_to_num(advantages, nan=0.0, posinf=0.0, neginf=0.0)
 
         return advantages.to(dtype=rewards.dtype).unsqueeze(1)
+
+    def _compute_multi_turn_advantages(
+            self,
+            rewards_tensor: torch.Tensor,
+            loss_mask: torch.Tensor,
+            gamma: float = 1.0
+    ) -> torch.Tensor:
+        """
+        针对多轮交互 Agent 的因果时序信用分配 (Causal Reward-to-Go + Action-level Bridge Discount)。
+
+        - 轮内 Token: 属于同一次模型输出，共享本轮及未来的折现回报，轮内不额外衰减；
+        - 跨轮跃迁: 越过环境 Feedback 区间时乘以跨轮折扣 gamma；
+        - 组内对齐: 基于同 Prompt 组且在同一交互轮次内对齐计算基线均值与标准差，彻底消除跨轮时序负偏移偏差。
+        """
+        batch_size, seq_len = rewards_tensor.shape
+        group_size = self.grpo_config.group_size
+        device = rewards_tensor.device
+
+        # 1. 识别每个 Token 所属的 Action 交互轮次 (Turn ID)
+        # Action 区间为 loss_mask == True 的连续段，每个连续段对应一次模型生成的交互轮次
+        is_turn_start = loss_mask & torch.cat(
+            [loss_mask.new_ones(batch_size, 1), ~loss_mask[:, :-1]],
+            dim=1
+        )
+        turn_ids = torch.cumsum(is_turn_start.long(), dim=1)  # [batch_size, seq_len]
+        max_turns = turn_ids.max().item()
+
+        # 若全序列无任何有效生成 Token，直接返回全零
+        if max_turns == 0:
+            return torch.zeros_like(rewards_tensor)
+
+        # 2. 统计各样本在每个交互轮次所获得的有效奖励 (Turn Rewards)
+        # 屏蔽非生成位置（Feedback / Pad）的噪声
+        masked_rewards = (rewards_tensor * loss_mask.float()).float()
+        valid_turn_ids = torch.where(loss_mask, turn_ids, torch.zeros_like(turn_ids))
+
+        turn_rewards = torch.zeros(batch_size, max_turns + 1, device=device, dtype=torch.float32)
+        turn_rewards.scatter_add_(dim=1, index=valid_turn_ids, src=masked_rewards)
+
+        # 3. 按因果时序反向累积计算各轮次的未来折现回报 (Turn-level Return-to-Go)
+        # G_{i, k} = R_{i, k} + gamma * G_{i, k+1}
+        turn_returns = torch.zeros(batch_size, max_turns + 1, device=device, dtype=torch.float32)
+        running_return = torch.zeros(batch_size, device=device, dtype=torch.float32)
+        for k in range(max_turns, 0, -1):
+            running_return = turn_rewards[:, k] + gamma * running_return
+            turn_returns[:, k] = running_return
+
+        # 4. 组内对齐基线：按同 Prompt 组和同一交互轮次，分别计算基线均值与方差
+        # 提取有效轮次 1..max_turns，形状为 [num_groups, group_size, max_turns]
+        returns_by_group = turn_returns[:, 1:].view(-1, group_size, max_turns)
+        group_means = returns_by_group.mean(dim=1, keepdim=True)  # [num_groups, 1, max_turns]
+
+        scale_rewards = self.grpo_config.scale_rewards
+        if scale_rewards is None:
+            scale_rewards = (self.grpo_config.loss_type != "dr_grpo")
+
+        if scale_rewards:
+            group_stds = torch.nan_to_num(
+                returns_by_group.std(dim=1, unbiased=False, keepdim=True),
+                nan=0.0
+            )
+            is_flat = group_stds < 1e-6
+            turn_adv = (returns_by_group - group_means) / (group_stds + 1e-4)
+            turn_adv = torch.where(is_flat, torch.zeros_like(turn_adv), turn_adv)
+        else:
+            turn_adv = returns_by_group - group_means
+
+        # 5. 将各轮次标准化优势值精确广播映射回对应 Action Token
+        turn_adv = turn_adv.view(batch_size, max_turns)
+        turn_adv_padded = torch.cat(
+            [torch.zeros(batch_size, 1, device=device, dtype=turn_adv.dtype), turn_adv],
+            dim=1
+        )
+
+        advantages = torch.gather(turn_adv_padded, dim=1, index=turn_ids)
+        advantages = torch.where(loss_mask, advantages, torch.zeros_like(advantages))
+        advantages = torch.nan_to_num(advantages, nan=0.0, posinf=0.0, neginf=0.0)
+        return advantages.to(dtype=rewards_tensor.dtype)
 
     def _generate_rollout_data(self, batch_data: List[dict]):
         prompt_ids = [item["prompt"] for item in batch_data]
@@ -252,14 +373,24 @@ class GRPOTrainer(BaseTrainer):
         padded_prompt_ids = padded_prompt_ids.repeat_interleave(group_size, 0)
         prompt_masks = self._calc_attention_mask(padded_prompt_ids)
 
-        max_new_tokens = self.grpo_config.generate_config.max_seq_len - prompt_len
-        if max_new_tokens <= 0:
-            raise ValueError(
-                f"Prompt length ({prompt_len}) >= max_seq_len ({self.grpo_config.generate_config.max_seq_len}). "
-                f"Cannot generate any tokens. Please increase max_seq_len or reduce dataset_block_size."
-            )
+        max_seq_len = self.grpo_config.generate_config.max_seq_len
+        if prompt_len >= max_seq_len:
+            max_allowed_prompt_len = max(1, max_seq_len - 16)
+            if TrainerTools().parallel.is_main_process:
+                Logger.std_log(
+                    f"WARN: [Rank {TrainerTools().parallel.global_rank}] Prompt length ({prompt_len}) >= max_seq_len ({max_seq_len}). "
+                    f"Truncating prompt to last {max_allowed_prompt_len} tokens to leave generation budget and prevent rank abort."
+                )
+            padded_prompt_ids = padded_prompt_ids[:, -max_allowed_prompt_len:]
+            prompt_masks = self._calc_attention_mask(padded_prompt_ids)
+            prompt_len = padded_prompt_ids.shape[1]
+
+        max_new_tokens = max(1, max_seq_len - prompt_len)
 
         external_gen_mask = None
+        dones_list = None
+        feedbacks_list = None
+        padded_gen_masks = []
         with torch.no_grad():
             if self.generation_service is not None:
                 service_output = self.generation_service(
@@ -268,6 +399,8 @@ class GRPOTrainer(BaseTrainer):
                 )
 
                 completion_ids_list = service_output['completions']
+                dones_list = service_output.get('dones', None)
+                feedbacks_list = service_output.get('feedbacks', None)
                 gen_masks_list = service_output.get('generation_masks', None)
 
                 if gen_masks_list is not None:
@@ -278,6 +411,14 @@ class GRPOTrainer(BaseTrainer):
                 max_comp_len = max((len(c) for c in completion_ids_list), default=0)
                 if max_comp_len == 0:
                     max_comp_len = 1
+
+                if max_comp_len > max_new_tokens:
+                    if TrainerTools().parallel.is_main_process:
+                        Logger.std_log(
+                            f"WARN: generation_service returned completions of length {max_comp_len} "
+                            f"exceeding max_new_tokens ({max_new_tokens}). Completions will be truncated."
+                        )
+
                 max_comp_len = min(max_comp_len, max_new_tokens)
 
                 for idx, comp in enumerate(completion_ids_list):
@@ -328,6 +469,7 @@ class GRPOTrainer(BaseTrainer):
                         for comp in chunk_completions
                     ]
                     completion_ids = torch.cat(padded_comps, dim=0)
+                    dones_list = torch.any(completion_ids == TrainerTools().tokenizer.end, dim=1).cpu().tolist()
 
             completion_pad_mask = completion_ids != pad_token_id
             if external_gen_mask is not None:
@@ -359,7 +501,22 @@ class GRPOTrainer(BaseTrainer):
         else:
             repeated_ptx_data = []
 
-        raw_rewards = self.reward_func(repeated_prompt_ids, completion_ids.cpu(), repeated_gt_answer_ids)
+        extra_reward_kwargs = {}
+        if dones_list is not None:
+            extra_reward_kwargs['dones'] = dones_list
+        if padded_gen_masks:
+            extra_reward_kwargs['generation_masks'] = padded_gen_masks
+        elif external_gen_mask is not None:
+            extra_reward_kwargs['generation_masks'] = external_gen_mask.cpu()
+        if feedbacks_list is not None:
+            extra_reward_kwargs['feedbacks'] = feedbacks_list
+
+        raw_rewards = self._call_reward_func(
+            repeated_prompt_ids,
+            completion_ids.cpu(),
+            repeated_gt_answer_ids,
+            **extra_reward_kwargs
+        )
         if isinstance(raw_rewards, torch.Tensor):
             rewards_tensor = raw_rewards.to(dtype=torch.float32, device=TrainerTools().parallel.device)
         else:
@@ -369,21 +526,60 @@ class GRPOTrainer(BaseTrainer):
                 device=TrainerTools().parallel.device
             )
 
+        # 计算每个样本在模型生成区域（action tokens）的最后一个有效 Token 位置与结束符判断
+        eos_token_id = TrainerTools().tokenizer.end
+        gen_indices = torch.where(
+            loss_mask,
+            torch.arange(completion_ids.size(1), device=device).unsqueeze(0),
+            torch.tensor(-1, device=device)
+        )
+        last_token_indices = gen_indices.max(dim=1).values
+        valid_indices_mask = last_token_indices >= 0
+        batch_range = torch.arange(completion_ids.size(0), device=device)
+
+        if external_gen_mask is not None:
+            # 多轮 Agent 模式：以模型最后一个有效 action token 是否为 eos_token_id 判定是否正常结束
+            last_action_tokens = torch.where(
+                valid_indices_mask,
+                completion_ids[batch_range, last_token_indices.clamp(min=0)],
+                torch.tensor(pad_token_id, device=device)
+            )
+            has_eos = (last_action_tokens == eos_token_id) & valid_indices_mask
+        else:
+            # 单轮模式：只要 completion 中包含 eos_token_id 即视为正常结束
+            has_eos = torch.any(completion_ids == eos_token_id, dim=1)
+
+        if getattr(self.grpo_config, 'missing_eos_penalty', None) is not None:
+            penalty = self.grpo_config.missing_eos_penalty
+            if rewards_tensor.dim() == 2:
+                missing_eos_mask = (~has_eos) & valid_indices_mask
+                if missing_eos_mask.any():
+                    m_batch = batch_range[missing_eos_mask]
+                    m_last = last_token_indices[missing_eos_mask]
+                    rewards_tensor[m_batch, m_last] -= penalty
+            elif rewards_tensor.dim() == 1:
+                rewards_tensor[~has_eos] -= penalty
+
         if rewards_tensor.dim() == 2:
             # 2D 逐 Token / 稠密序列奖励: [batch * group_size, seq_len]
             assert rewards_tensor.shape == completion_ids.shape, (
                 f"2D dense reward shape {rewards_tensor.shape} must match completion_ids shape {completion_ids.shape}"
             )
-            # 屏蔽非生成位置后求和，得到整条轨迹的累积得分
+            # 多轮因果时序信用分配 (Reward-to-Go + Action-level Bridge Discount)
+            advantages = self._compute_multi_turn_advantages(
+                rewards_tensor=rewards_tensor,
+                loss_mask=loss_mask,
+                gamma=getattr(self.grpo_config, 'gamma', 1.0)
+            )
+            # 屏蔽非生成位置后求和，得到整条轨迹的累积得分（用于日志统计）
             masked_rewards = rewards_tensor * loss_mask.float()
             rewards = masked_rewards.sum(dim=-1)
         elif rewards_tensor.dim() == 1:
             # 1D 标量轨迹奖励: [batch * group_size]
             rewards = rewards_tensor
+            advantages = self._compute_group_relative_advantages(rewards)
         else:
             raise ValueError(f"Unsupported reward dimension: {rewards_tensor.dim()}, expected 1 or 2.")
-
-        advantages = self._compute_group_relative_advantages(rewards)
 
         return {
             'input_ids': input_ids.detach(),
@@ -395,6 +591,7 @@ class GRPOTrainer(BaseTrainer):
             'advantages': advantages.detach(),
             'rewards': rewards.detach(),
             'ptx_data': repeated_ptx_data,
+            'max_new_tokens': max_new_tokens,
         }
 
     def _grpo_learning_phase(self, rollout_data: dict):
@@ -428,6 +625,22 @@ class GRPOTrainer(BaseTrainer):
         global_micro_batch_idx = 0
         has_ptx = self.ptx_criterion is not None and len(ptx_data) > 0
 
+        # 计算全局 Token 级归一化因子（用于 DAPO / BNPO 等消除 micro-batch 划分造成的长度梯度权重偏差）
+        use_global_token_norm = (self.grpo_config.token_level_loss_norm == "global")
+        if use_global_token_norm:
+            local_total_tokens = loss_mask.sum().float()
+            num_micro_batches_local = (total_samples + grpo_batch_size - 1) // grpo_batch_size
+            if TrainerTools().parallel.parallel_train and dist.is_initialized():
+                global_total_tokens = local_total_tokens.clone()
+                dist.all_reduce(global_total_tokens, op=dist.ReduceOp.SUM)
+                total_micro_batches_global = num_micro_batches_local * TrainerTools().parallel.world_size
+                avg_tokens_per_mb = (global_total_tokens / max(total_micro_batches_global, 1)).item()
+            else:
+                avg_tokens_per_mb = (local_total_tokens / max(num_micro_batches_local, 1)).item()
+            avg_tokens_per_mb = max(avg_tokens_per_mb, 1.0)
+        else:
+            avg_tokens_per_mb = None
+
         for grpo_epoch in range(self.grpo_config.grpo_epochs):
             indices = torch.randperm(total_samples, device=device)
 
@@ -436,12 +649,21 @@ class GRPOTrainer(BaseTrainer):
 
                 mb_input_ids = input_ids[mini_batch_indices]
                 mb_attention_mask = attention_mask[mini_batch_indices]
+                mb_completion_ids = completion_ids[mini_batch_indices]
                 mb_loss_mask = loss_mask[mini_batch_indices]
-                actual_completion_len = mb_loss_mask.sum(dim=-1).float().mean().item()
                 mb_old_log_probs = old_log_probs[mini_batch_indices]
                 mb_ref_log_probs = ref_log_probs[mini_batch_indices] if ref_log_probs is not None else None
-                mb_completion_ids = completion_ids[mini_batch_indices]
                 mb_advantages = advantages[mini_batch_indices]
+
+                actual_completion_len = mb_loss_mask.sum(dim=-1).float().mean().item()
+                if self.grpo_config.loss_type == "dr_grpo":
+                    completion_len_for_loss = (
+                        self.grpo_config.dr_grpo_max_completion_len
+                        or rollout_data.get('max_new_tokens')
+                        or mb_completion_ids.size(1)
+                    )
+                else:
+                    completion_len_for_loss = actual_completion_len
 
                 with autocast(TrainerTools().parallel.device_type):
                     log_probs, aux_loss = self._compute_completion_log_probs(
@@ -454,7 +676,8 @@ class GRPOTrainer(BaseTrainer):
                         ref_log_probs=mb_ref_log_probs,
                         completion_mask=mb_loss_mask,
                         advantages=mb_advantages,
-                        completion_len=actual_completion_len
+                        completion_len=completion_len_for_loss,
+                        avg_tokens_per_micro_batch=avg_tokens_per_mb
                     )
 
                     with torch.no_grad():
@@ -592,7 +815,27 @@ class GRPOTrainer(BaseTrainer):
                         Logger.std_log(f'start generate for batch {batch + 1}/{batch_count_per_file}')
 
                     # 生成数据
-                    rollout_data = self._generate_rollout_data(batch_data)
+                    rollout_data = None
+                    rollout_error = None
+
+                    try:
+                        rollout_data = self._generate_rollout_data(batch_data)
+                    except Exception as e:
+                        rollout_error = e
+
+                    # 跨卡同步本批次 Rollout 是否在所有 Rank 上均成功完成，防止单卡崩溃引发死锁
+                    if TrainerTools().parallel.parallel_train:
+                        has_rollout_err = torch.tensor(1 if rollout_error is not None else 0, device=TrainerTools().parallel.device, dtype=torch.int32)
+                        dist.all_reduce(has_rollout_err, op=dist.ReduceOp.MAX)
+                        if has_rollout_err.item() > 0:
+                            if rollout_error is not None:
+                                self._on_exception(rollout_error, epoch, batch)
+                            else:
+                                if TrainerTools().parallel.is_main_process:
+                                    Logger.std_log(f"WARN: Rollout failed on a peer rank in epoch {epoch}, batch {batch + 1}. Aborting to prevent collective deadlock.")
+                                raise RuntimeError(f"Rollout failed on a peer rank in epoch {epoch}, batch {batch + 1}.")
+                    elif rollout_error is not None:
+                        self._on_exception(rollout_error, epoch, batch)
                     # end generate
 
                     try:

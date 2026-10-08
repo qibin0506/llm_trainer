@@ -33,14 +33,12 @@ def save_ds_checkpoint(
     else:
         ckpt_dir = os.environ.get('CHECKPOINT_DIR', './checkpoints')
 
-    try:
-        # 包括model、optimizer等状态
-        model.save_checkpoint(save_dir=ckpt_dir)
-    except: ...
+    # 包括model、optimizer等状态。直接执行保存，避免静默吞异常导致多卡集合通信死锁
+    model.save_checkpoint(save_dir=ckpt_dir)
 
     # 只在main rank上执行
     if TrainerTools().parallel.is_main_process:
-        if extra_module:
+        if extra_module is not None:
             torch.save(extra_module.state_dict(), os.path.join(ckpt_dir, "extra_module_state_dict.pt"))
 
         # 最多保存多少checkpoint，默认为2
@@ -52,7 +50,8 @@ def save_ds_checkpoint(
             oldest_ckpt = sorted(ckpt_paths, key=os.path.getmtime)[0]
             try:
                 shutil.rmtree(oldest_ckpt)
-            except: ...
+            except OSError:
+                pass
 
     TrainerTools().parallel.wait('remove old ds checkpoint')
 
@@ -77,7 +76,7 @@ def load_ds_checkpoint(
         )
 
         path = os.path.join(ckpt_dir, "extra_module_state_dict.pt")
-        if os.path.exists(path):
+        if extra_module is not None and os.path.exists(path):
             state = torch.load(path, map_location=TrainerTools().parallel.device, weights_only=True)
             extra_module.load_state_dict(state)
 

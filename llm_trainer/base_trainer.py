@@ -1,8 +1,9 @@
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Optional, Tuple, List, Dict, Any, Union
 import os
 import copy
 import gc
 import math
+import inspect
 import importlib.metadata
 from packaging import version
 from itertools import islice
@@ -258,7 +259,7 @@ class BaseTrainer:
 
         self._check_freeze_llm_model(model)
 
-        if self.train_config.gradient_checkpointing:
+        if self.train_config.is_gradient_checkpointing:
             if self.is_ds:
                 import deepspeed
                 model.gradient_checkpointing_enable(checkpoint_func=deepspeed.checkpointing.checkpoint)
@@ -306,7 +307,7 @@ class BaseTrainer:
                 ds_muon = _get_ds_muon(all_groups)
 
                 if ds_muon is None:
-                    raise RuntimeError('Current deepspeed is not support muon')
+                    raise RuntimeError('Current DeepSpeed version does not support Muon optimizer.')
                 return ds_muon
 
             return MuonWithAdamW(
@@ -363,9 +364,9 @@ class BaseTrainer:
             if self.train_config.optim_config.optim_type == 'lion':
                 try:
                     import lion_pytorch
-                except:
-                    raise Exception(
-                        'lion is not detected, please use `pip3 install lion_pytorch` to install or set optim_type to adam')
+                except ImportError:
+                    raise ImportError(
+                        'lion_pytorch is not installed. Please run `pip install lion_pytorch` to install or set optim_type to adam.')
 
                 optimizer = lion_pytorch.Lion
             else:
@@ -539,6 +540,33 @@ class BaseTrainer:
 
         return parallel_kwargs
 
+    def _call_reward_func(
+            self,
+            prompt_ids: List[torch.Tensor],
+            completion_ids: torch.Tensor,
+            gt_answer_ids: List[Optional[torch.Tensor]],
+            **extra_kwargs
+    ) -> Union[List[float], List[List[float]], torch.Tensor]:
+        if not hasattr(self, 'reward_func') or self.reward_func is None:
+            raise RuntimeError("reward_func is not defined on trainer.")
+
+        try:
+            sig = inspect.signature(self.reward_func)
+            has_var_keyword = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+            if has_var_keyword:
+                return self.reward_func(prompt_ids, completion_ids, gt_answer_ids, **extra_kwargs)
+
+            accepted_kwargs = {
+                k: v for k, v in extra_kwargs.items()
+                if k in sig.parameters
+            }
+            return self.reward_func(prompt_ids, completion_ids, gt_answer_ids, **accepted_kwargs)
+        except (ValueError, TypeError):
+            try:
+                return self.reward_func(prompt_ids, completion_ids, gt_answer_ids, **extra_kwargs)
+            except TypeError:
+                return self.reward_func(prompt_ids, completion_ids, gt_answer_ids)
+
     def _create_dataset(self, file_idx) -> Tuple[Dataset, str]: ...
 
     def _calc_loss(self, inputs, attention_mask, result, labels, model: Optional[torch.nn.Module] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]: ...
@@ -610,6 +638,24 @@ class BaseTrainer:
 
         return True
 
+    def _reset_ds_gradient_accumulation_boundary(self):
+        """
+        安全重置 DeepSpeed Engine 与 ZeRO Optimizer 的梯度累积边界状态。
+        DeepSpeed 内部 ZeROOptimizer.set_gradient_accumulation_boundary(is_boundary)
+        在接收 None 时会执行 bool(None) 得到 False，导致 optimizer 内部状态泄漏锁死为 False。
+        此处在将 engine 重置为 None (恢复基于 micro_steps 自动计数模式) 的同时，
+        显式将 optimizer 的 _is_gradient_accumulation_boundary 复位为默认的 True。
+        """
+        if not self.is_ds:
+            return
+
+        self.train_model.set_gradient_accumulation_boundary(None)
+        if hasattr(self.train_model, 'optimizer') and hasattr(self.train_model.optimizer, '_is_gradient_accumulation_boundary'):
+            self.train_model.optimizer._is_gradient_accumulation_boundary = True
+
+        if hasattr(self.train_model, 'micro_steps'):
+            self.train_model.micro_steps = 0
+
     def _update_step(self, is_last_step: bool = False):
         self._apply_grad_clipping()
         overflow = False
@@ -620,9 +666,7 @@ class BaseTrainer:
                 overflow = self.train_model.optimizer.overflow
 
             if is_last_step:
-                self.train_model._is_gradient_accumulation_boundary = None
-                if hasattr(self.train_model, 'micro_steps'):
-                    self.train_model.micro_steps = 0
+                self._reset_ds_gradient_accumulation_boundary()
         else:
             scale_before = self.scaler.get_scale()
             self._apply_step()
@@ -664,10 +708,18 @@ class BaseTrainer:
             epoch: int,
             batch: int
     ):
-        exception_file = e.__traceback__.tb_frame.f_globals["__file__"]
-        exception_line = e.__traceback__.tb_lineno
-        log_msg = f"epoch: {epoch}, batch: {batch} -> {e} at {exception_file} line {exception_line}"
-        Logger('exception.txt').log(log_msg, log_to_console=False).release()
+        import traceback
+        tb_str = traceback.format_exc()
+        rank = TrainerTools().parallel.global_rank if hasattr(TrainerTools(), 'parallel') else 0
+        log_msg = f"[Rank {rank}] Exception at epoch: {epoch}, batch: {batch} -> {e}\n{tb_str}"
+        Logger('exception.txt').log(log_msg, log_to_console=True).release()
+
+        # 在分布式环境下主动销毁通信组，使得其他卡能立刻探测到通信断开并退出，避免 NCCL 集合通信卡死 30 分钟
+        if dist.is_available() and dist.is_initialized():
+            try:
+                dist.destroy_process_group()
+            except Exception:
+                pass
 
         raise e
 

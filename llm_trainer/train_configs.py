@@ -396,6 +396,7 @@ class PPOConfig:
         gamma (`float`): 优势函数 (GAE) 中的折扣因子 (Discount Factor)，决定长期奖励的衰减。
         lam (`float`): GAE 中的 lambda 参数，权衡偏差与方差。
         clip_eps (`float`): PPO 的核心裁剪阈值，限制新旧策略更新的步长差距，防止更新崩溃。
+        value_clip_eps (`Optional[float]`): Critic 价值函数更新的裁剪阈值。若为 None 则默认使用 clip_eps。可设为更大值以适应不同 Reward 尺度，或设为 0 关闭价值裁剪。
         vf_coef (`float`): 总 Loss 中 Value Loss 的权重系数。
         kl_beta (`float`): 基于 KL 散度的初始惩罚奖励系数。
         kl_estimator (`str`): 计算近似 KL 散度的方法，支持 "k1" (log ratio) 或 "k3" (严格近似)。
@@ -404,7 +405,7 @@ class PPOConfig:
         missing_eos_penalty (`Optional[float]`): 针对模型未能正常生成 EOS (结束符) 的硬性奖励惩罚值。
         normalize_rewards (`bool`): 是否在喂给 GAE 前对环境 Reward 进行标准化。
         normalize_method (`str`): Reward 标准化方法，"RunningMeanStd" (流式均值方差) 或 "BatchStd" (当前批次方差)。
-        generate_config (`GenerateConfig`): PPO Rollout 交互生成数据时的解码策略。
+        generate_config (`GenerateConfig`): PPO Rollout 交互生成数据时的解码策略 (RL 默认 top_p=1.0 保证采样与求值无偏)。
     """
     ppo_epochs: int
     ppo_batch_size: int
@@ -416,6 +417,7 @@ class PPOConfig:
     gamma: float = 1.0
     lam: float = 0.95
     clip_eps: float = 0.1
+    value_clip_eps: Optional[float] = None
     vf_coef: float = 0.1
     kl_beta: float = 0.02
     kl_estimator: str = 'k1'
@@ -424,7 +426,7 @@ class PPOConfig:
     missing_eos_penalty: Optional[float] = None
     normalize_rewards: bool = False
     normalize_method: str = 'RunningMeanStd'
-    generate_config: GenerateConfig = field(default_factory=GenerateConfig)
+    generate_config: GenerateConfig = field(default_factory=lambda: GenerateConfig(top_p=1.0))
 
 
 @dataclass(kw_only=True)
@@ -439,8 +441,8 @@ class GRPOConfig:
         gradient_accumulation_steps (`int`): 梯度累积步数。
         chunked_log_probs_size (`Optional[int]`): 评估/前向阶段（计算旧策略及参考模型 Log Prob）的 Batch 分块大小，用于降低显存峰值。
         loss_beta (`float`): KL 惩罚强度。在特定模式下(loss_importance_sampling_level=sequence) 可设为 0.0 改为隐式约束。
-        loss_clip_eps (`float`): PPO 基础截断的下限 epsilon。
-        loss_clip_eps_high (`Optional[float]`): 不对称裁剪中的上限 epsilon。
+        loss_clip_eps (`float`): PPO 基础截断的下限 epsilon (token 级截断推荐 0.2，sequence 级截断如 GSPO 推荐 3e-4)。
+        loss_clip_eps_high (`Optional[float]`): 不对称裁剪中的上限 epsilon (若为 None 则对称裁剪)。
         loss_delta (`Optional[float]`): Advantage 权重的绝对上限阈值。
         loss_importance_sampling_level (`str`): 组相对优化的计算层级，支持 'token' 或 'sequence' 级截断。
         loss_type (`str`): GRPO 的 Loss 变体族，支持 'grpo', 'bnpo', 'dr_grpo', 'cispo', 'dapo', 'luspo', 'sapo', 'vespo' 等前沿算子。
@@ -451,7 +453,12 @@ class GRPOConfig:
         vespo_k_neg (`float`): VESPO 特定参数。
         vespo_lambda_neg (`float`): VESPO 特定参数。
         ptx_coef (`float`): 加入预训练监督数据的 Loss 混合权重系数。
-        generate_config (`GenerateConfig`): Rollout 时的采样与生成策略。
+        dr_grpo_max_completion_len (`Optional[int]`): Dr. GRPO 算法使用的固定常数长度归一化因子。若为 None，自动使用当前 rollout 的 max_new_tokens，确保不退化为动态平均的 BNPO。
+        scale_rewards (`Optional[bool]`): 是否在组内 Advantage 计算中除以标准差 (std)。若为 None，在 loss_type == 'dr_grpo' 时默认设为 False（符合 Dr. GRPO 算法规范），其他模式下默认设为 True。
+        token_level_loss_norm (`str`): Token 级损失归一化策略（适用于 'dapo', 'bnpo', 'cispo', 'vespo' 等）。可选 'global'（默认：按全局累积 Batch 的 Token 总量归一化，消除因 micro-batch 划分造成的长度梯度权重偏差）或 'micro_batch'（仅在当前单个 micro-batch 内部归一化）。
+        gamma (`float`): 多轮 Agent 强化学习的时间折扣衰减因子，默认 1.0 (纯因果 Reward-to-Go)。
+        missing_eos_penalty (`Optional[float]`): 针对模型未能正常生成 EOS (结束符) 的硬性奖励惩罚值。
+        generate_config (`GenerateConfig`): Rollout 时的采样与生成策略 (RL 默认 top_p=1.0 保证采样与求值无偏)。
     """
     grpo_epochs: int
     grpo_batch_size: int
@@ -460,8 +467,8 @@ class GRPOConfig:
     gradient_accumulation_steps: int = 1
     chunked_log_probs_size: Optional[int] = None
     loss_beta: float = 0.04
-    loss_clip_eps: float = 3e-4
-    loss_clip_eps_high: Optional[float] = 4e-4
+    loss_clip_eps: float = 0.2
+    loss_clip_eps_high: Optional[float] = 0.28
     loss_delta: Optional[float] = None
     loss_importance_sampling_level: str = 'token'
     loss_type: str = 'grpo'
@@ -472,7 +479,12 @@ class GRPOConfig:
     vespo_k_neg: float = 3.0
     vespo_lambda_neg: float = 2.0
     ptx_coef: float = 0.0
-    generate_config: GenerateConfig = field(default_factory=GenerateConfig)
+    dr_grpo_max_completion_len: Optional[int] = None
+    scale_rewards: Optional[bool] = None
+    token_level_loss_norm: str = 'global'
+    gamma: float = 1.0
+    missing_eos_penalty: Optional[float] = None
+    generate_config: GenerateConfig = field(default_factory=lambda: GenerateConfig(top_p=1.0))
 
 
 @dataclass(kw_only=True)
@@ -492,7 +504,7 @@ class TrainConfig:
         eval_config (`GenerateConfig`): 训练期间触发 Evaluation 测试集时的生成配置。
         save_interval (`int`): 指定多少个 global batch step 后触发一次 Checkpoint 保存。
         eval_interval (`int`): 指定多少个 global batch step 后触发一次评估/测试集 Evaluation。
-        gradient_checkpointing (`bool`): 是否开启梯度检查点，如果开启且使用ds模式，会自动配置DsActivationCheckpointingConfig
+        is_gradient_checkpointing (`bool`): 是否开启梯度检查点，如果开启且使用ds模式，会自动配置DsActivationCheckpointingConfig
         pretrain_config (`Optional[PretrainConfig]`): 使用基础 Trainer 时的配置组。
         sft_config (`Optional[SFTConfig]`): 使用 SFTTrainer 时的监督微调配置组。
         dpo_config (`Optional[DPOConfig]`): 使用 DPOTrainer 时的对齐微调配置组。
@@ -514,7 +526,7 @@ class TrainConfig:
     eval_config: GenerateConfig = field(default_factory=GenerateConfig)
     save_interval: int = 100
     eval_interval: int = 100
-    gradient_checkpointing: bool = False
+    is_gradient_checkpointing: bool = False
 
     pretrain_config: Optional[PretrainConfig] = None
     sft_config: Optional[SFTConfig] = None
@@ -523,10 +535,10 @@ class TrainConfig:
     grpo_config: Optional[GRPOConfig] = None
 
     def __post_init__(self):
-        if self.gradient_checkpointing and self.ds_config is not None and self.ds_config.activation_checkpointing is None:
+        if self.is_gradient_checkpointing and self.ds_config is not None and self.ds_config.activation_checkpointing is None:
             self.ds_config.activation_checkpointing = DsActivationCheckpointingConfig()
-        elif not self.gradient_checkpointing and self.ds_config is not None and self.ds_config.activation_checkpointing is not None:
-            self.gradient_checkpointing = True
+        elif not self.is_gradient_checkpointing and self.ds_config is not None and self.ds_config.activation_checkpointing is not None:
+            self.is_gradient_checkpointing = True
 
 
 class RewardFun(Protocol):
@@ -534,7 +546,12 @@ class RewardFun(Protocol):
             self,
             prompt_ids: List[torch.Tensor],
             completion_ids: torch.Tensor,
-            gt_answer_ids: List[Optional[torch.Tensor]]
+            gt_answer_ids: List[Optional[torch.Tensor]],
+            *,
+            dones: Optional[List[bool]] = None,
+            generation_masks: Optional[Union[List[List[bool]], torch.Tensor]] = None,
+            feedbacks: Optional[List[str]] = None,
+            **kwargs: Any
     ) -> Union[List[float], List[List[float]], torch.Tensor]:
         """
         计算奖励分数。
@@ -543,6 +560,9 @@ class RewardFun(Protocol):
             prompt_ids: 长度为 [N] 的列表。内层 Tensor 形状为 [prompt_len]，为对齐前的原始 prompt ids。
             completion_ids: 形状为 [N, max_completion_len] 的 CPU Tensor，为当前生成的 Completion IDs。
             gt_answer_ids: 长度为 [N] 的列表。表示真值（用于匹配或指标判定）。
+            dones (Optional[List[bool]]): 多轮交互中各样本的环境终止状态（任务是否成功完成）。
+            generation_masks (Optional[Union[List[List[bool]], torch.Tensor]]): 形状为 [N, max_completion_len]，True 表示该位置由模型生成，False 表示为环境反馈或 Padding。
+            feedbacks (Optional[List[str]]): 长度为 [N] 的列表，多轮交互中环境给出的最终反馈文本。
 
         Note:
             - 在 PPO 训练中，N 通常等于 batch_size (B)。

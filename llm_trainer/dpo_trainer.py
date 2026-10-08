@@ -56,6 +56,13 @@ class DPOTrainer(BaseTrainer):
         if self.dpo_config.loss_type in ['orpo', 'simpo']:
             return None
 
+        if not self.dpo_config.ref_model_weights_path:
+            raise ValueError(
+                f"DPO (loss_type='{self.dpo_config.loss_type}') requires a reference model to compute preference loss, "
+                "but `ref_model_weights_path` is not configured! "
+                "Please configure `ref_model_weights_path` in DPOConfig to prevent using randomly initialized weights in distributed training."
+            )
+
         parallel_kwargs = self._init_ref_model_args(self.train_config.model_config)
         with self._new_model_context(parallel_kwargs):
             ref_model = self._new_model(self.train_config)
@@ -64,8 +71,7 @@ class DPOTrainer(BaseTrainer):
         for param in ref_model.parameters():
             param.requires_grad = False
 
-        if self.dpo_config.ref_model_weights_path is not None:
-            self._load_external_weights(ref_model, self.dpo_config.ref_model_weights_path)
+        self._load_external_weights(ref_model, self.dpo_config.ref_model_weights_path)
 
         ref_model, _ = TrainerTools().parallel.process(
             model=ref_model,

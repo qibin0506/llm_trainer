@@ -166,6 +166,16 @@ class DsParallel(Parallel):
             kwargs: Optional[dict] = None,
             save_instance: bool = True
     ) -> Tuple[nn.Module, torch.optim.Optimizer]:
+        if kwargs and kwargs.get("zero_optimization", {}).get("stage", 0) == 3:
+            try:
+                from deepspeed.utils import set_z3_leaf_modules
+                from llm_model.sparse_moe import MoE
+                # 将 MoE 容器模块标记为 Leaf Module：
+                # 1. 传入 [MoE] 会自动匹配并标记所有 MoE 子模块
+                # 2. raise_if_not_found=False 保证若训练非 MoE 模型（如普通 Dense 模型）时安全跳过
+                set_z3_leaf_modules(model, [MoE], raise_if_not_found=False)
+            except Exception as e:
+                Logger.std_log(f'Warning: failed to set z3 leaf modules: {e}')
 
         model, optim, _, _ = deepspeed.initialize(
             model=model,

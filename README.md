@@ -1,6 +1,6 @@
 # 🚀 LLM/VLM 全流程分布式训练与强化学习框架
 
-一个基于 PyTorch 与 DeepSpeed 构建的高性能、通用大语言模型（LLM）与视觉语言模型（VLM）训练框架。支持从**预训练（Pretrain）**、**监督微调（SFT）**、**直接偏好优化（DPO/ORPO/SimPO）** 到 **强化学习（PPO & GRPO全系列算子）** 的完整生命周期。
+一个基于 PyTorch 与 DeepSpeed 构建的高性能、通用大语言模型（LLM）与视觉语言模型（VLM）训练框架。支持从**预训练（Pretrain）**、**监督微调（SFT）**、**直接偏好优化（DPO/ORPO/SimPO）** 到 **强化学习（PPO & GRPO全系列算子与多轮Agent交互）** 的完整生命周期。
 
 ---
 
@@ -20,9 +20,9 @@
     * [1. 预训练 (Pretrain Trainer & 分块交叉熵)](#1-预训练-pretrain-trainer)
     * [2. 监督微调 (SFT Trainer - ATF 与分块损失)](#2-监督微调-sft-trainer---llm--vlm)
     * [3. 偏好对齐 (DPO / ORPO / SimPO Trainer)](#3-偏好对齐-dpo--orpo--simpo-trainer)
-    * [4. 近端策略优化 (PPO Trainer & Rollout分块)](#4-近端策略优化-ppo-trainer)
-    * [5. 组相对策略优化 (GRPO Trainer & 前沿变体)](#5-组相对策略优化-grpo-trainer--前沿变体)
-8. [自定义生成服务 (Generation Services)](#-自定义生成服务-generation-services)
+    * [4. 近端策略优化 (PPO Trainer & 价值裁剪 & 奖励折叠)](#4-近端策略优化-ppo-trainer)
+    * [5. 组相对策略优化 (GRPO Trainer & 前沿变体与信用分配)](#5-组相对策略优化-grpo-trainer--前沿变体)
+8. [自定义生成服务 (Generation Services & 多轮Agent交互)](#-自定义生成服务-generation-services)
 9. [实用工具 (Tools & Utilities)](#-实用工具-tools--utilities)
 10. [附录：全量参数配置详解](#-附录)
 
@@ -30,7 +30,7 @@
 
 ## 🔥 项目特性
 
-* **全流程算法支持**：覆盖 Pretrain、SFT、DPO/ORPO/SimPO、PPO 以及 DeepSeek-R1 核心的 GRPO 及其衍生算子（BNPO, Dr-GRPO, CISPO, DAPO, LUSPO, SAPO, VESPO）。
+* **全流程算法支持**：覆盖 Pretrain、SFT、DPO/ORPO/SimPO、PPO (Actor-Critic 双模型) 以及 DeepSeek-R1 核心的 GRPO 及其衍生算子（BNPO, Dr-GRPO, CISPO, DAPO, LUSPO, SAPO, VESPO）。
 * **新一代正交动量优化器 (Muon Optimizer) 与混合优化支持**：
   - **极分解正交更新**：原生实现 5 阶 Newton-Schulz 迭代（`MuonOptim`），支持 `torch.compile` 编译加速，显著提升大模型预训练与强化学习阶段的收敛速度与稳定性。
   - **智能混合参数分组 (Muon + AdamW)**：框架自动分离 2D 线性层矩阵（分配给 Muon 进行正交动量更新）与 1D 向量、Embedding、LM Head、LayerNorm/RMSNorm 及 Bias（分配给 AdamW/Lion），完全无需繁琐的手动配置。
@@ -40,16 +40,27 @@
 * **Active Token Filtering (ATF) & Chunked Cross Entropy (CCE)**：
   - **动态 Token 筛选**：在 SFT/Pretrain 阶段自动过滤 `-100` 掩码（Prompt/Padding），仅将有效 Token 送入投影层，砍掉 $70\% \sim 90\%$ 的无用 GEMM 计算。
   - **分块交叉熵 + 梯度检查点**：支持 `chunked_cross_entropy_size`，在前向阶段完全避免具象化超大 $[B, S, V]$ 的 Logits 显存。
-  - **ZeRO-3 原生安全**：内置 `maybe_gather_lm_head_ctx` 与 Zero-Token 假节点穿透，彻底杜绝跨卡通信悬挂与死锁。
+  - **ZeRO-3 原生安全**：内置 `maybe_gather_lm_head_ctx` 与 Zero-Token 假节点穿透，跨卡 All-Reduce 规约最大 Chunk 数量，彻底杜绝通信悬挂与死锁。
 * **分块强化学习与自回归生成 (Chunked Generation & Log-probs)**：
   - **自回归生成分块 (`chunked_generate_size`)**：在 Rollout 采样阶段按 Chunk 执行 `batch_generate`，防止大 Batch/长文本并发 KV Cache 导致显存溢出（OOM）。
   - **评估前向分块 (`chunked_log_probs_size`)**：在 Policy 与 Reference 模型的 Log-probs 及 Value 评估阶段按 Chunk 分批推理，配合 Active Token Filtering 消除超长序列下的显存尖峰。
-* **多模态 (VLM) 训练**：支持多模态投影层冻结/微调、图像虚拟 Token 扩展与动态 Pixel Features 注入。
-* **异构硬件支持**：原生适配 **NVIDIA CUDA (NCCL)**、**华为升腾 NPU (HCCL)**、**寒武纪 MLU (CNCL)**、**Apple Silicon (MPS)** 及 **CPU/Gloo**。
+* **多轮强化学习与 Agent 交互支持 (Multi-Turn Agent RL)**：
+  - **解耦环境服务 (`MultiTurnRLGenerationService`)**：原生支持多轮代码执行、工具调用与数学推导；内置多线程并发交互与环境超时保护（`env_timeout`、`max_workers`）。
+  - **Action-level 时序信用分配与奖励折叠 (Reward Folding)**：内置 `fold_rewards_to_preceding_action` 算子，自动将环境反馈（Observation）或 Padding 上的奖励折叠至紧邻的前序 Action 尾部；支持多轮 1D 轨迹奖励沿轮次反向折现传递（Reward-to-Go）以及 2D PRM 过程奖励因果累积。
+* **前沿 GRPO 变体算法库**：
+  - 支持 **8 种主流及前沿 Loss 算子**：`grpo`、`bnpo`、`dr_grpo`、`cispo`、`dapo`、`luspo`、`sapo`、`vespo`。
+  - 支持 **Token 级与 Sequence 级重要性采样**（Token 级默认推荐截断 `0.2`，Sequence 级推荐小截断如 `3e-4`）。
+  - 支持 **全局 Token 级损失归一化**（`token_level_loss_norm='global'`），消除 Micro-batch 样本长度不均引起的梯度偏差。
+  - 针对 **Dr. GRPO** 原生支持固定常数长度归一化（`dr_grpo_max_completion_len`）与无方差缩放机制（`scale_rewards=False`）。
+* **ValueModel 显存优化与独立 Critic 架构**：
+  - PPO ValueModel 自动冻结底座 `lm_head`（非 tied 模式下），节省数十 GB 冗余优化器状态显存。
+  - 支持 Critic 独立更新裁剪阈值（`value_clip_eps`）与独立优化器调度（`CompositeLRScheduler`）。
+  - 支持全流程 EOS 缺失惩罚（`missing_eos_penalty`），防止模型刷长度作弊。
+* **多模态 (VLM) 训练**：支持多模态投影层冻结/微调、图像虚拟 Token 扩展与动态 Pixel Features 注入，支持评估图像 Tags 映射。
+* **异构硬件支持**：原生适配 **NVIDIA CUDA (NCCL)**、**华为昇腾 NPU (HCCL)**、**寒武纪 MLU (CNCL)**、**Apple Silicon (MPS)** 及 **CPU/Gloo**。
 * **DeepSpeed 深度集成**：灵活配置 ZeRO-1/2/3、ZeRO-Offload (CPU/NVMe)、ZeRO++ 梯度/权重量化及激活检查点（Activation Checkpointing）。
 * **高效数据载入**：支持 `.npy` (内存映射 mmap)、`.jsonl` 和 `.pkl` 格式，大体量数据集零内存暴涨加载。
-* **解耦生成服务**：内置单卡集中生成、并行广播生成以及**多轮 RL 交互环境服务（Multi-Turn RL）**。
-* **分块知识蒸馏 (Chunked KD) & PTX**：支持在分块计算中同步完成 Student/Teacher 软标签蒸馏；PPO/GRPO 支持 PTX 混合预训练损失。
+* **分块知识蒸馏 (Chunked KD)**：支持在分块计算中同步完成 Student/Teacher 软标签蒸馏。
 
 ---
 
@@ -58,26 +69,26 @@
 ```text
 ├── __init__.py             # 统一导出入口
 ├── base_trainer.py         # 训练器基类 (生命周期管理、梯度累积、Checkpoint、优化器与参数分组管理)
-├── trainer.py              # 预训练 Trainer (支持 ChunkedLMLoss 分块交叉熵)
+├── trainer.py              # 预训练 Trainer (支持 ChunkedLMLoss 分块交叉熵与 KD 蒸馏)
 ├── sft_trainer.py          # 监督微调 SFT Trainer (支持 Active Token Filtering 与 VLM)
 ├── dpo_trainer.py          # 偏好对齐 DPO Trainer (支持 DPO, ORPO, SimPO)
-├── ppo_trainer.py          # 强化学习 PPO Trainer (支持 Value Model, GAE, 生成与评估分块, Muon 混合优化)
-├── grpo_trainer.py         # 强化学习 GRPO Trainer (支持组内归一化、生成与评估分块及多种前沿 Loss)
+├── ppo_trainer.py          # 强化学习 PPO Trainer (支持 Value Model, GAE, 生成与评估分块, 独立价值裁剪, 奖励折叠)
+├── grpo_trainer.py         # 强化学习 GRPO Trainer (支持组内归一化、全局Token归一化、生成与评估分块、8种变体Loss与多轮因果优势)
 ├── muon.py                 # Muon 优化器实现 (Newton-Schulz 正交迭代, MuonWithAdamW 及 DeepSpeed 集成)
 ├── train_configs.py        # 全局配置类 dataclasses (Optim, DsConfig, GenerateConfig, Protocols)
 ├── parallel.py             # 分布式并行抽象层 (DsParallel, NoneParallel, 多后端适配)
-├── generation_service.py   # 生成服务 (SyncCentral, Parallel, MultiTurnRL)
+├── generation_service.py   # 生成服务 (SyncCentral, Parallel, MultiTurnRL 多轮环境交互)
 ├── generate_utils.py       # 自回归生成底层算子 (KV Cache, 核采样, 惩罚项, Prefix Cache)
-├── loss.py                 # Loss 算子库 (ChunkedLMLoss, LMLoss, KDLoss, DPO, PPO, GRPO全系列)
+├── loss.py                 # Loss 算子库 (ChunkedLMLoss, LMLoss, KDLoss, DPO, PPO, GRPO全系列变体)
 ├── dataset.py              # Dataset 实现类 (Pretrain, SFT, DPO, RL)
 ├── tokenizer.py            # NanoTokenizer 封装与 Chat Template 应用
 ├── partition_utils.py      # ZeRO-3 权重 Gather、maybe_gather_lm_head_ctx、Unwrap 与跨 Rank 同步
 ├── checkpoint.py           # Checkpoint / Steps 序列化与恢复
 ├── ds_checkpoint.py        # DeepSpeed Checkpoint 管理
 ├── scheduler.py            # Warmup Cosine LR 调度器 (支持多参数组比例缩放) 及复合调度器
-├── tools.py                # 辅助工具 (权重格式转换, 步数计算, 数据量估算)
+├── tools.py                # 辅助工具 (权重格式转换, 步数计算, 数据量估算, PPO独立权重提取)
 ├── log.py                  # 日志记录器
-└── utils.py                # 常用数学算子, Mask 算子, 硬件辅助算子, DeepSpeed 配置构建器
+└── utils.py                # 常用数学算子, Mask 算子, 硬件辅助算子, 奖励折叠算子, DeepSpeed 配置构建器
 ```
 
 ---
@@ -147,6 +158,7 @@ export CHECKPOINT_DIR="./output_ckpts"
     "answer": "x = 2 或 x = -2"
   }
   ```
+  *(注：`RLDataset` 在解析时若发现 Prompt 尾部未包含 `<assistant>` 引导符，会自动补齐 `<assistant>`。)*
 
 ---
 
@@ -191,7 +203,7 @@ optim_config = OptimConfig(
 ### 硬件支持
 框架自动根据设备类型选择最优后端：
 - **NVIDIA GPU**: `nccl` 后端，启用 TF32 与 CUDA 优化。
-- **华为升腾 NPU**: `hccl` 后端，自动处理 NPU 内存与计算。
+- **华为昇腾 NPU**: `hccl` 后端，自动处理 NPU 内存与计算。
 - **寒武纪 MLU**: `cncl` 后端。
 - **Apple Silicon**: `mps` 设备模式。
 
@@ -254,6 +266,7 @@ train_config = TrainConfig(
         gradient_accumulation_steps=4,
         chunked_cross_entropy_size=1024 # 开启分块计算 (建议 512 ~ 2048)
     ),
+    is_gradient_checkpointing=True,
     ds_config=ds_config
 )
 
@@ -289,7 +302,8 @@ train_config = TrainConfig(
         mask_prompt=True,                 # 开启 Prompt 掩码
         gradient_accumulation_steps=2,
         chunked_cross_entropy_size=512    # 开启 Active Token Filtering 与分块 CE
-    )
+    ),
+    is_gradient_checkpointing=True
 )
 
 trainer = SFTTrainer(
@@ -301,6 +315,7 @@ trainer.train()
 
 #### B. VLM 多模态微调
 ```python
+from sft_trainer import SFTTrainer
 from llm_model import VLMConfig
 
 vlm_config = VLMConfig(...) # 包含 vision_config 与 tokens_per_image
@@ -317,6 +332,13 @@ train_config.sft_config = SFTConfig(
     pixel_values_provider=pixel_provider,
     freeze_llm_model=True # 冻结 LLM 底座，仅微调 Projector
 )
+
+trainer = SFTTrainer(
+    train_config=train_config,
+    eval_prompts=["<image><user>描述这张图片的内容</s><assistant>"],
+    eval_image_tags=["tag_image_001"] # 多模态评估支持
+)
+trainer.train()
 ```
 
 ---
@@ -367,16 +389,18 @@ trainer.train()
 ### 4. 近端策略优化 (PPO Trainer)
 
 PPO 包含了 Actor (Policy) 模型与 Critic (Value) 模型，采用 GAE 优势估计，支持 Running Mean/Std 归一化、Advantage 白化（Whitening）与 KL 散度惩罚。
-- 支持 Policy 与 Value 模型独立配置优化器类型（例如 Policy 使用 `muon`，Value 使用 `adam` 或 `muon`）。
-- 支持配置 `GenerateConfig.chunked_generate_size` 在自回归采样生成阶段按分块执行，降低并发 KV Cache 显存峰值。
-- 支持配置 `PPOConfig.chunked_log_probs_size` 在计算 Policy / Reference Log-probs 及 Value 评估阶段按分块执行，防止长序列显存溢出。
+- **独立价值裁剪 (`value_clip_eps`)**：支持 Critic 价值函数独立截断阈值，避免直接绑定策略截断导致价值函数欠拟合。
+- **ValueModel 显存瘦身**：自动识别并冻结 Critic 模型的 `lm_head` 参数，避免在超大词表矩阵上浪费巨额优化器状态显存。
+- **独立 Critic 优化器**：支持 Policy 与 Value 模型独立配置优化器类型（例如 Policy 使用 `muon`，Value 使用 `adam` 或 `muon`），通过 `CompositeLRScheduler` 独立调度。
+- **端到端奖励折叠与 EOS 惩罚**：支持 `missing_eos_penalty`，内置 `fold_rewards_to_preceding_action` 自动将环境反馈奖励折叠至前序 Action 尾部。
+- **分块降低显存峰值**：配置 `GenerateConfig.chunked_generate_size` 优化生成 KV Cache 显存；配置 `PPOConfig.chunked_log_probs_size` 优化评估显存。
 
 ```python
 from ppo_trainer import PPOTrainer
 from train_configs import TrainConfig, PPOConfig, GenerateConfig, OptimConfig
 
-# 支持 1D 轨迹标量奖励 或 2D 逐 Token 稠密奖励
-def reward_function(prompt_ids, completion_ids, gt_answer_ids):
+# 支持 1D 轨迹标量奖励 或 2D 逐 Token 稠密奖励 (兼容多轮 kwargs)
+def reward_function(prompt_ids, completion_ids, gt_answer_ids, **kwargs):
     # 返回 List[float] (1D Outcome Reward) 或 List[List[float]] (2D Process/Dense Reward)
     return [compute_score(c, g) for c, g in zip(completion_ids, gt_answer_ids)]
 
@@ -399,11 +423,14 @@ train_config.ppo_config = PPOConfig(
     ), 
     kl_beta=0.02,
     clip_eps=0.1,
+    value_clip_eps=0.2,                # Critic 独立价值裁剪阈值
     vf_coef=0.1,
     normalize_rewards=False,
+    missing_eos_penalty=0.5,           # 未生成 EOS 结束符扣分
     generate_config=GenerateConfig(
         max_seq_len=512, 
         temperature=0.7,
+        top_p=1.0,                     # RL 建议保持 1.0 无偏采样
         chunked_generate_size=2        # 自回归生成采样阶段分块大小
     )
 )
@@ -422,30 +449,31 @@ trainer.train()
 
 GRPO (Group Relative Policy Optimization) 是 DeepSeek-R1 的核心强化学习算法，对同一个 Prompt 生成一个 Group 的采样结果，在组内计算相对 Advantage，**无需单独的 Value 模型**。
 
-本框架支持多种 GRPO Loss 变体算子（配置在 `GRPOConfig.loss_type`）：
-- `grpo`: 经典截断 GRPO 算子。
-- `bnpo`: Batch-level 归一化 GRPO。
-- `dr_grpo`: 带有长度正则项的 GRPO。
+本框架支持 **8 种主流与前沿 GRPO 变体算子**（通过 `GRPOConfig.loss_type` 配置）：
+- `grpo`: 经典截断 GRPO 算子（Token 级截断默认 `loss_clip_eps=0.2`, `loss_clip_eps_high=0.28`）。
+- `bnpo`: Batch-level 归一化 GRPO，支持配合 `token_level_loss_norm='global'` 消除跨卡长度偏差。
+- `dr_grpo`: 针对长度偏置矫正的 Dr. GRPO 算法，采用常数长度因子归一化（`dr_grpo_max_completion_len`），且默认关闭除以标准差（`scale_rewards=False`）。
 - `cispo`: 剪裁重要性采样加权算法。
 - `dapo`: 解耦剪裁范围算法。
-- `luspo` / `sapo` / `vespo`: 支持长度偏置消除与软温度平滑。
+- `luspo`: 长度解耦加权优化算法（建议配置 `loss_importance_sampling_level='sequence'`）。
+- `sapo`: 软温度 Sigmoid 平滑裁剪算法（支持 `sapo_temperature_pos/neg`）。
+- `vespo`: 基于 Gamma 分布权重调控的序列级重要性采样算法。
+
+#### 细粒度因果信用分配 (PRM & Multi-Turn)
+- **单轮 2D PRM 过程奖励**：按 Token 计算因果累积未来回报 (Reward-to-Go)，在同组候选各 Token 步进行组内归一化。
+- **多轮 Agent RL 信用分配**：1D 奖励精准注入最后一个有效 Action 并沿历史轮次反向折现；2D 奖励自动通过 `fold_rewards_to_preceding_action` 折叠反馈噪声。
 
 ```python
 from grpo_trainer import GRPOTrainer
 from train_configs import TrainConfig, GRPOConfig, GenerateConfig, OptimConfig
 
-def reward_function(prompt_ids, completion_ids, gt_answer_ids):
+def reward_function(prompt_ids, completion_ids, gt_answer_ids, **kwargs):
     # 针对 batch_size * group_size 条样本计算奖励 (支持 1D 标量或 2D 稠密打分)
     scores = []
     for comp, gt in zip(completion_ids, gt_answer_ids):
         score = rule_based_math_checker(comp, gt)
         scores.append(score)
     return scores
-
-# 可选：PTX 混合预训练，防止强化学习阶段遗忘通用能力
-def ptx_builder(prompt_ids_list, gt_answer_ids_list):
-    # 返回拼接好的 Prompt + Answer Tensor 列表
-    return [torch.cat([p, a]) for p, a in zip(prompt_ids_list, gt_answer_ids_list)]
 
 train_config.optim_config = OptimConfig(
     optim_type='muon',
@@ -460,12 +488,15 @@ train_config.grpo_config = GRPOConfig(
     gradient_accumulation_steps=2,
     chunked_log_probs_size=4,          # Group 评估时分块计算 Log-probs，防止 OOM
     loss_type='grpo',                  # 可选: 'bnpo', 'dr_grpo', 'cispo', 'dapo', 'luspo', 'sapo', 'vespo'
-    loss_beta=0.04,                    # KL 散度约束强度
-    ptx_coef=0.1,                      # PTX 预训练 Loss 融合权重
+    loss_beta=0.04,                    # KL 散度约束强度 (设为 0.0 时无需 ref_model)
+    loss_clip_eps=0.2,                 # Token 级推荐 0.2；若使用 sequence 级采样推荐 3e-4
+    loss_clip_eps_high=0.28,           # 不对称上限截断
+    token_level_loss_norm='global',    # 全局 Token 归一化，消除 micro-batch 长度偏差
+    missing_eos_penalty=0.5,           # 未生成 EOS 惩罚
     generate_config=GenerateConfig(
         max_seq_len=1024, 
         temperature=0.9, 
-        top_p=0.95,
+        top_p=1.0,                     # RL 建议保持 1.0 无偏采样
         chunked_generate_size=4        # 组内自回归采样分块大小
     )
 )
@@ -473,7 +504,6 @@ train_config.grpo_config = GRPOConfig(
 trainer = GRPOTrainer(
     train_config=train_config,
     reward_func=reward_function,
-    ptx_builder=ptx_builder,
     eval_prompts=["证明勾股定理：a^2 + b^2 = c^2"]
 )
 trainer.train()
@@ -492,12 +522,13 @@ trainer.train()
 多卡并行生成服务。使用自定义的桶式 `dist.broadcast` 高效同步模型最新权重到各卡独立生成设备，各卡本地按 `chunked_generate_size` 分块生成，避免 pickle 序列化开销。
 
 ### 3. `MultiTurnRLGenerationService` (多轮环境交互 / Agent RL)
-专门用于大模型代码执行、公式推理、工具调用的多轮强化学习交互服务。在多轮自回归生成时原生支持分块生成与动态 Padding 对齐。
+专门用于大模型代码执行、公式推理、工具调用的多轮强化学习交互服务。原生支持动态 Padding 对齐、分块生成、多线程并发交互及超时保护（`env_timeout`）。
 
 ```python
 from generation_service import MultiTurnRLGenerationService
 
-def environment_step(generated_text: str) -> tuple[bool, str]:
+# 支持 (sample_idx, prompt_ids, history_tokens, generated_text) 或单个 generated_text 入参
+def environment_step(sample_idx, prompt_ids, history_tokens, generated_text: str) -> tuple[bool, str]:
     # 提取代码并运行 Python 解释器
     code = extract_code(generated_text)
     success, output_or_error = python_interpreter.run(code)
@@ -510,7 +541,9 @@ gen_service = MultiTurnRLGenerationService(
     env_step=environment_step,
     format_feedback=format_feedback,
     max_turns=3,                  # 最多允许交互 3 轮
-    max_consecutive_errors=2      # 连续报错 2 次自动终止该 Trajectory
+    max_consecutive_errors=2,     # 连续报错 2 次自动终止该 Trajectory
+    env_timeout=30.0,             # 单步环境交互超时秒数 (超时自动判定异常)
+    max_workers=8                 # 并发线程数
 )
 
 # 传入 GRPOTrainer / PPOTrainer
@@ -520,24 +553,28 @@ trainer = GRPOTrainer(
     generation_service=gen_service,
     eval_prompts=eval_prompts
 )
+trainer.train()
 ```
 
 ---
 
 ## 🛠 实用工具 (Tools & Utilities)
 
-`tools.py` 包含了各种全流程开发所需的便捷辅助函数：
+`tools.py` 与 `utils.py` 包含了各种全流程开发所需的便捷辅助函数：
 
 ### 1. 自动计算学习率调度器总步数
-根据训练阶段（SFT/DPO/PPO/GRPO）、数据量、Batch Size、卡数与 Warmup 比例，精确算得 `warmup_iters` 与 `cosine_annealing_batches`：
+精确考虑训练阶段（SFT/DPO/PPO/GRPO）、数据量、Batch Size、卡数、多文件独立 `drop_last=True` 截断与 Warmup 比例，精准算得 `warmup_iters` 与 `cosine_annealing_batches`：
 
 ```python
-from tools import compute_lr_scheduler_steps
+from tools import compute_lr_scheduler_steps, estimate_data_size
+
+# 估算多文件独立样本量
+file_sizes = estimate_data_size(file_dataset, block_size=2048, type='grpo', return_per_file=True)
 
 warmup_iters, cosine_steps = compute_lr_scheduler_steps(
     train_stage='grpo',
     epochs=1,
-    all_data_size=10000,
+    all_data_size=file_sizes,          # 支持传入各文件样本列表精确对齐 drop_last
     batch_size=4,
     gradient_accumulation_steps=2,
     warmup_rate=0.03,
@@ -570,9 +607,26 @@ save_pt_weights_to_safetensors(
 
 ### 3. 从 PPO 复合权重中提取 Policy/Value 独立权重
 ```python
-from tools import extract_policy_weights_from_ppo
+from tools import extract_policy_weights_from_ppo, extract_value_weights_from_ppo
 
+# 提取 Policy 模型独立权重字典
 policy_state_dict = extract_policy_weights_from_ppo(model_config, ppo_checkpoint_weights)
+
+# 提取 Value 模型独立权重字典
+value_state_dict = extract_value_weights_from_ppo(model_config, ppo_checkpoint_weights)
+```
+
+### 4. 2D 奖励因果时序折叠算子
+在多轮强化学习中，环境反馈及 Observation 的位置不属于模型的 Action 生成段。`fold_rewards_to_preceding_action` 会自动将标注在反馈上的奖励折叠累加到紧邻的前序 Action 尾部：
+
+```python
+from utils import fold_rewards_to_preceding_action
+
+clean_2d_rewards = fold_rewards_to_preceding_action(
+    rewards_tensor=raw_2d_rewards,
+    action_mask=action_mask,
+    context_desc="GRPO"
+)
 ```
 
 ---
@@ -595,7 +649,7 @@ policy_state_dict = extract_policy_weights_from_ppo(model_config, ppo_checkpoint
 | `eval_config` | `GenerateConfig` | `GenerateConfig()` | 训练过程中触发 Evaluation 阶段时的生成控制参数。 |
 | `save_interval` | `int` | `100` | 每隔多少个 global batch step 触发一次保存 checkpoint。 |
 | `eval_interval` | `int` | `100` | 每隔多少个 global batch step 触发一次测试集推理评估。 |
-| `gradient_checkpointing` | `bool` | `False` | 是否开启梯度检查点；若开启且使用 DeepSpeed，会自动同步初始化 `ds_config.activation_checkpointing`。 |
+| `is_gradient_checkpointing` | `bool` | `False` | 是否开启梯度检查点；若开启且使用 DeepSpeed，会自动同步初始化 `ds_config.activation_checkpointing`。 |
 | `pretrain_config` | `Optional[PretrainConfig]` | `None` | 使用 `Trainer` 进行无监督预训练时的特定配置。 |
 | `sft_config` | `Optional[SFTConfig]` | `None` | 使用 `SFTTrainer` 进行监督微调时的特定配置。 |
 | `dpo_config` | `Optional[DPOConfig]` | `None` | 使用 `DPOTrainer` 进行直接偏好对齐时的特定配置。 |
@@ -642,12 +696,12 @@ policy_state_dict = extract_policy_weights_from_ppo(model_config, ppo_checkpoint
 | `max_seq_len` | `int` | `512` | 自回归生成的序列最大总长度（包含 Prompt）。 |
 | `chunked_generate_size` | `Optional[int]` | `None` | 自回归生成阶段 (`batch_generate`) 的 Batch 分块大小，防止并发 KV Cache 过大导致显存 OOM。 |
 | `temperature` | `float` | `1.0` | 采样温度；值越大越随机，值为 `0` 或接近 `0` 时退化为贪婪搜索。 |
-| `top_p` | `float` | `0.95` | Nucleus 采样概率阈值；仅保留累积概率达 `top_p` 的候选词。 |
+| `top_p` | `float` | `0.95` | Nucleus 采样概率阈值；仅保留累积概率达 `top_p` 的候选词（强化学习 PPO/GRPO 中推荐设为 `1.0` 保证采样与求值无偏）。 |
 | `top_k` | `Optional[int]` | `None` | Top-K 采样限制；设为非空时仅保留概率最高的 K 个候选词。 |
 | `repetition_penalty` | `Optional[float]` | `1.0` | 重复惩罚因子；`> 1.0` 时惩罚已生成的重复 Token。 |
 | `exclude_penalty_tokens` | `Optional[List[int]]` | `None` | 不受重复惩罚约束的豁免 Token ID 列表（如标点或特殊符号）。 |
 | `suppress_tokens` | `Optional[List[int]]` | `None` | 强行抑制不被生成的 Token ID 列表（将 Logits 置为 `-inf`）。 |
-| `auto_prefix_cache` | `bool` | `True` | 批量生成时是否开启公共 Prompt 前缀缓存优化。 |
+| `auto_prefix_cache` | `bool` | `True` | 批量生成时是否开启公共 Prompt 前缀缓存复用优化。 |
 
 ### 2.4 知识蒸馏配置 (`KDConfig`)
 
@@ -708,15 +762,15 @@ policy_state_dict = extract_policy_weights_from_ppo(model_config, ppo_checkpoint
 | `gamma` | `float` | `1.0` | GAE 优势估计中的折扣因子 $\gamma$。 |
 | `lam` | `float` | `0.95` | GAE 优势估计中的平滑因子 $\lambda$。 |
 | `clip_eps` | `float` | `0.1` | PPO 策略更新的代换截断阈值 $\epsilon$。 |
+| `value_clip_eps` | `Optional[float]` | `None` | Critic 价值函数更新的独立裁剪阈值。若为 `None` 则默认使用 `clip_eps`；可设为更大值或 `<= 0` 关闭截断。 |
 | `vf_coef` | `float` | `0.1` | 总 Loss 中 Value Loss 的比重系数。 |
 | `kl_beta` | `float` | `0.02` | 基于 KL 散度的环境奖励惩罚系数。 |
 | `kl_estimator` | `str` | `'k1'` | 近似 KL 计算公式：`'k1'`（Log-Ratio 方差）或 `'k3'`。 |
 | `huber_delta` | `float` | `1.0` | Value 损失函数中 Smooth L1 (Huber Loss) 的平滑阈值 beta。 |
-| `ptx_coef` | `float` | `0.0` | PTX 混合预训练 Loss 的权重，用于缓解灾难性遗忘。 |
 | `missing_eos_penalty` | `Optional[float]` | `None` | 当生成的回答未能包含 EOS 结束符时的硬性扣分惩罚值。 |
-| `normalize_rewards` | `bool` | `False` | 是否在送入 GAE 前对 Reward 进行标准化。 |
+| `normalize_rewards` | `bool` | `False` | 是否在送入 GAE 前对 Reward 进行标准化（基于整条轨迹累计回报统计方差）。 |
 | `normalize_method` | `str` | `'RunningMeanStd'` | Reward 标准化算法：`'RunningMeanStd'` 或 `'BatchStd'`。 |
-| `generate_config` | `GenerateConfig` | `GenerateConfig()` | PPO 采样 Rollout 生成数据时的自回归解码参数（可在此配置 `chunked_generate_size`）。 |
+| `generate_config` | `GenerateConfig` | `GenerateConfig(top_p=1.0)` | PPO 采样 Rollout 生成数据时的自回归解码参数（默认 `top_p=1.0` 保证采样与求值无偏）。 |
 
 ### 3.5 组相对策略优化配置 (`GRPOConfig`)
 
@@ -729,19 +783,23 @@ policy_state_dict = extract_policy_weights_from_ppo(model_config, ppo_checkpoint
 | `gradient_accumulation_steps` | `int` | `1` | 梯度累积步数。 |
 | `chunked_log_probs_size` | `Optional[int]` | `None` | 评估/前向阶段（计算旧策略及参考模型 Log Prob）的 Batch 分块大小，用于降低显存峰值。 |
 | `loss_beta` | `float` | `0.04` | KL 散度惩罚系数。 |
-| `loss_clip_eps` | `float` | `3e-4` | 组相对优化下限截断阈值 $\epsilon_{low}$。 |
-| `loss_clip_eps_high` | `Optional[float]` | `4e-4` | 不对称截断时的上限阈值 $\epsilon_{high}$。 |
+| `loss_clip_eps` | `float` | `0.2` | 组相对优化下限截断阈值 $\epsilon_{low}$（Token 级推荐 `0.2`，Sequence 级推荐 `3e-4`）。 |
+| `loss_clip_eps_high` | `Optional[float]` | `0.28` | 不对称截断时的上限阈值 $\epsilon_{high}$。 |
 | `loss_delta` | `Optional[float]` | `None` | Advantage 权重的绝对值上限门限。 |
 | `loss_importance_sampling_level` | `str` | `'token'` | 归一化重要性采样的作用层级：`'token'` 或 `'sequence'`。 |
 | `loss_type` | `str` | `'grpo'` | GRPO 变体损失算子：`'grpo'`, `'bnpo'`, `'dr_grpo'`, `'cispo'`, `'dapo'`, `'luspo'`, `'sapo'`, `'vespo'`。 |
+| `token_level_loss_norm` | `str` | `'global'` | Token 级损失归一化策略（适用于 `'bnpo'`, `'cispo'`, `'dapo'`, `'vespo'`）。可选 `'global'`（全局 Token 均值，消除 micro-batch 样本长度偏差）或 `'micro_batch'`。 |
+| `scale_rewards` | `Optional[bool]` | `None` | 组内 Advantage 计算中是否除以标准差 (std)。若为 `None`，在 `loss_type=='dr_grpo'` 时默认设为 `False`，其他模式下默认设为 `True`。 |
+| `dr_grpo_max_completion_len` | `Optional[int]` | `None` | Dr. GRPO 算法使用的固定常数长度归一化因子。若为 `None` 则自动使用当前 rollout 的 `max_new_tokens`。 |
+| `gamma` | `float` | `1.0` | 多轮 Agent 强化学习的时间折扣衰减因子，默认 1.0 (纯因果 Reward-to-Go)。 |
+| `missing_eos_penalty` | `Optional[float]` | `None` | 针对模型未能正常生成 EOS (结束符) 的硬性奖励惩罚值。 |
 | `sapo_temperature_pos` | `float` | `1.0` | SAPO/VESPO 算法针对正优势样本的调节温度。 |
 | `sapo_temperature_neg` | `float` | `1.0` | SAPO/VESPO 算法针对负优势样本的调节温度。 |
 | `vespo_k_pos` | `float` | `2.0` | VESPO 算法特定 Gamma 权重超参数。 |
 | `vespo_lambda_pos` | `float` | `3.0` | VESPO 算法特定 Gamma 权重超参数。 |
 | `vespo_k_neg` | `float` | `3.0` | VESPO 算法特定 Gamma 权重超参数。 |
 | `vespo_lambda_neg` | `float` | `2.0` | VESPO 算法特定 Gamma 权重超参数。 |
-| `ptx_coef` | `float` | `0.0` | PTX 混合预训练 Loss 的权重系数。 |
-| `generate_config` | `GenerateConfig` | `GenerateConfig()` | GRPO 组采样生成数据时的自回归解码参数（可在此配置 `chunked_generate_size`）。 |
+| `generate_config` | `GenerateConfig` | `GenerateConfig(top_p=1.0)` | GRPO 组采样生成数据时的自回归解码参数（默认 `top_p=1.0` 保证采样与求值无偏）。 |
 
 ---
 
@@ -828,7 +886,7 @@ policy_state_dict = extract_policy_weights_from_ppo(model_config, ppo_checkpoint
 
 ## 5. Protocols 回调协议类型定义
 
-框架在 `train_configs.py` 中定义了标准协议接口：
+框架在 `train_configs.py` 与 `generation_service.py` 中定义了标准协议接口：
 
 ### 5.1 奖励计算接口 (`RewardFun`)
 ```python
@@ -837,12 +895,20 @@ class RewardFun(Protocol):
         self,
         prompt_ids: List[torch.Tensor],
         completion_ids: torch.Tensor,
-        gt_answer_ids: List[Optional[torch.Tensor]]
+        gt_answer_ids: List[Optional[torch.Tensor]],
+        *,
+        dones: Optional[List[bool]] = None,
+        generation_masks: Optional[Union[List[List[bool]], torch.Tensor]] = None,
+        feedbacks: Optional[List[str]] = None,
+        **kwargs: Any
     ) -> Union[List[float], List[List[float]], torch.Tensor]:
         """
         支持返回：
-        1. 1D 轨迹标量奖励 (List[float] 或 [N] Tensor): 结果导向，自动赋予序列最后一个有效 Token。
+        1. 1D 轨迹标量奖励 (List[float] 或 [N] Tensor): 结果导向。
+           - 单轮模式：框架自动赋给序列最后一个有效 Token。
+           - 多轮模式：框架精准注入到各样本最后一个有效 Action Token 上并沿轮次反向折现 (Reward-to-Go)。
         2. 2D 逐 Token / 分步稠密奖励 (List[List[float]] 或 [N, max_completion_len] Tensor): 过程监督打分。
+           - 框架自动通过 fold_rewards_to_preceding_action 将反馈噪声折叠至前序 Action 尾部。
         """
         ...
 ```
@@ -860,21 +926,35 @@ class GenerationService(Protocol):
         tokens_per_image: Optional[int]
     ) -> Dict[str, Any]:
         """
-        返回包含 'completions' (List[List[int]])、'dones' (Optional[List[bool]]) 
-        及 'generation_masks' (Optional[List[List[bool]]]) 的字典。
+        返回包含以下键的字典：
+        - 'completions' (List[List[int]]): 包含完整交互轨迹的 Token ID 序列。
+        - 'dones' (Optional[List[bool]]): 每个样本最终的环境终止状态标志。
+        - 'generation_masks' (Optional[List[List[bool]]]): 精确标记哪些 Token 是模型生成的 (True) 以及哪些是环境反馈的 (False)。
+        - 'feedbacks' (Optional[List[str]]): 环境最终返回的文本反馈列表。
         """
         ...
 ```
 
-### 5.3 PTX 混合预训练构建器 (`PtxBuilder`)
+### 5.3 多轮交互环境协议 (`EnvironmentStep` & `FeedbackFormatter`)
 ```python
-class PtxBuilder(Protocol):
+class EnvironmentStep(Protocol):
     def __call__(
         self,
-        prompt_ids: List[torch.Tensor],
-        gt_answer_ids: List[torch.Tensor]
-    ) -> List[torch.Tensor]:
-        """返回长度为 [B] 的拼接后（Prompt + Answer）完整句子 Token 张量列表。"""
+        sample_idx: int,
+        prompt_ids: List[int],
+        history_tokens: List[int],
+        generated_text: str
+    ) -> Tuple[bool, str]:
+        """
+        根据当前轮次模型生成的文本执行环境操作 (运行代码/测试公式/调用工具)。
+        返回: (is_done, feedback)
+        同时向下兼容仅接收 generated_text 单一参数的函数签名。
+        """
+        ...
+
+class FeedbackFormatter(Protocol):
+    def __call__(self, feedback: str) -> str:
+        """将环境反馈信息包装格式化为符合模型的对话格式文本。"""
         ...
 ```
 

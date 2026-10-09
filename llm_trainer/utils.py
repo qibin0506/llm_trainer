@@ -877,3 +877,70 @@ class RunningMeanStd(nn.Module):
             out = x_high / torch.sqrt(self.var + self.epsilon)
 
         return out.to(target_dtype)
+
+
+def fold_rewards_to_preceding_action(
+        rewards_tensor: torch.Tensor,
+        action_mask: torch.Tensor,
+        context_desc: str = "RL"
+) -> torch.Tensor:
+    """
+    检查 2D 奖励中是否存在标注在非 Action Token（如多轮环境反馈 Feedback、Observation 或 Padding）上的奖励。
+    如果存在，打印 Warning 提示用户，并自动将这些奖励沿因果时序折叠/累加到紧邻的前序 Action 连续段的最后一个 Token 上。
+
+    :param rewards_tensor: 形状为 [batch_size, seq_len] 的 2D 奖励张量
+    :param action_mask: 形状为 [batch_size, seq_len] 的布尔掩码，True 表示模型 Action 生成 Token
+    :param context_desc: 上下文描述（例如 "PPO" 或 "GRPO"），用于日志提示
+    :return: 折叠处理后的 2D 奖励张量
+    """
+    if rewards_tensor.dim() != 2:
+        return rewards_tensor
+
+    device = rewards_tensor.device
+    action_mask = action_mask.bool()
+    non_action_rewards = (rewards_tensor != 0) & (~action_mask)
+
+    if not non_action_rewards.any():
+        return rewards_tensor
+
+    if TrainerTools().parallel.is_main_process:
+        Logger.std_log(
+            f"WARN: [{context_desc}] Detected non-zero 2D env rewards on non-action tokens "
+            f"(e.g. environment feedback/observation). In multi-turn Action-level Bridge credit assignment, "
+            f"step rewards must belong to action tokens. Auto-folding and accumulating these rewards "
+            f"into the last token of the immediately preceding Action."
+        )
+
+    out_rewards = rewards_tensor.clone()
+    batch_size, seq_len = rewards_tensor.shape
+
+    # is_action_end: 标记每个 Action 连续段的最后一个 Token
+    is_action_end = action_mask & torch.cat(
+        [~action_mask[:, 1:], action_mask.new_ones(batch_size, 1)],
+        dim=1
+    )
+    seq_indices = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+    action_end_indices = torch.where(is_action_end, seq_indices, torch.tensor(-1, device=device))
+    # 沿时序向前传播最近的 action_end 索引
+    preceding_action_end = action_end_indices.cummax(dim=1).values
+
+    # 兜底：若奖励异常出现在序列中第一个 Action 之前，将其折叠至该样本的第一个 Action 结束处
+    first_action_end = torch.where(
+        is_action_end,
+        seq_indices,
+        torch.tensor(seq_len, device=device)
+    ).cummin(dim=1).values[:, -1:]
+    first_action_end = torch.where(first_action_end < seq_len, first_action_end, torch.tensor(-1, device=device))
+    target_indices = torch.where(preceding_action_end >= 0, preceding_action_end, first_action_end)
+
+    valid_fold_mask = non_action_rewards & (target_indices >= 0) & (target_indices < seq_len)
+    if valid_fold_mask.any():
+        fold_b, fold_t = torch.where(valid_fold_mask)
+        target_t = target_indices[fold_b, fold_t]
+        rewards_to_fold = out_rewards[fold_b, fold_t]
+        # 累加到紧邻的前序 Action 最后一个 Token 上
+        out_rewards.index_put_((fold_b, target_t), rewards_to_fold, accumulate=True)
+        # 将非 Action 位置的奖励清零
+        out_rewards[fold_b, fold_t] = 0.0
+
+    return out_rewards

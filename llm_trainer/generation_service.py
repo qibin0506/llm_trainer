@@ -460,11 +460,6 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
         generation_masks = [[] for _ in range(batch_size)]
         last_feedbacks = ["" for _ in range(batch_size)]
 
-        # 自动将 pad_token 加进 suppress_tokens，防止采样出 pad 导致与训练时 attention mask 产生语义偏移
-        effective_suppress_tokens = list(generate_config.suppress_tokens or [])
-        if pad_token_id not in effective_suppress_tokens:
-            effective_suppress_tokens.append(pad_token_id)
-
         with torch.no_grad(), unwrap_model_for_generation(model) as unwrapped_model:
             gen_model = getattr(unwrapped_model, 'policy_model', unwrapped_model)
 
@@ -545,7 +540,7 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
                             top_k=generate_config.top_k,
                             repetition_penalty=generate_config.repetition_penalty,
                             exclude_penalty_tokens=generate_config.exclude_penalty_tokens,
-                            suppress_tokens=effective_suppress_tokens,
+                            suppress_tokens=generate_config.suppress_tokens,
                             device=device,
                             pixel_values=chunk_pixel_values,
                             tokens_per_image=tokens_per_image,
@@ -572,7 +567,7 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
                         top_k=generate_config.top_k,
                         repetition_penalty=generate_config.repetition_penalty,
                         exclude_penalty_tokens=generate_config.exclude_penalty_tokens,
-                        suppress_tokens=effective_suppress_tokens,
+                        suppress_tokens=generate_config.suppress_tokens,
                         device=device,
                         pixel_values=active_pixel_values,
                         tokens_per_image=tokens_per_image,

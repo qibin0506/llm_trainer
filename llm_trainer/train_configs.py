@@ -401,7 +401,6 @@ class PPOConfig:
         kl_beta (`float`): 基于 KL 散度的初始惩罚奖励系数。
         kl_estimator (`str`): 计算近似 KL 散度的方法，支持 "k1" (log ratio) 或 "k3" (严格近似)。
         huber_delta (`float`): Value 损失函数中 Smooth L1 (Huber Loss) 的平滑阈值 beta。
-        ptx_coef (`float`): 预训练数据 (PTX) Loss 的混合占比系数，用于缓解灾难性遗忘。
         missing_eos_penalty (`Optional[float]`): 针对模型未能正常生成 EOS (结束符) 的硬性奖励惩罚值。
         normalize_rewards (`bool`): 是否在喂给 GAE 前对环境 Reward 进行标准化。
         normalize_method (`str`): Reward 标准化方法，"RunningMeanStd" (流式均值方差) 或 "BatchStd" (当前批次方差)。
@@ -422,7 +421,6 @@ class PPOConfig:
     kl_beta: float = 0.02
     kl_estimator: str = 'k1'
     huber_delta: float = 1.0
-    ptx_coef: float = 0.0
     missing_eos_penalty: Optional[float] = None
     normalize_rewards: bool = False
     normalize_method: str = 'RunningMeanStd'
@@ -452,7 +450,6 @@ class GRPOConfig:
         vespo_lambda_pos (`float`): VESPO 特定参数。
         vespo_k_neg (`float`): VESPO 特定参数。
         vespo_lambda_neg (`float`): VESPO 特定参数。
-        ptx_coef (`float`): 加入预训练监督数据的 Loss 混合权重系数。
         dr_grpo_max_completion_len (`Optional[int]`): Dr. GRPO 算法使用的固定常数长度归一化因子。若为 None，自动使用当前 rollout 的 max_new_tokens，确保不退化为动态平均的 BNPO。
         scale_rewards (`Optional[bool]`): 是否在组内 Advantage 计算中除以标准差 (std)。若为 None，在 loss_type == 'dr_grpo' 时默认设为 False（符合 Dr. GRPO 算法规范），其他模式下默认设为 True。
         token_level_loss_norm (`str`): Token 级损失归一化策略（适用于 'dapo', 'bnpo', 'cispo', 'vespo' 等）。可选 'global'（默认：按全局累积 Batch 的 Token 总量归一化，消除因 micro-batch 划分造成的长度梯度权重偏差）或 'micro_batch'（仅在当前单个 micro-batch 内部归一化）。
@@ -478,7 +475,6 @@ class GRPOConfig:
     vespo_lambda_pos: float = 3.0
     vespo_k_neg: float = 3.0
     vespo_lambda_neg: float = 2.0
-    ptx_coef: float = 0.0
     dr_grpo_max_completion_len: Optional[int] = None
     scale_rewards: Optional[bool] = None
     token_level_loss_norm: str = 'global'
@@ -608,24 +604,6 @@ class GenerationService(Protocol):
         """
         ...
 
-
-class PtxBuilder(Protocol):
-    def __call__(
-            self,
-            prompt_ids: List[torch.Tensor],
-            gt_answer_ids: List[torch.Tensor]
-    ) -> List[torch.Tensor]:
-        """
-        构建预训练校准数据集 (PTX Data Mixture) 的回调函数，用以缓解强化学习阶段的灾难性遗忘。
-
-        Args:
-            prompt_ids (List[torch.Tensor]): 长度为 [B] 的列表，内层 Tensor 形状为 [prompt_len]，对应训练批次下的 Prompts。
-            gt_answer_ids (List[torch.Tensor]): 长度为 [B] 的列表，内层 Tensor 形状为 [answer_len]，对应训练批次下的真值 Answers。
-
-        Returns:
-            长度为 [B] 的拼接后（Prompt + Answer）完整句子 Token 张量列表。每个 Tensor 形状为 [seq_len]。
-        """
-        ...
 
 class TeacherLogitsProvider(Protocol):
     """

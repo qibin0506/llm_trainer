@@ -338,7 +338,7 @@ class PPOLoss(nn.Module):
         :param returns: GAE计算出的回报, 形状: [batch_size, seq_len]
         :param advantages: GAE计算出的优势, 形状: [batch_size, seq_len]
         :param mask: 掩码，只计算生成部分的损失, 形状: [batch_size, seq_len]
-        :return: (总损失, Actor损失, Value损失, Entropy)
+        :return: (总损失, Actor损失, Value损失, Mean NLL)
         """
         if value_mask is None:
             value_mask = mask
@@ -361,8 +361,8 @@ class PPOLoss(nn.Module):
         else:
             value_loss = F.smooth_l1_loss(values, returns, reduction='none', beta=self.huber_delta)
 
-        # Apply mask and average
-        value_loss = 0.5 * (value_loss * value_mask).sum() / value_mask.sum().clamp(min=1.0)
+        # Apply mask and average (F.smooth_l1_loss 内部二次区间已包含 0.5 系数，无需外层再乘 0.5)
+        value_loss = (value_loss * value_mask).sum() / value_mask.sum().clamp(min=1.0)
         value_loss = value_loss * self.vf_coef
 
         # Actor Loss (策略损失)
@@ -393,9 +393,9 @@ class PPOLoss(nn.Module):
                       ((advantages < 0) & ratio.lt(1.0 - self.clip_eps))
             clip_frac = torch.sum(clipped.float() * mask) / mask.sum().clamp(min=1.0)
 
-            entropy = -torch.sum(log_probs * mask) / mask.sum().clamp(min=1.0)
+            mean_nll = -torch.sum(log_probs * mask) / mask.sum().clamp(min=1.0)
 
-        return total_loss, actor_loss, value_loss, approx_kl, clip_frac, entropy
+        return total_loss, actor_loss, value_loss, approx_kl, clip_frac, mean_nll
 
 
 class GRPOLoss(nn.Module):
@@ -452,7 +452,16 @@ class GRPOLoss(nn.Module):
         log_w_seq = torch.clamp(seq_log_ratio, lower_clamp, 20.0)
         w_seq = torch.exp(log_w_seq)
 
-        is_nonneg_adv = advantages >= 0
+        # 确保 advantages 为序列级标量 (B, 1)，消除逐 token 或高维 advantages 造成的张量维度广播错误
+        if advantages.dim() >= 2 and advantages.size(-1) > 1:
+            mask_sum = mask.sum(dim=-1, keepdim=True).clamp(min=1.0)
+            adv_seq = (advantages * mask).sum(dim=-1, keepdim=True) / mask_sum
+        elif advantages.dim() == 1:
+            adv_seq = advantages.unsqueeze(-1)
+        else:
+            adv_seq = advantages
+
+        is_nonneg_adv = adv_seq >= 0
         k_seq = torch.where(
             is_nonneg_adv,
             torch.tensor(k_pos, device=advantages.device),

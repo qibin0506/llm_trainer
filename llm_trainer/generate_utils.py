@@ -429,12 +429,19 @@ def batch_generate(
         pixel_values: Optional[torch.Tensor] = None,
         tokens_per_image: int = -1,
         suppress_tokens: Optional[List[int]] = None,
+        suppress_pad_token: bool = True,
         device: Union[str, torch.device, int],
         return_logits: bool = False,
         auto_prefix_cache: bool = False
 ):
     end_token = TrainerTools().tokenizer.end
     pad_token_id = TrainerTools().tokenizer.pad
+
+    if suppress_pad_token and pad_token_id is not None:
+        if suppress_tokens is None:
+            suppress_tokens = [pad_token_id]
+        elif pad_token_id not in suppress_tokens:
+            suppress_tokens = list(suppress_tokens) + [pad_token_id]
 
     special_tokens = list(TrainerTools().tokenizer.get_special_tokens_dict().values())
     if exclude_penalty_tokens is not None:

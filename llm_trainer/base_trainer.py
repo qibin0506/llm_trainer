@@ -718,6 +718,8 @@ class BaseTrainer:
                 gen_text = TrainerTools().tokenizer.decode(response_ids[0])
                 with open(os.path.join(_get_log_dir(), 'gen.txt'), 'a') as f:
                     f.write(f"{tag}, gen->{eval_prompt}{gen_text}\n")
+
+            TrainerTools().parallel.wait('eval')
         else:
             with unwrap_model_for_generation(self.train_model) as eval_model:
                 if TrainerTools().parallel.is_main_process:
@@ -747,7 +749,7 @@ class BaseTrainer:
 
                     eval_model.train()
 
-        TrainerTools().parallel.wait('eval')
+                TrainerTools().parallel.wait('eval')
 
     def _check_eval_model(self, eval_model):
         return eval_model

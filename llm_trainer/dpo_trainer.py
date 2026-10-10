@@ -279,8 +279,8 @@ class DPOTrainer(BaseTrainer):
 
                         total_loss_unscaled = loss + aux_loss + nll_loss
 
+                        # 每个 epoch 的最后一个 batch 作为累积边界强制提交梯度，防止跨 epoch 泄漏
                         is_last_step = (
-                            epoch == self.train_config.n_epochs - 1 and
                             file_idx == file_count - 1 and
                             batch == batch_count_per_file - 1
                         )
@@ -402,7 +402,8 @@ class DPOTrainer(BaseTrainer):
                     del rejected_rewards
                     del reward_margin
                     del reward_accuracy
-                except UnboundLocalError: ...
+                except (NameError, UnboundLocalError):
+                    pass
 
                 if hasattr(TrainerTools().parallel, '_sampler'):
                     TrainerTools().parallel._sampler = None
@@ -411,6 +412,18 @@ class DPOTrainer(BaseTrainer):
                 empty_cache()
 
             # end epoch
+            if batches_accumulated > 0:
+                self._update_step(is_last_step=True)
+                batches_accumulated = 0
+                loss_accumulation = 0.0
+                dpo_loss_accumulation = 0.0
+                aux_loss_accumulation = 0.0
+                nll_loss_accumulation = 0.0
+                ce_loss_accumulation = 0.0
+                chosen_reward_accumulation = 0.0
+                rejected_reward_accumulation = 0.0
+                reward_margin_accumulation = 0.0
+                reward_accuracy_accumulation = 0.0
 
             # reset resume state
             self.resume_file_idx = 0

@@ -515,20 +515,14 @@ class BaseTrainer:
 
         if parallel_kwargs and isinstance(TrainerTools().parallel, DsParallel):
             stage = parallel_kwargs.get("zero_optimization", {}).get("stage", 0)
-            if model_config is not None:
-                hidden_size = model_config.hidden_size
-                if hidden_size is not None and stage == 3:
-                    # Note that `stage3_prefetch_bucket_size` can produce DeepSpeed messages like: `Invalidate trace cache
-                    # @ step 0: expected module 1, but got module 0`
-                    # This is expected and is not an error
-                    zero_optimization = parallel_kwargs.get("zero_optimization", {})
-                    zero_optimization.update(
-                        {
-                            "reduce_bucket_size": int(hidden_size * hidden_size),
-                            "stage3_param_persistence_threshold": int(10 * hidden_size),
-                            "stage3_prefetch_bucket_size": int(0.9 * hidden_size * hidden_size),
-                        }
-                    )
+            if stage == 3:
+                zero_optimization = parallel_kwargs.get("zero_optimization", {})
+                zero_optimization.update(
+                    {
+                        "stage3_param_persistence_threshold": 0,
+                        "stage3_prefetch_bucket_size": 0,
+                    }
+                )
 
             parallel_kwargs.pop('activation_checkpointing', None)
             parallel_kwargs.pop('gradient_clipping', None)
@@ -718,8 +712,6 @@ class BaseTrainer:
                 gen_text = TrainerTools().tokenizer.decode(response_ids[0])
                 with open(os.path.join(_get_log_dir(), 'gen.txt'), 'a') as f:
                     f.write(f"{tag}, gen->{eval_prompt}{gen_text}\n")
-
-            TrainerTools().parallel.wait('eval')
         else:
             with unwrap_model_for_generation(self.train_model) as eval_model:
                 if TrainerTools().parallel.is_main_process:
@@ -749,7 +741,7 @@ class BaseTrainer:
 
                     eval_model.train()
 
-                TrainerTools().parallel.wait('eval')
+        TrainerTools().parallel.wait('eval')
 
     def _check_eval_model(self, eval_model):
         return eval_model
@@ -864,9 +856,9 @@ class BaseTrainer:
                                     labels
                                 )
 
+                        # 每个 epoch 的最后一个 batch 作为累积边界强制提交梯度，防止跨 epoch 泄漏
                         is_last_step = (
-                            epoch == self.train_config.n_epochs - 1
-                            and file_idx == file_count - 1
+                            file_idx == file_count - 1
                             and batch == batch_count_per_file - 1
                         )
 
@@ -941,12 +933,12 @@ class BaseTrainer:
                     del inputs
                     del labels
                     del attention_mask
-                    del result
-                    del loss
                     del total_loss_unscaled
+                    del ce_loss
                     del aux_loss
                     del pixel_values
-                except UnboundLocalError: ...
+                except (NameError, UnboundLocalError):
+                    pass
 
                 if hasattr(TrainerTools().parallel, '_sampler'):
                     TrainerTools().parallel._sampler = None
@@ -955,6 +947,12 @@ class BaseTrainer:
                 empty_cache()
 
             # end epoch
+            if batches_accumulated > 0:
+                self._update_step(is_last_step=True)
+                batches_accumulated = 0
+                loss_accumulation = 0.0
+                aux_loss_accumulation = 0.0
+                ce_loss_accumulation = 0.0
 
             # reset resume state
             self.resume_file_idx = 0

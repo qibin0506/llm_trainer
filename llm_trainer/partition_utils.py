@@ -348,8 +348,13 @@ def _add_hooks(model: nn.Module) -> None:
         optimizer_offload = model.optimizer
     else:
         raise RuntimeError("The model optimizer is None, which is not yet supported.")
+
+    if hasattr(optimizer_offload, "param_coordinator"):
+        coordinator = optimizer_offload.param_coordinator
+        if not coordinator.is_invalid_trace():
+            coordinator._invalidate_trace()
+
     if version.parse(deepspeed.__version__) >= version.parse("0.16.4"):
-        # Account for renaming in https://github.com/deepspeedai/DeepSpeed/pull/6847
         optimizer_offload._register_deepspeed_module(optimizer_offload.module)
     else:
         optimizer_offload._register_hooks_recursively(optimizer_offload.module)

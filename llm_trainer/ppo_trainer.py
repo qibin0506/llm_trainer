@@ -1029,10 +1029,10 @@ class PPOTrainer(BaseTrainer):
 
         ppo_batch_size = self.ppo_config.ppo_batch_size
         total_micro_batches_processed = 0
-        global_micro_batch_idx = 0
 
         for ppo_epoch in range(self.ppo_config.ppo_epochs):
             indices = torch.randperm(batch_size, device=TrainerTools().parallel.device)
+            micro_batch_idx = 0
 
             for i in range(0, batch_size, ppo_batch_size):
                 mini_batch_indices = indices[i: i + ppo_batch_size]
@@ -1090,10 +1090,8 @@ class PPOTrainer(BaseTrainer):
 
                 ppo_loss_unscaled = loss + aux_loss
 
-                is_last_mini_batch = (
-                    ppo_epoch == self.ppo_config.ppo_epochs - 1
-                    and (i + ppo_batch_size >= batch_size)
-                )
+                # 每个 ppo_epoch 的最后一个 micro-batch 强制作为边界提交累积梯度，防止跨 epoch 泄漏
+                is_last_mini_batch = (i + ppo_batch_size >= batch_size)
 
                 if self.is_ds:
                     if is_last_mini_batch:
@@ -1102,9 +1100,9 @@ class PPOTrainer(BaseTrainer):
                     else:
                         need_update_step = self.train_model.is_gradient_accumulation_boundary()
                 else:
-                    global_micro_batch_idx += 1
+                    micro_batch_idx += 1
                     need_update_step = (
-                        global_micro_batch_idx % self.gradient_accumulation_steps == 0
+                        micro_batch_idx % self.gradient_accumulation_steps == 0
                         or is_last_mini_batch
                     )
 
@@ -1136,9 +1134,10 @@ class PPOTrainer(BaseTrainer):
         global_steps_since_last_save = 0
         global_steps_since_last_eval = 0
 
-        micro_batches_per_rollout = self.train_config.batch_size / self.ppo_config.ppo_batch_size
-        updates_per_rollout = (self.ppo_config.ppo_epochs * micro_batches_per_rollout) / self.gradient_accumulation_steps
-        global_steps_per_rollout = max(1, math.ceil(updates_per_rollout))
+        micro_batches_per_epoch = math.ceil(self.train_config.batch_size / self.ppo_config.ppo_batch_size)
+        updates_per_epoch = math.ceil(micro_batches_per_epoch / self.gradient_accumulation_steps)
+        updates_per_rollout = self.ppo_config.ppo_epochs * updates_per_epoch
+        global_steps_per_rollout = max(1, updates_per_rollout)
 
         for epoch in range(self.resume_epoch, self.train_config.n_epochs):
             file_count = len(self.train_config.file_dataset)

@@ -184,6 +184,9 @@ class LMLoss(nn.Module):
         shift_labels = F.pad(labels[..., 1:], (0, 1), value=self.ignore_index)
         logits = logits.reshape(-1, logits.shape[-1])
         targets = shift_labels.reshape(-1)
+        valid_mask = targets != self.ignore_index
+        if not valid_mask.any():
+            return (logits.float() * 0.0).sum()
 
         ce_loss = F.cross_entropy(
             logits,

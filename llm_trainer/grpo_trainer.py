@@ -787,7 +787,6 @@ class GRPOTrainer(BaseTrainer):
         }
 
         total_micro_batches_processed = 0
-        global_micro_batch_idx = 0
 
         # 计算全局 Token 级归一化因子（仅用于 DAPO / BNPO / CISPO / VESPO 等消除 micro-batch 划分造成的长度梯度权重偏差）
         # 对于标准 "grpo" 以及 "sapo", "dr_grpo", "luspo"，不依赖全局 token 归一化，跳过跨卡通信
@@ -811,6 +810,7 @@ class GRPOTrainer(BaseTrainer):
 
         for grpo_epoch in range(self.grpo_config.grpo_epochs):
             indices = torch.randperm(total_samples, device=device)
+            micro_batch_idx = 0
 
             for i in range(0, total_samples, grpo_batch_size):
                 mini_batch_indices = indices[i:i + grpo_batch_size]
@@ -874,10 +874,8 @@ class GRPOTrainer(BaseTrainer):
 
                 grpo_loss_unscaled = loss + aux_loss
 
-                is_last_mini_batch = (
-                    grpo_epoch == self.grpo_config.grpo_epochs - 1
-                    and (i + grpo_batch_size >= total_samples)
-                )
+                # 每个 grpo_epoch 的最后一个 micro-batch 强制作为边界提交累积梯度，防止跨 epoch 泄漏
+                is_last_mini_batch = (i + grpo_batch_size >= total_samples)
 
                 if self.is_ds:
                     if is_last_mini_batch:
@@ -886,9 +884,9 @@ class GRPOTrainer(BaseTrainer):
                     else:
                         need_update_step = self.train_model.is_gradient_accumulation_boundary()
                 else:
-                    global_micro_batch_idx += 1
+                    micro_batch_idx += 1
                     need_update_step = (
-                        global_micro_batch_idx % self.gradient_accumulation_steps == 0
+                        micro_batch_idx % self.gradient_accumulation_steps == 0
                         or is_last_mini_batch
                     )
 
@@ -917,9 +915,10 @@ class GRPOTrainer(BaseTrainer):
         global_steps_since_last_save = 0
         global_steps_since_last_eval = 0
 
-        micro_batches_per_rollout = (self.train_config.batch_size * self.grpo_config.group_size) / self.grpo_config.grpo_batch_size
-        updates_per_rollout = (self.grpo_config.grpo_epochs * micro_batches_per_rollout) / self.gradient_accumulation_steps
-        global_steps_per_rollout = max(1, math.ceil(updates_per_rollout))
+        micro_batches_per_epoch = math.ceil((self.train_config.batch_size * self.grpo_config.group_size) / self.grpo_config.grpo_batch_size)
+        updates_per_epoch = math.ceil(micro_batches_per_epoch / self.gradient_accumulation_steps)
+        updates_per_rollout = self.grpo_config.grpo_epochs * updates_per_epoch
+        global_steps_per_rollout = max(1, updates_per_rollout)
 
         for epoch in range(self.resume_epoch, self.train_config.n_epochs):
             file_count = len(self.train_config.file_dataset)

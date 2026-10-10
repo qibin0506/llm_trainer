@@ -518,12 +518,17 @@ def log_softmax(logits, index) -> torch.Tensor:
     return selected_log_probs.squeeze(-1)
 
 
-def masked_whiten(values: torch.Tensor, mask: torch.Tensor, shift_mean: bool = True) -> torch.Tensor:
-    """Whiten values with masked values."""
+def masked_whiten(
+        values: torch.Tensor,
+        mask: torch.Tensor,
+        shift_mean: bool = True,
+        distributed: bool = True
+) -> torch.Tensor:
+    """Whiten values with masked values across distributed ranks."""
     values = values.float()
     mask = mask.float()
 
-    mean, var = _masked_mean(values, mask), _masked_var(values, mask)
+    mean, var = _masked_mean_and_var(values, mask, unbiased=True, distributed=distributed)
     whitened = (values - mean) * torch.rsqrt(var + 1e-8)
     if not shift_mean:
         whitened += mean
@@ -588,28 +593,84 @@ def disable_dropout_in_model(model: torch.nn.Module) -> None:
             module.p = 0
 
 
-def _masked_mean(values: torch.Tensor, mask: torch.Tensor, axis: Optional[int] = None) -> torch.Tensor:
-    """Compute mean of tensor with a masked values."""
-    if axis is not None:
-        return (values * mask).sum(axis=axis) / mask.sum(axis=axis).clamp(min=1.0)
-    else:
-        return (values * mask).sum() / mask.sum().clamp(min=1.0)
+def _masked_mean_and_var(
+        values: torch.Tensor,
+        mask: torch.Tensor,
+        unbiased: bool = True,
+        distributed: bool = True
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute mean and variance of tensor with masked values, supporting distributed all_reduce."""
+    values_fp32 = values.float()
+    mask_fp32 = mask.float()
+    val_sum = (values_fp32 * mask_fp32).sum()
+    mask_sum = mask_fp32.sum()
 
+    is_distributed = (
+        distributed
+        and TrainerTools().parallel.world_size > 1
+    )
 
-def _masked_var(values: torch.Tensor, mask: torch.Tensor, unbiased: bool = True) -> torch.Tensor:
-    """Compute variance of tensor with masked values."""
-    mean = _masked_mean(values, mask)
-    centered_values = values - mean
-    variance = _masked_mean(centered_values**2, mask)
+    if is_distributed:
+        stats = torch.stack([val_sum, mask_sum])
+        needs_cuda_transfer = (
+            stats.device.type == 'cpu'
+            and dist.get_backend() == 'nccl'
+            and torch.cuda.is_available()
+        )
+        if needs_cuda_transfer:
+            target_device = torch.device(f"cuda:{dist.get_rank() % torch.cuda.device_count()}")
+            stats_dev = stats.to(target_device)
+            dist.all_reduce(stats_dev, op=dist.ReduceOp.SUM)
+            stats = stats_dev.to(stats.device)
+        else:
+            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+        val_sum, mask_sum = stats[0], stats[1]
+
+    mean = val_sum / mask_sum.clamp(min=1.0)
+    centered = values_fp32 - mean
+    var_sum = (centered**2 * mask_fp32).sum()
+
+    if is_distributed:
+        if needs_cuda_transfer:
+            var_sum_dev = var_sum.to(target_device)
+            dist.all_reduce(var_sum_dev, op=dist.ReduceOp.SUM)
+            var_sum = var_sum_dev.to(var_sum.device)
+        else:
+            dist.all_reduce(var_sum, op=dist.ReduceOp.SUM)
+
+    variance = var_sum / mask_sum.clamp(min=1.0)
     if unbiased:
-        mask_sum = mask.sum()
-        if mask_sum == 0:
-            return torch.tensor(0.0, device=values.device, dtype=values.dtype)
+        if mask_sum <= 1.0:
+            variance = torch.tensor(0.0, device=values.device, dtype=torch.float32)
+        else:
+            bessel_correction = mask_sum / (mask_sum - 1.0)
+            variance = variance * bessel_correction
 
-        # note that if mask_sum == 1, then there is a division by zero issue
-        # to avoid it you just need to use a larger minibatch_size
-        bessel_correction = mask_sum / (mask_sum - 1).clamp(min=1.0)
-        variance = variance * bessel_correction
+    return mean, variance
+
+
+def _masked_mean(
+        values: torch.Tensor,
+        mask: torch.Tensor,
+        axis: Optional[int] = None,
+        distributed: bool = True
+) -> torch.Tensor:
+    """Compute mean of tensor with masked values."""
+    if axis is not None:
+        return (values.float() * mask.float()).sum(axis=axis) / mask.float().sum(axis=axis).clamp(min=1.0)
+    else:
+        mean, _ = _masked_mean_and_var(values, mask, distributed=distributed)
+        return mean
+
+
+def _masked_var(
+        values: torch.Tensor,
+        mask: torch.Tensor,
+        unbiased: bool = True,
+        distributed: bool = True
+) -> torch.Tensor:
+    """Compute variance of tensor with masked values."""
+    _, variance = _masked_mean_and_var(values, mask, unbiased=unbiased, distributed=distributed)
     return variance
 
 
@@ -841,9 +902,9 @@ class RunningMeanStd(nn.Module):
         batch_count = torch.tensor(count, device=device, dtype=torch.float64)
 
         if TrainerTools().parallel.parallel_train:
-            dist.all_reduce(batch_count, op=dist.ReduceOp.SUM)
-            dist.all_reduce(batch_sum, op=dist.ReduceOp.SUM)
-            dist.all_reduce(batch_sum_sq, op=dist.ReduceOp.SUM)
+            stats = torch.stack([batch_count, batch_sum, batch_sum_sq])
+            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+            batch_count, batch_sum, batch_sum_sq = stats[0], stats[1], stats[2]
 
         if batch_count.item() == 0:
             return

@@ -99,20 +99,12 @@ class Parallel(ABC):
 
     def on_epoch_end(self, epoch): ...
 
-    def synchronize(self):
-        if self._use_parallel:
-            if self.device_type == 'cuda' and torch.cuda.is_available():
-                torch.cuda.synchronize()
-            elif self.device_type == 'npu' and hasattr(torch, 'npu'):
-                torch.npu.synchronize()
-            elif self.device_type == 'mlu' and hasattr(torch, 'mlu'):
-                torch.mlu.synchronize()
-            elif self.device_type == 'mps' and hasattr(torch, 'mps'):
-                torch.mps.synchronize()
-
     def destroy(self):
-        if self._use_parallel:
-            dist.destroy_process_group()
+        if self._use_parallel and dist.is_initialized():
+            try:
+                dist.destroy_process_group()
+            except Exception:
+                pass
 
     @property
     def parallel_train(self) -> bool:
@@ -188,10 +180,6 @@ class DsParallel(Parallel):
             self.model = model
 
         return model, optim
-
-    def synchronize(self): ...
-
-    def destroy(self): ...
 
 
 class NoneParallel(Parallel):

@@ -235,6 +235,45 @@ class DPODataset(Dataset):
     def __len__(self):
         return len(self.data)
 
+    def _truncate_sequence(self, token_ids: list) -> list:
+        """ 超出长度限制，进行左侧截断 """
+        if len(token_ids) <= self.block_size:
+            return token_ids
+
+        assistant_id =  TrainerTools().tokenizer.assistant
+        user_id =  TrainerTools().tokenizer.user
+        system_id =  TrainerTools().tokenizer.system
+
+        last_assistant_idx = -1
+        for idx in range(len(token_ids) - 1, -1, -1):
+            if token_ids[idx] == assistant_id:
+                last_assistant_idx = idx
+                break
+
+        if last_assistant_idx == -1:
+            return token_ids[:self.block_size]
+
+        prompt_ids = token_ids[:last_assistant_idx + 1]
+        completion_ids = token_ids[last_assistant_idx + 1:]
+
+        if len(completion_ids) == 0:
+            return token_ids[:self.block_size]
+
+        min_prompt_len = 4
+        max_comp_len = max(self.block_size - min_prompt_len, 1)
+
+        if len(completion_ids) > max_comp_len:
+            completion_ids = completion_ids[:max_comp_len]
+
+        avail_prompt_len = self.block_size - len(completion_ids)
+
+        if len(prompt_ids) > avail_prompt_len:
+            prompt_ids = prompt_ids[-avail_prompt_len:]
+            if prompt_ids[0] not in (user_id, system_id):
+                prompt_ids[0] = user_id
+
+        return prompt_ids + completion_ids
+
     def __getitem__(self, item):
         record = self.data[item]
 
@@ -252,8 +291,8 @@ class DPODataset(Dataset):
         if isinstance(rejected_id, (np.ndarray, torch.Tensor)): rejected_id = rejected_id.tolist()
 
         return {
-            'chosen': chosen_id[:self.block_size],
-            'rejected': rejected_id[:self.block_size]
+            'chosen': self._truncate_sequence(chosen_id),
+            'rejected': self._truncate_sequence(rejected_id)
         }
 
 

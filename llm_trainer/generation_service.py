@@ -236,17 +236,18 @@ class ParallelGenerationService(GenerationServiceBase):
             tokens_per_image: Optional[int] = -1
     ):
         state_dict = self._get_clean_state_dict_on_rank0(model)
-        if TrainerTools().parallel.is_main_process:
-            self.gen_model.load_state_dict(state_dict)
+        self._sync_weights(state_dict)
 
-            del state_dict
-            gc.collect()
-            empty_cache()
+        del state_dict
+        gc.collect()
+        empty_cache()
 
-            max_new_tokens = max(generate_config.max_seq_len - prompt_ids.shape[1], 1)
+        local_prompts_tensor = prompt_ids.to(self.generation_device)
+        max_new_tokens = max(generate_config.max_seq_len - local_prompts_tensor.shape[1], 1)
+        with torch.no_grad():
             out_ids = generate(
                 self.gen_model,
-                prompt=prompt_ids,
+                prompt=local_prompts_tensor,
                 max_new_tokens=max_new_tokens,
                 temperature=generate_config.temperature,
                 top_k=generate_config.top_k,
@@ -260,10 +261,8 @@ class ParallelGenerationService(GenerationServiceBase):
                 return_token=True
             )
 
-            prompt_len = prompt_ids.shape[1]
-            return [out_ids[prompt_len:].cpu().tolist()]
-
-        return None
+        prompt_len = local_prompts_tensor.shape[1]
+        return [out_ids[prompt_len:].cpu().tolist()]
 
     def _generate(
             self,

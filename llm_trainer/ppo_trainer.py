@@ -1,4 +1,5 @@
 from typing import Tuple, List, Union, Optional, Dict, Any
+from contextlib import nullcontext
 import gc
 import math
 from itertools import islice
@@ -33,7 +34,7 @@ from .utils import (
 )
 from .checkpoint import save_checkpoint, save_steps, load_checkpoint
 from .scheduler import LRScheduler, WarmupCosineAnnealingLRScheduler, CompositeLRScheduler, NoneLRScheduler
-from .partition_utils import unwrap_model_for_generation
+from .partition_utils import unwrap_model_for_generation, zero3_trace_guard, add_fused_lm_head
 from .muon import MuonWithAdamW, _get_ds_muon
 
 
@@ -67,7 +68,7 @@ class ValueModel(nn.Module):
         self.value_head = ValueHead(base_model.config.hidden_size, 1, bias=True)
 
     def forward(self, *args, **kwargs) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        base_kwargs = {k: v for k, v in kwargs.items() if k not in ('return_logits', 'logits_to_keep')}
+        base_kwargs = {k: v for k, v in kwargs.items() if k not in ('return_logits', 'logits_to_keep', 'fused_lm_head', 'completion_ids', 'completion_mask')}
         outputs = self.base_model(*args, return_logits=False, **base_kwargs)
         # [batch_size, seq_len, hidden_size]
         last_hidden_state = outputs['hidden_states']
@@ -136,11 +137,14 @@ class PPOTrainer(BaseTrainer):
             if self.ppo_config.normalize_method == 'RunningMeanStd':
                 self.reward_normalizer = RunningMeanStd(shape=()).to(TrainerTools().parallel.device)
 
+        self.chunked_log_probs_size = self.ppo_config.chunked_log_probs_size
+        self.rollout_eval_batch_size = self.ppo_config.rollout_eval_batch_size
         super().__init__(
             train_config=train_config,
             eval_prompts=eval_prompts,
             generation_service=generation_service,
-            gradient_accumulation_steps=self.ppo_config.gradient_accumulation_steps
+            gradient_accumulation_steps=self.ppo_config.gradient_accumulation_steps,
+            return_logits=self.chunked_log_probs_size is None
         )
 
         ppo_batch_size = self.ppo_config.ppo_batch_size
@@ -167,6 +171,7 @@ class PPOTrainer(BaseTrainer):
             policy_model = self._new_model(self.train_config)
             value_model = ValueModel(self._new_model(self.train_config))
 
+        self._check_add_fused_head(policy_model)
         train_model = PolicyAndValueModelWrapper(policy_model, value_model)
 
         if self.train_config.is_gradient_checkpointing:
@@ -211,6 +216,11 @@ class PPOTrainer(BaseTrainer):
         )
 
         return model, optim
+
+
+    def _check_add_fused_head(self, model):
+        if self.chunked_log_probs_size is not None:
+            add_fused_lm_head(model, chunk_size=self.chunked_log_probs_size)
 
     def _config_optim(self, model, initial_lr):
         policy_config = self.train_config.optim_config
@@ -427,6 +437,7 @@ class PPOTrainer(BaseTrainer):
             param.requires_grad = False
 
         self._load_external_weights(ref_model, self.ppo_config.ref_model_weights_path)
+        self._check_add_fused_head(ref_model)
 
         ref_model, _ = TrainerTools().parallel.process(
             model=ref_model,
@@ -476,7 +487,8 @@ class PPOTrainer(BaseTrainer):
                 ds_config,
                 self.gradient_accumulation_steps,
                 self.ppo_config.ppo_batch_size,
-                optim_type
+                optim_type,
+                gradient_clipping=self.train_config.gradient_clipping
             )
 
         data_loader_kwargs, sampler_kwargs = _build_data_loader_config(
@@ -558,40 +570,66 @@ class PPOTrainer(BaseTrainer):
             input_ids: torch.Tensor,
             attention_mask: Optional[torch.Tensor],
             completion_ids: torch.Tensor,
-            chunk_size: Optional[int] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+            batch_size: Optional[int] = None,
+            forward_type: str = 'both'
+    ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
+        """
+        计算 LogProbs 与 Values：
+        1. 支持 forward_type='both'（Policy 与 Value 共同前向）或 'value'（仅 Value 前向）
+        2. 支持 batch_size 样本维度切片：None 为全量计算，整数则按样本批次分块前向以降低显存峰值
+        3. 在 no_grad 模式下自动对每个 forward 应用细粒度 zero3_trace_guard 保护，杜绝跨 batch Trace 累积
+        """
+        is_no_grad = not torch.is_grad_enabled()
+
+        use_fused = (self.chunked_log_probs_size is not None)
+
         def _step_forward(inp_ids, att_mask, comp_ids):
             pos_ids = calc_position_ids(att_mask)
             comp_len = comp_ids.size(1)
-            policy_output, value_output = model(
-                inp_ids,
-                attention_mask=att_mask,
-                position_ids=pos_ids,
-                forward_type='both',
-                return_logits=True,
-                logits_to_keep=comp_len + 1
-            )
+            comp_mask = att_mask[:, -comp_len:].bool() if (att_mask is not None and att_mask.size(1) >= comp_len) else None
 
-            logits_completion = policy_output['logits'][:, :-1, :][:, -comp_len:, :].float()
-            log_probs = log_softmax(logits_completion, comp_ids)
-            values = value_output[0]
+            guard = zero3_trace_guard(model) if is_no_grad else nullcontext()
+            with guard:
+                policy_output, value_output = model(
+                    inp_ids,
+                    attention_mask=att_mask,
+                    position_ids=pos_ids,
+                    completion_ids=comp_ids if (use_fused and forward_type in ('both', 'policy')) else None,
+                    completion_mask=comp_mask if (use_fused and forward_type in ('both', 'policy')) else None,
+                    fused_lm_head=use_fused if forward_type in ('both', 'policy') else False,
+                    forward_type=forward_type,
+                    return_logits=not use_fused
+                )
+
+            if policy_output is not None:
+                if 'log_probs' in policy_output:
+                    log_probs = policy_output['log_probs']
+                else:
+                    logits_completion = policy_output['logits'][:, :-1, :][:, -comp_len:, :].float()
+                    log_probs = log_softmax(logits_completion, comp_ids)
+            else:
+                log_probs = None
+            values = value_output[0] if value_output is not None else None
 
             return log_probs, values
 
-        if chunk_size is None or chunk_size <= 0 or chunk_size >= input_ids.size(0):
+        if batch_size is None or batch_size <= 0 or batch_size >= input_ids.size(0):
             return _step_forward(input_ids, attention_mask, completion_ids)
 
         all_log_probs = []
         all_values = []
-        for i in range(0, input_ids.size(0), chunk_size):
-            c_input_ids = input_ids[i: i + chunk_size]
-            c_attention_mask = attention_mask[i: i + chunk_size]
-            c_completion_ids = completion_ids[i: i + chunk_size]
+        for i in range(0, input_ids.size(0), batch_size):
+            c_input_ids = input_ids[i: i + batch_size]
+            c_attention_mask = attention_mask[i: i + batch_size] if attention_mask is not None else None
+            c_completion_ids = completion_ids[i: i + batch_size]
             log_probs, values = _step_forward(c_input_ids, c_attention_mask, c_completion_ids)
-            all_log_probs.append(log_probs)
+            if log_probs is not None:
+                all_log_probs.append(log_probs)
             all_values.append(values)
 
-        return torch.cat(all_log_probs, dim=0), torch.cat(all_values, dim=0)
+        total_log_probs = torch.cat(all_log_probs, dim=0) if all_log_probs else None
+        total_values = torch.cat(all_values, dim=0)
+        return total_log_probs, total_values
 
     def _compute_ref_log_probs(
             self,
@@ -599,32 +637,49 @@ class PPOTrainer(BaseTrainer):
             input_ids: torch.Tensor,
             attention_mask: Optional[torch.Tensor],
             completion_ids: torch.Tensor,
-            chunk_size: Optional[int] = None
+            batch_size: Optional[int] = None
     ) -> torch.Tensor:
+        """
+        计算参考模型的 LogProbs：
+        在 no_grad 模式下自动对每个 forward 应用细粒度 zero3_trace_guard 保护，杜绝跨 batch Trace 累积
+        """
+        is_no_grad = not torch.is_grad_enabled()
+
+        use_fused = (self.chunked_log_probs_size is not None)
+
         def _step_forward(inp_ids, att_mask, comp_ids):
             pos_ids = calc_position_ids(att_mask)
             comp_len = comp_ids.size(1)
-            outputs = model(
-                inp_ids,
-                attention_mask=att_mask,
-                position_ids=pos_ids,
-                return_logits=True,
-                logits_to_keep=comp_len + 1
-            )
+            comp_mask = att_mask[:, -comp_len:].bool() if (att_mask is not None and att_mask.size(1) >= comp_len) else None
 
-            logits_completion = outputs['logits'][:, :-1, :][:, -comp_len:, :].float()
-            log_probs = log_softmax(logits_completion, comp_ids)
+            guard = zero3_trace_guard(model) if is_no_grad else nullcontext()
+            with guard:
+                outputs = model(
+                    inp_ids,
+                    attention_mask=att_mask,
+                    position_ids=pos_ids,
+                    completion_ids=comp_ids if use_fused else None,
+                    completion_mask=comp_mask if use_fused else None,
+                    fused_lm_head=use_fused,
+                    return_logits=not use_fused
+                )
+
+            if isinstance(outputs, dict) and 'log_probs' in outputs:
+                log_probs = outputs['log_probs']
+            else:
+                logits_completion = outputs['logits'][:, :-1, :][:, -comp_len:, :].float()
+                log_probs = log_softmax(logits_completion, comp_ids)
 
             return log_probs
 
-        if chunk_size is None or chunk_size <= 0 or chunk_size >= input_ids.size(0):
+        if batch_size is None or batch_size <= 0 or batch_size >= input_ids.size(0):
             return _step_forward(input_ids, attention_mask, completion_ids)
 
         all_log_probs = []
-        for i in range(0, input_ids.size(0), chunk_size):
-            c_input_ids = input_ids[i: i + chunk_size]
-            c_attention_mask = attention_mask[i: i + chunk_size]
-            c_completion_ids = completion_ids[i: i + chunk_size]
+        for i in range(0, input_ids.size(0), batch_size):
+            c_input_ids = input_ids[i: i + batch_size]
+            c_attention_mask = attention_mask[i: i + batch_size] if attention_mask is not None else None
+            c_completion_ids = completion_ids[i: i + batch_size]
             log_probs = _step_forward(c_input_ids, c_attention_mask, c_completion_ids)
             all_log_probs.append(log_probs)
 
@@ -685,6 +740,11 @@ class PPOTrainer(BaseTrainer):
                 padded_completions = []
                 padded_gen_masks = []
                 max_comp_len = max((len(c) for c in completion_ids_list), default=0)
+                if TrainerTools().parallel.parallel_train and dist.is_initialized():
+                    max_comp_len_t = torch.tensor(max_comp_len, dtype=torch.long, device=device)
+                    dist.all_reduce(max_comp_len_t, op=dist.ReduceOp.MAX)
+                    max_comp_len = int(max_comp_len_t.item())
+
                 if max_comp_len == 0:
                     max_comp_len = 1
 
@@ -719,6 +779,8 @@ class PPOTrainer(BaseTrainer):
                     dones = torch.any(completion_ids == eos_token_id, dim=1)
 
                 full_ids = torch.cat([padded_prompt_ids, completion_ids], dim=1)
+
+                TrainerTools().parallel.wait('rollout')
             else:
                 with unwrap_model_for_generation(self.train_model) as unwrapped_model:
                     gen_chunk_size = self.ppo_config.generate_config.chunked_generate_size
@@ -749,6 +811,13 @@ class PPOTrainer(BaseTrainer):
                         max_comp_len = max(max_comp_len, comp.shape[1])
                         chunk_completions.append(comp)
 
+                    # 跨卡全局同步最大补全长度：
+                    # 消除不同 Rank 因提前遇到 EOS 生成长度不同导致的退出相移死锁
+                    if TrainerTools().parallel.parallel_train and dist.is_initialized():
+                        max_comp_len_t = torch.tensor(max_comp_len, dtype=torch.long, device=device)
+                        dist.all_reduce(max_comp_len_t, op=dist.ReduceOp.MAX)
+                        max_comp_len = int(max_comp_len_t.item())
+
                     if max_comp_len == 0:
                         if TrainerTools().parallel.is_main_process:
                             Logger.std_log(
@@ -768,6 +837,8 @@ class PPOTrainer(BaseTrainer):
                     ]
                     completion_ids = torch.cat(padded_comps, dim=0)
                     full_ids = torch.cat([padded_prompt_ids, completion_ids], dim=1)
+
+                    TrainerTools().parallel.wait('rollout')
                 dones = torch.any(completion_ids == eos_token_id, dim=1)
 
         return {
@@ -801,24 +872,46 @@ class PPOTrainer(BaseTrainer):
 
         full_attention_mask = self._calc_attention_mask(full_ids)
 
-        chunk_size = self.ppo_config.chunked_log_probs_size
+        total_samples = full_ids.size(0)
+        accum_steps = self.gradient_accumulation_steps
+        samples_per_accum_window = self.ppo_config.ppo_batch_size * accum_steps
+        can_skip_policy = (
+            (self.ppo_config.kl_beta == 0.0 or self.ref_model is None)
+            and (total_samples <= samples_per_accum_window)
+        )
+
+        eval_batch_size = self.rollout_eval_batch_size
         with torch.no_grad():
             with autocast(TrainerTools().parallel.device_type):
-                old_log_probs, value_output = self._compute_log_probs_and_values(
-                    self.train_model,
-                    full_ids,
-                    full_attention_mask,
-                    completion_ids,
-                    chunk_size
-                )
+                if can_skip_policy:
+                    # kl_beta == 0 且单累积窗口对齐时，Rollout 阶段无需 Policy 前向计算 old_log_probs，
+                    # 仅前向 Value 模型计算状态价值，完全跳过庞大的 Policy 策略主干与 LM Head，
+                    # 节省约 50% 算力与通信，并从源头消除 Policy 模型的 ZeRO-3 Trace 隐患
+                    old_log_probs, value_output = self._compute_log_probs_and_values(
+                        self.train_model,
+                        full_ids,
+                        full_attention_mask,
+                        completion_ids,
+                        batch_size=eval_batch_size,
+                        forward_type='value'
+                    )
+                else:
+                    old_log_probs, value_output = self._compute_log_probs_and_values(
+                        self.train_model,
+                        full_ids,
+                        full_attention_mask,
+                        completion_ids,
+                        batch_size=eval_batch_size,
+                        forward_type='both'
+                    )
 
-                if self.ref_model is not None:
+                if self.ref_model is not None and not can_skip_policy:
                     ref_log_probs_completion = self._compute_ref_log_probs(
                         self.ref_model,
                         full_ids,
                         full_attention_mask,
                         completion_ids,
-                        chunk_size
+                        batch_size=eval_batch_size
                     )
                 else:
                     ref_log_probs_completion = None
@@ -831,7 +924,7 @@ class PPOTrainer(BaseTrainer):
             else:
                 loss_mask = completion_pad_mask
 
-            if self.ppo_config.kl_beta > 0.0 and ref_log_probs_completion is not None:
+            if self.ppo_config.kl_beta > 0.0 and ref_log_probs_completion is not None and old_log_probs is not None:
                 logr = ref_log_probs_completion.float() - old_log_probs.float()
                 kl = -logr if self.ppo_config.kl_estimator == "k1" else (logr.exp() - 1) - logr
                 kl_rewards = -self.ppo_config.kl_beta * kl
@@ -925,7 +1018,7 @@ class PPOTrainer(BaseTrainer):
         return {
             'prompt_ids': padded_prompt_ids.detach(),
             'completion_ids': completion_ids.detach(),
-            'old_log_probs': old_log_probs.detach(),
+            'old_log_probs': old_log_probs.detach() if old_log_probs is not None else None,
             'values': value_output.detach(),
             'rewards': rewards.detach(),
             'env_rewards_tensor': env_rewards_tensor.detach(),
@@ -1000,6 +1093,19 @@ class PPOTrainer(BaseTrainer):
         batch_size = prompt_ids.shape[0]
         comp_len = completion_ids.shape[1]
 
+        # 若 Rollout 阶段跳过了 Policy 前向 (old_log_probs is None)，在 multi-epoch (ppo_epochs > 1) 情况下，
+        # 仅当单批样本数未超过单个梯度累积窗口 (保证 epoch 0 内部模型权重无中途更新漂移) 时，
+        # 记录初始 log_probs 以供后续 epoch 准确作为 old_log_probs 复用
+        samples_per_accum_window = self.ppo_config.ppo_batch_size * self.gradient_accumulation_steps
+        if old_log_probs is None and self.ppo_config.ppo_epochs > 1 and batch_size <= samples_per_accum_window:
+            cached_old_log_probs = torch.empty(
+                (batch_size, comp_len),
+                dtype=torch.float32,
+                device=prompt_ids.device
+            )
+        else:
+            cached_old_log_probs = None
+
         comp_values = old_values[:, -(comp_len + 1):]
         values_for_gae = comp_values[:, :-1]
         assert values_for_gae.shape[1] == comp_len
@@ -1041,7 +1147,7 @@ class PPOTrainer(BaseTrainer):
                 mb_attention_mask = attention_mask[mini_batch_indices]
                 mb_completion_ids = completion_ids[mini_batch_indices]
                 mb_loss_mask = loss_mask[mini_batch_indices]
-                mb_old_log_probs = old_log_probs[mini_batch_indices]
+                mb_old_log_probs = old_log_probs[mini_batch_indices] if old_log_probs is not None else None
                 mb_values = values_for_gae[mini_batch_indices]
                 mb_returns = returns[mini_batch_indices]
                 mb_advantages = advantages_whitened[mini_batch_indices]
@@ -1049,17 +1155,32 @@ class PPOTrainer(BaseTrainer):
 
                 with autocast(TrainerTools().parallel.device_type):
                     mb_comp_len = mb_completion_ids.size(1)
+                    mb_comp_mask = mb_attention_mask[:, -mb_comp_len:].bool() if (mb_attention_mask is not None and mb_attention_mask.size(1) >= mb_comp_len) else None
+                    use_fused = (self.chunked_log_probs_size is not None)
                     policy_output, value_output = self.train_model(
                         mb_input_ids,
                         attention_mask=mb_attention_mask,
                         position_ids=mb_position_ids,
+                        completion_ids=mb_completion_ids if use_fused else None,
+                        completion_mask=mb_comp_mask if use_fused else None,
+                        fused_lm_head=use_fused,
                         forward_type='both',
-                        return_logits=True,
-                        logits_to_keep=mb_comp_len + 1
+                        return_logits=not use_fused
                     )
 
-                    logits_completion = policy_output['logits'][:, :-1, :][:, -mb_comp_len:, :].float()
-                    current_log_probs = log_softmax(logits_completion, mb_completion_ids)
+                    if isinstance(policy_output, dict) and 'log_probs' in policy_output:
+                        current_log_probs = policy_output['log_probs']
+                    else:
+                        logits_completion = policy_output['logits'][:, :-1, :][:, -mb_comp_len:, :].float()
+                        current_log_probs = log_softmax(logits_completion, mb_completion_ids)
+
+                    # 核心复用：若 mb_old_log_probs 为 None（即首轮迭代且跳过了 Rollout Policy 前向），
+                    # 直接就地 detach 复用本次带梯度的前向 log_probs
+                    if mb_old_log_probs is None:
+                        mb_old_log_probs = current_log_probs.detach()
+                        if cached_old_log_probs is not None:
+                            cached_old_log_probs[mini_batch_indices] = current_log_probs.detach().float()
+
                     current_values = value_output[0][:, -(mb_comp_len + 1): -1]
                     value_aux_loss = value_output[1]
 
@@ -1080,7 +1201,7 @@ class PPOTrainer(BaseTrainer):
                         value_error = value_mean - return_mean
                         completion_len = mb_loss_mask.sum(dim=-1).float().mean()
 
-                    if policy_output['aux_loss'] is not None:
+                    if isinstance(policy_output, dict) and policy_output.get('aux_loss') is not None:
                         aux_loss = policy_output['aux_loss'].to(loss.dtype)
                     else:
                         aux_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
@@ -1123,6 +1244,9 @@ class PPOTrainer(BaseTrainer):
 
                 if need_update_step:
                     self._update_step(is_last_step=is_last_mini_batch)
+
+            if cached_old_log_probs is not None and old_log_probs is None:
+                old_log_probs = cached_old_log_probs
 
         if total_micro_batches_processed > 0:
             for key in ppo_stats:

@@ -529,6 +529,8 @@ def masked_whiten(
     mask = mask.float()
 
     mean, var = _masked_mean_and_var(values, mask, unbiased=True, distributed=distributed)
+    var = torch.nan_to_num(var, nan=0.0)
+    var = torch.clamp(var, min=0.0)
     whitened = (values - mean) * torch.rsqrt(var + 1e-8)
     if not shift_mean:
         whitened += mean
@@ -610,6 +612,7 @@ def _masked_mean_and_var(
         and TrainerTools().parallel.world_size > 1
     )
 
+    target_device = None
     if is_distributed:
         stats = torch.stack([val_sum, mask_sum])
         needs_cuda_transfer = (
@@ -631,12 +634,14 @@ def _masked_mean_and_var(
     var_sum = (centered**2 * mask_fp32).sum()
 
     if is_distributed:
-        if needs_cuda_transfer:
-            var_sum_dev = var_sum.to(target_device)
-            dist.all_reduce(var_sum_dev, op=dist.ReduceOp.SUM)
-            var_sum = var_sum_dev.to(var_sum.device)
+        var_stats = torch.stack([var_sum])
+        if target_device is not None:
+            var_stats_dev = var_stats.to(target_device)
+            dist.all_reduce(var_stats_dev, op=dist.ReduceOp.SUM)
+            var_stats = var_stats_dev.to(var_stats.device)
         else:
-            dist.all_reduce(var_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(var_stats, op=dist.ReduceOp.SUM)
+        var_sum = var_stats[0]
 
     variance = var_sum / mask_sum.clamp(min=1.0)
     if unbiased:
@@ -764,10 +769,18 @@ def _zero_pad_sequences(sequences: list[torch.Tensor], side: str = "left") -> to
     return torch.stack(padded_sequences, dim=0)
 
 
-def _build_deepspeed_kwargs(ds_config: DsConfig, gradient_accumulation_steps, batch_size, optim_type) -> Dict[str, Any]:
+def _build_deepspeed_kwargs(
+        ds_config: DsConfig,
+        gradient_accumulation_steps,
+        batch_size,
+        optim_type,
+        gradient_clipping: float
+) -> Dict[str, Any]:
+    clip_float = float(gradient_clipping) if (gradient_clipping is not None and gradient_clipping > 0) else 0.0
+
     kwargs: Dict[str, Any] = {
         'gradient_accumulation_steps': gradient_accumulation_steps,
-        'gradient_clipping': ds_config.gradient_clipping,
+        'gradient_clipping': clip_float,
         'train_micro_batch_size_per_gpu': batch_size
     }
 

@@ -202,7 +202,6 @@ class DsConfig:
         zero_config (`Optional[DsZeROConfig]`): ZeRO 优化器核心配置 (阶段0/1/2/3)。
         fp16_config (`Optional[DsFp16Config]`): FP16 混合精度设置。
         bf16_config (`Optional[DsBf16Config]`): BF16 混合精度设置。
-        gradient_clipping (`float`): 全局梯度裁剪阈值，防止梯度爆炸。
         activation_checkpointing (`Optional[DsActivationCheckpointingConfig]`): 激活重计算设置。
         wall_clock_breakdown (`bool`): 是否打印耗时拆解（Forward/Backward/Comm 等时间的占比分析）。
         flops_profiler (`Optional[DsFlopsProfilerConfig]`): DeepSpeed 算子性能与 TFLOPS 分析器配置。
@@ -211,7 +210,6 @@ class DsConfig:
     zero_config: Optional[DsZeROConfig] = field(default_factory=DsZero3Config)
     fp16_config: Optional[DsFp16Config] = field(default_factory=DsFp16Config)
     bf16_config: Optional[DsBf16Config] = field(default_factory=DsBf16Config)
-    gradient_clipping: float = 1.0
     activation_checkpointing: Optional[DsActivationCheckpointingConfig] = None
     wall_clock_breakdown: bool = False
     flops_profiler: Optional[DsFlopsProfilerConfig] = None
@@ -392,7 +390,8 @@ class PPOConfig:
         value_model_weights_path (`Optional[str]`): Value (Critic) 模型的初始化权重路径。
         value_optim_config (`Optional[OptimConfig]`): 专门为 Value 模型配置独立的优化器及学习率。
         gradient_accumulation_steps (`int`): 梯度累积步数。
-        chunked_log_probs_size (`Optional[int]`): 评估/前向阶段（计算旧策略及参考模型 Log Prob 和 Value）的 Batch 分块大小，用于降低显存峰值。
+        chunked_log_probs_size (`Optional[int]`): Token 序列维度（LM Head 投影）的分块大小，用于在计算 Log Prob 时分块做矩阵乘与 log_softmax，避免物化 [B, S, V] 巨额 Logits 显存。若为 None 则不启用分块计算。推荐值如 256、512 或 1024。
+        rollout_eval_batch_size (`Optional[int]`): 样本 Batch 维度（Backbone 主干前向）的分块批次大小，用于在 Rollout 评估阶段（计算旧策略及参考模型 Log Prob 和 Value）分批前向模型主干，降低激活值显存峰值。若为 None 则默认一次性前向全部样本。
         gamma (`float`): 优势函数 (GAE) 中的折扣因子 (Discount Factor)，决定长期奖励的衰减。
         lam (`float`): GAE 中的 lambda 参数，权衡偏差与方差。
         clip_eps (`float`): PPO 的核心裁剪阈值，限制新旧策略更新的步长差距，防止更新崩溃。
@@ -413,6 +412,7 @@ class PPOConfig:
     value_optim_config: Optional[OptimConfig] = None
     gradient_accumulation_steps: int = 1
     chunked_log_probs_size: Optional[int] = None
+    rollout_eval_batch_size: Optional[int] = None
     gamma: float = 1.0
     lam: float = 0.95
     clip_eps: float = 0.1
@@ -437,7 +437,8 @@ class GRPOConfig:
         group_size (`int`): 对同一个 Prompt 并行生成多少个不同的答案，用于组内 Advantage 优势归一化计算。
         ref_model_weights_path (Optional[str]): GRPO 计算 KL 惩罚奖励时参考模型的权重路径。
         gradient_accumulation_steps (`int`): 梯度累积步数。
-        chunked_log_probs_size (`Optional[int]`): 评估/前向阶段（计算旧策略及参考模型 Log Prob）的 Batch 分块大小，用于降低显存峰值。
+        chunked_log_probs_size (`Optional[int]`): Token 序列维度（LM Head 投影）的分块大小，用于在计算 Log Prob 时分块做矩阵乘与 log_softmax，避免物化 [B, S, V] 巨额 Logits 显存。若为 None 则不启用分块计算。推荐值如 256、512 或 1024。
+        rollout_eval_batch_size (`Optional[int]`): 样本 Batch 维度（Backbone 主干前向）的分块批次大小，用于在 Rollout 评估阶段（计算旧策略及参考模型 Log Prob）分批前向模型主干，降低激活值显存峰值。若为 None 则默认一次性前向全部样本。
         loss_beta (`float`): KL 惩罚强度。在特定模式下(loss_importance_sampling_level=sequence) 可设为 0.0 改为隐式约束。
         loss_clip_eps (`float`): PPO 基础截断的下限 epsilon (token 级截断推荐 0.2，sequence 级截断如 GSPO 推荐 3e-4)。
         loss_clip_eps_high (`Optional[float]`): 不对称裁剪中的上限 epsilon (若为 None 则对称裁剪)。
@@ -463,6 +464,7 @@ class GRPOConfig:
     ref_model_weights_path: Optional[str] = None
     gradient_accumulation_steps: int = 1
     chunked_log_probs_size: Optional[int] = None
+    rollout_eval_batch_size: Optional[int] = None
     loss_beta: float = 0.04
     loss_clip_eps: float = 0.2
     loss_clip_eps_high: Optional[float] = 0.28
@@ -501,6 +503,7 @@ class TrainConfig:
         save_interval (`int`): 指定多少个 global batch step 后触发一次 Checkpoint 保存。
         eval_interval (`int`): 指定多少个 global batch step 后触发一次评估/测试集 Evaluation。
         is_gradient_checkpointing (`bool`): 是否开启梯度检查点，如果开启且使用ds模式，会自动配置DsActivationCheckpointingConfig
+        gradient_clipping (`float`): 全局梯度裁剪阈值，防止梯度爆炸。若 <= 0 或 None 则不进行裁剪。默认值为 1.0。
         pretrain_config (`Optional[PretrainConfig]`): 使用基础 Trainer 时的配置组。
         sft_config (`Optional[SFTConfig]`): 使用 SFTTrainer 时的监督微调配置组。
         dpo_config (`Optional[DPOConfig]`): 使用 DPOTrainer 时的对齐微调配置组。
@@ -523,6 +526,7 @@ class TrainConfig:
     save_interval: int = 100
     eval_interval: int = 100
     is_gradient_checkpointing: bool = False
+    gradient_clipping: float = 1.0
 
     pretrain_config: Optional[PretrainConfig] = None
     sft_config: Optional[SFTConfig] = None

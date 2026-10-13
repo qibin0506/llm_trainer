@@ -8,12 +8,13 @@ from torch.utils.data import Dataset
 
 from .base_trainer import BaseTrainer
 from .dataset import DPODataset
-from .loss import DPOLoss
+from .loss import DPOLoss, log1mexp
 from .tools import TrainerTools
 from .log import Logger
 from .train_configs import TrainConfig, GenerationService
 from .utils import autocast, get_dpo_collate_fn, log_softmax, disable_dropout_in_model, empty_cache
 from .checkpoint import save_checkpoint, save_steps
+from .partition_utils import zero3_trace_guard
 
 
 class DPOTrainer(BaseTrainer):
@@ -211,15 +212,20 @@ class DPOTrainer(BaseTrainer):
                         with autocast(TrainerTools().parallel.device_type):
                             if self.ref_model is not None:
                                 with torch.no_grad():
-                                    ref_outputs = self.ref_model(concat_inputs, attention_mask=concat_attention_masks)
-                                    ref_logprobs_sums, _, _ = self._logprobs(ref_outputs['logits'], concat_labels)
-                                    del ref_outputs
+                                    with zero3_trace_guard(self.ref_model):
+                                        ref_outputs = self.ref_model(concat_inputs, attention_mask=concat_attention_masks)
+                                        ref_logprobs_sums, ref_logprobs_means, _ = self._logprobs(ref_outputs['logits'], concat_labels)
+                                        del ref_outputs
 
                                     ref_chosen_logps = ref_logprobs_sums[:chosen_inputs.shape[0]]
                                     ref_rejected_logps = ref_logprobs_sums[chosen_inputs.shape[0]:]
+                                    ref_chosen_means = ref_logprobs_means[:chosen_inputs.shape[0]]
+                                    ref_rejected_means = ref_logprobs_means[chosen_inputs.shape[0]:]
                             else:
                                 ref_chosen_logps = None
                                 ref_rejected_logps = None
+                                ref_chosen_means = None
+                                ref_rejected_means = None
 
                             policy_outputs = self.train_model(concat_inputs, attention_mask=concat_attention_masks)
                             policy_logprobs_sums, policy_logprobs_means, policy_mask_sums = self._logprobs(policy_outputs['logits'], concat_labels)
@@ -232,12 +238,12 @@ class DPOTrainer(BaseTrainer):
 
                             policy_chosen_means = policy_logprobs_means[:chosen_inputs.shape[0]]
                             policy_rejected_means = policy_logprobs_means[chosen_inputs.shape[0]:]
-
-                            nll_loss = -policy_logprobs_means[:chosen_inputs.shape[0]].mean()
-
-                            chosen_logprobs_sums = policy_logprobs_sums[:chosen_inputs.shape[0]]
                             chosen_mask_sums = policy_mask_sums[:chosen_inputs.shape[0]]
-                            ce_loss = -(chosen_logprobs_sums.sum() / chosen_mask_sums.sum().clamp(min=1.0))
+                            rejected_mask_sums = policy_mask_sums[chosen_inputs.shape[0]:]
+
+                            # 采用标准 Token-level 交叉熵损失 (Token-level NLL)，避免“均值的均值”导致长短样本 token 梯度失衡
+                            nll_loss = -(policy_chosen_logps.sum() / chosen_mask_sums.sum().clamp(min=1.0))
+                            ce_loss = nll_loss.detach()
 
                             # calc loss
                             loss = self.criterion(
@@ -246,7 +252,11 @@ class DPOTrainer(BaseTrainer):
                                 ref_chosen_logps=ref_chosen_logps,
                                 ref_reject_logps=ref_rejected_logps,
                                 policy_chosen_means=policy_chosen_means,
-                                policy_reject_means=policy_rejected_means
+                                policy_reject_means=policy_rejected_means,
+                                chosen_lengths=chosen_mask_sums,
+                                reject_lengths=rejected_mask_sums,
+                                ref_chosen_means=ref_chosen_means,
+                                ref_reject_means=ref_rejected_means,
                             )
 
                             if aux_loss is not None:
@@ -261,11 +271,11 @@ class DPOTrainer(BaseTrainer):
 
                             with torch.no_grad():
                                 if self.dpo_config.loss_type == 'orpo':
-                                    p_c = torch.clamp(policy_chosen_means.float(), max=-1e-6)
-                                    p_r = torch.clamp(policy_rejected_means.float(), max=-1e-6)
-                                    # Odds
-                                    chosen_rewards = p_c - torch.log1p(-torch.exp(p_c))
-                                    rejected_rewards = p_r - torch.log1p(-torch.exp(p_r))
+                                    p_c = torch.clamp(policy_chosen_means.float(), max=-1e-7)
+                                    p_r = torch.clamp(policy_rejected_means.float(), max=-1e-7)
+                                    # Odds: log(Odds) = p - log(1 - exp(p))
+                                    chosen_rewards = p_c - log1mexp(p_c)
+                                    rejected_rewards = p_r - log1mexp(p_r)
                                 elif self.dpo_config.loss_type == 'simpo':
                                     chosen_rewards = beta * policy_chosen_means
                                     rejected_rewards = beta * policy_rejected_means
@@ -385,6 +395,7 @@ class DPOTrainer(BaseTrainer):
                     del loss
                     del aux_loss
                     del nll_loss
+                    del ce_loss
                     del total_loss_unscaled
                     del chosen_inputs
                     del chosen_labels

@@ -1,4 +1,4 @@
-from typing import Optional, Tuple, List, Dict, Any, Union
+from typing import Optional, Tuple, List, Dict, Any
 import os
 import copy
 import gc
@@ -15,7 +15,7 @@ from llm_model import LlmModel, ModelConfig
 
 from .parallel import DsParallel
 from .tools import TrainerTools
-from .partition_utils import unwrap_model_for_generation, unwrap_model, ForwardRedirection
+from .partition_utils import unwrap_model_for_generation
 from .generate_utils import generate
 from .log import Logger, _get_log_dir
 from .train_configs import TrainConfig, GenerationService
@@ -77,7 +77,6 @@ class BaseTrainer:
         self.resume_file_idx = 0
         self.resume_batch_idx = 0
 
-        self._forward_redirection = ForwardRedirection()
         self.logger = Logger('log.txt')
 
         self.parallel_kwargs, self.data_loader_kwargs, self.sampler_kwargs = self._convert_train_args()
@@ -257,6 +256,7 @@ class BaseTrainer:
             model = self._new_model(self.train_config)
 
         self._check_freeze_llm_model(model)
+        self._check_add_fused_head(model)
 
         if self.train_config.is_gradient_checkpointing:
             if self.is_ds:
@@ -288,6 +288,8 @@ class BaseTrainer:
         )
 
         return model, optim
+
+    def _check_add_fused_head(self, model): ...
 
     def _check_freeze_llm_model(self, model): ...
 
@@ -398,12 +400,12 @@ class BaseTrainer:
             return g
 
         if optim_type != 'muon':
-            no_decay_name_list = ["bias", "norm.weight"]
+            no_decay_keywords = ["bias", "norm", "ln_"]
             decay_params, no_decay_params = [], []
             for name, param in module.named_parameters():
                 if not param.requires_grad:
                     continue
-                if any(nd in name for nd in no_decay_name_list):
+                if any(kw in name.lower() for kw in no_decay_keywords) or param.ndim <= 1:
                     no_decay_params.append(param)
                 else:
                     decay_params.append(param)
@@ -500,7 +502,8 @@ class BaseTrainer:
                 ds_config,
                 self.gradient_accumulation_steps,
                 self.train_config.batch_size,
-                self.train_config.optim_config.optim_type
+                self.train_config.optim_config.optim_type,
+                gradient_clipping=self.train_config.gradient_clipping
             )
 
         data_loader_kwargs, sampler_kwargs = _build_data_loader_config(
@@ -538,6 +541,11 @@ class BaseTrainer:
 
     def _calc_loss(self, inputs, attention_mask, result, labels, model: Optional[torch.nn.Module] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]: ...
 
+    def _get_teacher_logits_and_kd_coef(
+            self, inputs: torch.Tensor, attention_mask: Optional[torch.Tensor]
+    ) -> Tuple[Optional[torch.Tensor], float]:
+        return None, 0.0
+
     def _step_forward_and_loss(
             self,
             model: torch.nn.Module,
@@ -546,14 +554,28 @@ class BaseTrainer:
             pixel_values: Optional[torch.Tensor],
             labels: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        result = model(
-            inputs,
-            attention_mask=attention_mask,
-            pixel_values=pixel_values,
-            return_logits=self.return_logits
-        )
+        teacher_logits, kd_coef = self._get_teacher_logits_and_kd_coef(inputs, attention_mask)
+        if getattr(self, "chunked_cross_entropy_size", None) is not None:
+            result = model(
+                inputs,
+                attention_mask=attention_mask,
+                pixel_values=pixel_values,
+                labels=labels,
+                fused_lm_head=True,
+                teacher_logits=teacher_logits,
+                kd_coef=kd_coef,
+            )
+            loss = result["loss"]
+            ce_loss = result.get("ce_loss", loss)
+        else:
+            result = model(
+                inputs,
+                attention_mask=attention_mask,
+                pixel_values=pixel_values,
+                return_logits=self.return_logits
+            )
+            loss, ce_loss = self._calc_loss(inputs, attention_mask, result, labels, model=model)
 
-        loss, ce_loss = self._calc_loss(inputs, attention_mask, result, labels, model=model)
         if result.get('aux_loss') is not None:
             aux_loss = result['aux_loss'].to(loss.dtype)
         else:
@@ -572,20 +594,23 @@ class BaseTrainer:
             self.scaler.scale(total_loss_scaled).backward()
 
     def _apply_grad_clipping(self):
-        if not isinstance(TrainerTools().parallel, DsParallel) and self.lr_scheduler.can_clip_grad():
-            self.scaler.unscale_(self.optimizer)
+        clip_norm = self.train_config.gradient_clipping
+        if clip_norm is not None and clip_norm > 0:
+            if not isinstance(TrainerTools().parallel, DsParallel) and self.lr_scheduler.can_clip_grad():
+                self.scaler.unscale_(self.optimizer)
 
-            if hasattr(self.train_model, 'policy_model') and hasattr(self.train_model, 'value_model'):
-                policy_params = [p for p in self.train_model.policy_model.parameters() if p.requires_grad]
-                value_params = [p for p in self.train_model.value_model.parameters() if p.requires_grad]
+                if hasattr(self.train_model, 'policy_model') and hasattr(self.train_model, 'value_model'):
+                    policy_params = [p for p in self.train_model.policy_model.parameters() if p.requires_grad]
+                    value_params = [p for p in self.train_model.value_model.parameters() if p.requires_grad]
 
-                if policy_params:
-                    torch.nn.utils.clip_grad_norm_(policy_params, 1.0)
-                if value_params:
-                    torch.nn.utils.clip_grad_norm_(value_params, 1.0)
-            else:
-                trainable_params = filter(lambda p: p.requires_grad, self.train_model.parameters())
-                torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+                    if policy_params:
+                        torch.nn.utils.clip_grad_norm_(policy_params, clip_norm)
+                    if value_params:
+                        torch.nn.utils.clip_grad_norm_(value_params, clip_norm)
+                else:
+                    trainable_params = [p for p in self.train_model.parameters() if p.requires_grad]
+                    if trainable_params:
+                        torch.nn.utils.clip_grad_norm_(trainable_params, clip_norm)
 
     def _apply_step(self):
         if not isinstance(TrainerTools().parallel, DsParallel):
@@ -611,14 +636,14 @@ class BaseTrainer:
         DeepSpeed 内部 ZeROOptimizer.set_gradient_accumulation_boundary(is_boundary)
         在接收 None 时会执行 bool(None) 得到 False，导致 optimizer 内部状态泄漏锁死为 False。
         此处在将 engine 重置为 None (恢复基于 micro_steps 自动计数模式) 的同时，
-        显式将 optimizer 的 _is_gradient_accumulation_boundary 复位为默认的 True。
+        显式将 optimizer 的 _is_gradient_accumulation_boundary 复位为默认的 None。
         """
         if not self.is_ds:
             return
 
         self.train_model.set_gradient_accumulation_boundary(None)
         if hasattr(self.train_model, 'optimizer') and hasattr(self.train_model.optimizer, '_is_gradient_accumulation_boundary'):
-            self.train_model.optimizer._is_gradient_accumulation_boundary = True
+            self.train_model.optimizer._is_gradient_accumulation_boundary = None
 
         if hasattr(self.train_model, 'micro_steps'):
             self.train_model.micro_steps = 0
@@ -642,8 +667,6 @@ class BaseTrainer:
 
         if not overflow:
             self.lr_scheduler.step()
-
-        TrainerTools().parallel.synchronize()
 
     def _get_eval_data(self) -> Optional[str]:
         if len(self.eval_prompts) == 0:
@@ -712,15 +735,17 @@ class BaseTrainer:
                 gen_text = TrainerTools().tokenizer.decode(response_ids[0])
                 with open(os.path.join(_get_log_dir(), 'gen.txt'), 'a') as f:
                     f.write(f"{tag}, gen->{eval_prompt}{gen_text}\n")
+
+            TrainerTools().parallel.wait('eval')
         else:
             with unwrap_model_for_generation(self.train_model) as eval_model:
-                if TrainerTools().parallel.is_main_process:
-                    eval_model = self._check_eval_model(eval_model)
-                    eval_model.eval()
+                eval_model = self._check_eval_model(eval_model)
+                eval_model.eval()
 
-                    tokens = torch.tensor(TrainerTools().tokenizer.encode(eval_prompt), dtype=torch.long).unsqueeze(0)
-                    max_new_tokens = max(self.train_config.eval_config.max_seq_len - tokens.shape[1], 0)
+                tokens = torch.tensor(TrainerTools().tokenizer.encode(eval_prompt), dtype=torch.long).unsqueeze(0)
+                max_new_tokens = max(self.train_config.eval_config.max_seq_len - tokens.shape[1], 0)
 
+                with torch.no_grad():
                     gen_result = generate(
                         eval_model,
                         prompt=tokens,
@@ -736,12 +761,13 @@ class BaseTrainer:
                         device=TrainerTools().parallel.device
                     )
 
+                if TrainerTools().parallel.is_main_process:
                     with open(os.path.join(_get_log_dir(), 'gen.txt'), 'a') as f:
                         f.write(f"{tag}, gen->{gen_result}\n")
 
-                    eval_model.train()
+                eval_model.train()
 
-        TrainerTools().parallel.wait('eval')
+            TrainerTools().parallel.wait('eval')
 
     def _check_eval_model(self, eval_model):
         return eval_model
@@ -836,25 +862,13 @@ class BaseTrainer:
                         pixel_values = self._get_pixel_values(batch_data)
 
                         with autocast(TrainerTools().parallel.device_type):
-                            if self.is_ds:
-                                unwrapped = unwrap_model(self.train_model)
-                                total_loss_unscaled, ce_loss, aux_loss = self._forward_redirection(
-                                    self.train_model,
-                                    unwrapped,
-                                    self._step_forward_and_loss,
-                                    inputs,
-                                    attention_mask,
-                                    pixel_values,
-                                    labels
-                                )
-                            else:
-                                total_loss_unscaled, ce_loss, aux_loss = self._step_forward_and_loss(
-                                    self.train_model,
-                                    inputs,
-                                    attention_mask,
-                                    pixel_values,
-                                    labels
-                                )
+                            total_loss_unscaled, ce_loss, aux_loss = self._step_forward_and_loss(
+                                self.train_model,
+                                inputs,
+                                attention_mask,
+                                pixel_values,
+                                labels
+                            )
 
                         # 每个 epoch 的最后一个 batch 作为累积边界强制提交梯度，防止跨 epoch 泄漏
                         is_last_step = (

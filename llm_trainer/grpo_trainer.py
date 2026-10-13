@@ -1,4 +1,5 @@
 from typing import Tuple, List, Optional
+from contextlib import nullcontext
 import gc
 import math
 from itertools import islice
@@ -25,7 +26,7 @@ from .utils import (
     fold_rewards_to_preceding_action
 )
 from .checkpoint import save_checkpoint, save_steps
-from .partition_utils import unwrap_model_for_generation
+from .partition_utils import unwrap_model_for_generation, zero3_trace_guard, add_fused_lm_head
 
 
 class GRPOTrainer(BaseTrainer):
@@ -55,11 +56,14 @@ class GRPOTrainer(BaseTrainer):
             eval_prompts: List[str]
     ):
         self.grpo_config = train_config.grpo_config
+        self.chunked_log_probs_size = self.grpo_config.chunked_log_probs_size
+        self.rollout_eval_batch_size = self.grpo_config.rollout_eval_batch_size
         super().__init__(
             train_config=train_config,
             eval_prompts=eval_prompts,
             generation_service=generation_service,
-            gradient_accumulation_steps=self.grpo_config.gradient_accumulation_steps
+            gradient_accumulation_steps=self.grpo_config.gradient_accumulation_steps,
+            return_logits=self.chunked_log_probs_size is None
         )
 
         grpo_batch_size = self.grpo_config.grpo_batch_size
@@ -134,6 +138,7 @@ class GRPOTrainer(BaseTrainer):
             param.requires_grad = False
 
         self._load_external_weights(ref_model, self.grpo_config.ref_model_weights_path)
+        self._check_add_fused_head(ref_model)
 
         ref_model, _ = TrainerTools().parallel.process(
             model=ref_model,
@@ -148,6 +153,10 @@ class GRPOTrainer(BaseTrainer):
         model = super()._new_model(train_config)
         disable_dropout_in_model(model)
         return model
+
+    def _check_add_fused_head(self, model):
+        if self.chunked_log_probs_size is not None:
+            add_fused_lm_head(model, chunk_size=self.chunked_log_probs_size)
 
     def _init_loss(self):
         grpo_criterion = GRPOLoss(
@@ -187,39 +196,53 @@ class GRPOTrainer(BaseTrainer):
             input_ids: torch.Tensor,
             attention_mask: Optional[torch.Tensor],
             completion_ids: torch.Tensor,
-            chunk_size: Optional[int] = None
+            batch_size: Optional[int] = None
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         计算 Completion 部分的 LogProbs：
         1. 采用 Active Token Filtering：跳过 Prompt 的 lm_head 矩阵乘法
-        2. 支持 chunk_size 配置：None 为全量计算，整数则分块计算
+        2. 支持 batch_size 样本维度切片：None 为全量计算，整数则按样本批次分块前向以降低显存峰值
+        3. 在 no_grad 模式下自动对每个 forward 应用细粒度 zero3_trace_guard 保护，杜绝跨 batch Trace 累积
         """
+        is_no_grad = not torch.is_grad_enabled()
+
+        use_fused = (self.chunked_log_probs_size is not None)
+
         def _step_forward(inp_ids, att_mask, comp_ids):
             pos_ids = calc_position_ids(att_mask)
             comp_len = comp_ids.size(1)
-            outputs = model(
-                input_ids=inp_ids,
-                attention_mask=att_mask,
-                position_ids=pos_ids,
-                return_logits=True,
-                logits_to_keep=comp_len + 1
-            )
+            comp_mask = att_mask[:, -comp_len:].bool() if (att_mask is not None and att_mask.size(1) >= comp_len) else None
 
-            logits_completion = outputs['logits'][:, :-1, :][:, -comp_len:, :].float()
-            log_probs = log_softmax(logits_completion, comp_ids)
-            aux_loss = outputs['aux_loss']
+            guard = zero3_trace_guard(model) if is_no_grad else nullcontext()
+            with guard:
+                outputs = model(
+                    input_ids=inp_ids,
+                    attention_mask=att_mask,
+                    position_ids=pos_ids,
+                    completion_ids=comp_ids if use_fused else None,
+                    completion_mask=comp_mask if use_fused else None,
+                    fused_lm_head=use_fused,
+                    return_logits=not use_fused
+                )
+
+            if isinstance(outputs, dict) and 'log_probs' in outputs:
+                log_probs = outputs['log_probs']
+            else:
+                logits_completion = outputs['logits'][:, :-1, :][:, -comp_len:, :].float()
+                log_probs = log_softmax(logits_completion, comp_ids)
+            aux_loss = outputs.get('aux_loss', None)
 
             return log_probs, aux_loss
 
-        if chunk_size is None or chunk_size <= 0 or chunk_size >= input_ids.size(0):
+        if batch_size is None or batch_size <= 0 or batch_size >= input_ids.size(0):
             return _step_forward(input_ids, attention_mask, completion_ids)
 
         all_log_probs = []
         aux_losses = []
-        for i in range(0, input_ids.size(0), chunk_size):
-            c_input_ids = input_ids[i: i + chunk_size]
-            c_attention_mask = attention_mask[i: i + chunk_size]
-            c_completion_ids = completion_ids[i: i + chunk_size]
+        for i in range(0, input_ids.size(0), batch_size):
+            c_input_ids = input_ids[i: i + batch_size]
+            c_attention_mask = attention_mask[i: i + batch_size] if attention_mask is not None else None
+            c_completion_ids = completion_ids[i: i + batch_size]
             log_probs, aux_loss = _step_forward(c_input_ids, c_attention_mask, c_completion_ids)
             all_log_probs.append(log_probs)
             if aux_loss is not None:
@@ -495,6 +518,11 @@ class GRPOTrainer(BaseTrainer):
                 padded_completions = []
                 padded_gen_masks = []
                 max_comp_len = max((len(c) for c in completion_ids_list), default=0)
+                if TrainerTools().parallel.parallel_train and dist.is_initialized():
+                    max_comp_len_t = torch.tensor(max_comp_len, dtype=torch.long, device=device)
+                    dist.all_reduce(max_comp_len_t, op=dist.ReduceOp.MAX)
+                    max_comp_len = int(max_comp_len_t.item())
+
                 if max_comp_len == 0:
                     max_comp_len = 1
 
@@ -524,6 +552,8 @@ class GRPOTrainer(BaseTrainer):
                 completion_ids = torch.tensor(padded_completions, dtype=torch.long, device=device)
                 if padded_gen_masks:
                     external_gen_mask = torch.tensor(padded_gen_masks, dtype=torch.bool, device=device)
+
+                TrainerTools().parallel.wait('rollout')
             else:
                 with unwrap_model_for_generation(self.train_model) as unwrapped_model:
                     gen_chunk_size = self.grpo_config.generate_config.chunked_generate_size
@@ -554,6 +584,14 @@ class GRPOTrainer(BaseTrainer):
                         max_comp_len = max(max_comp_len, comp.shape[1])
                         chunk_completions.append(comp)
 
+                    # 跨卡全局同步最大补全长度：
+                    # 1. 彻底解决各 Rank 生成结束时间不同、短序列 Rank 提前退出上下文引发的相移死锁 (Phase Mismatch)
+                    # 2. 保证全卡 completion_ids 的 sequence_length 严格对齐，避免异构张量维度导致后续通信或计算错位
+                    if TrainerTools().parallel.parallel_train and dist.is_initialized():
+                        max_comp_len_t = torch.tensor(max_comp_len, dtype=torch.long, device=device)
+                        dist.all_reduce(max_comp_len_t, op=dist.ReduceOp.MAX)
+                        max_comp_len = int(max_comp_len_t.item())
+
                     if max_comp_len == 0:
                         if TrainerTools().parallel.is_main_process:
                             Logger.std_log(
@@ -573,6 +611,8 @@ class GRPOTrainer(BaseTrainer):
                     ]
                     completion_ids = torch.cat(padded_comps, dim=0)
                     dones_list = torch.any(completion_ids == TrainerTools().tokenizer.end, dim=1).cpu().tolist()
+
+                    TrainerTools().parallel.wait('rollout')
 
         return {
             'prompt_ids': prompt_ids,
@@ -614,17 +654,28 @@ class GRPOTrainer(BaseTrainer):
         input_ids = torch.cat([padded_prompt_ids, completion_ids], dim=1)
         attention_mask = torch.cat([prompt_masks, completion_pad_mask], dim=1)
 
-        chunk_size = self.grpo_config.chunked_log_probs_size
+        total_samples = input_ids.size(0)
+        accum_steps = self.gradient_accumulation_steps
+        samples_per_accum_window = self.grpo_config.grpo_batch_size * accum_steps
+        can_skip_rollout_forward = (total_samples <= samples_per_accum_window)
+
+        eval_batch_size = self.rollout_eval_batch_size
         with torch.no_grad():
-            with autocast(TrainerTools().parallel.device_type):
-                old_log_probs, _ = self._compute_completion_log_probs(
-                    self.train_model, input_ids, attention_mask, completion_ids, chunk_size
-                )
+            if can_skip_rollout_forward:
+                # 对齐的单梯度累积窗口下，Rollout 阶段模型权重与后续首轮训练前向严格一致。
+                # 完全跳过对 train_model 的无梯度前向计算，设为 None 延迟就地复用。
+                # 节省约 25%~30% 算力与通信，并从根源上消除 ZeRO-3 残留 Trace 隐患。
+                old_log_probs = None
+            else:
+                with autocast(TrainerTools().parallel.device_type):
+                    old_log_probs, _ = self._compute_completion_log_probs(
+                        self.train_model, input_ids, attention_mask, completion_ids, batch_size=eval_batch_size
+                    )
 
             if self.ref_model:
                 with autocast(TrainerTools().parallel.device_type):
                     ref_log_probs, _ = self._compute_completion_log_probs(
-                        self.ref_model, input_ids, attention_mask, completion_ids, chunk_size
+                        self.ref_model, input_ids, attention_mask, completion_ids, batch_size=eval_batch_size
                     )
             else:
                 ref_log_probs = None
@@ -753,7 +804,7 @@ class GRPOTrainer(BaseTrainer):
             'input_ids': input_ids.detach(),
             'attention_mask': attention_mask.detach(),
             'loss_mask': loss_mask.detach(),
-            'old_log_probs': old_log_probs.detach(),
+            'old_log_probs': old_log_probs.detach() if old_log_probs is not None else None,
             'ref_log_probs': ref_log_probs.detach() if ref_log_probs is not None else None,
             'completion_ids': completion_ids.detach(),
             'advantages': advantages.detach(),
@@ -775,6 +826,19 @@ class GRPOTrainer(BaseTrainer):
 
         total_samples = input_ids.shape[0]
 
+        # 若 Rollout 阶段跳过了 old_log_probs 计算，在 multi-epoch (grpo_epochs > 1) 情况下，
+        # 仅当单批样本数未超过单个梯度累积窗口 (保证 epoch 0 内部模型权重无中途更新漂移) 时，
+        # 记录初始 log_probs 以供后续 epoch 准确作为 old_log_probs 复用
+        samples_per_accum_window = grpo_batch_size * self.gradient_accumulation_steps
+        if old_log_probs is None and self.grpo_config.grpo_epochs > 1 and total_samples <= samples_per_accum_window:
+            cached_old_log_probs = torch.empty(
+                (total_samples, completion_ids.shape[1]),
+                dtype=torch.float32,
+                device=device
+            )
+        else:
+            cached_old_log_probs = None
+
         grpo_stats = {
             "loss": 0.0,
             "moe_aux_loss": 0.0,
@@ -788,38 +852,58 @@ class GRPOTrainer(BaseTrainer):
 
         total_micro_batches_processed = 0
 
-        # 计算全局 Token 级归一化因子（仅用于 DAPO / BNPO / CISPO / VESPO 等消除 micro-batch 划分造成的长度梯度权重偏差）
-        # 对于标准 "grpo" 以及 "sapo", "dr_grpo", "luspo"，不依赖全局 token 归一化，跳过跨卡通信
         use_global_token_norm = (
             self.grpo_config.loss_type in ["bnpo", "cispo", "dapo", "vespo"]
             and self.grpo_config.token_level_loss_norm == "global"
         )
-        if use_global_token_norm:
-            local_total_tokens = loss_mask.sum().float()
-            num_micro_batches_local = (total_samples + grpo_batch_size - 1) // grpo_batch_size
-            if TrainerTools().parallel.parallel_train and dist.is_initialized():
-                global_total_tokens = local_total_tokens.clone()
-                dist.all_reduce(global_total_tokens, op=dist.ReduceOp.SUM)
-                total_micro_batches_global = num_micro_batches_local * TrainerTools().parallel.world_size
-                avg_tokens_per_mb = (global_total_tokens / max(total_micro_batches_global, 1)).item()
-            else:
-                avg_tokens_per_mb = (local_total_tokens / max(num_micro_batches_local, 1)).item()
-            avg_tokens_per_mb = max(avg_tokens_per_mb, 1.0)
-        else:
-            avg_tokens_per_mb = None
+        accum_steps = self.gradient_accumulation_steps
+        samples_per_accum_window = grpo_batch_size * accum_steps
+        num_accum_windows = max((total_samples + samples_per_accum_window - 1) // samples_per_accum_window, 1)
 
         for grpo_epoch in range(self.grpo_config.grpo_epochs):
             indices = torch.randperm(total_samples, device=device)
             micro_batch_idx = 0
 
+            # 动态按梯度累积窗口（Accumulation Window）计算 Token 归一化因子
+            # 不再使用全 Rollout 静态平均值，彻底解决：
+            # 1. 动态生成长度下不同更新步有效 Token 波动导致的梯度尺度失真与脱节
+            # 2. Rollout 尾部非整除残差微批次因强行除以固定的 gradient_accumulation_steps 导致的梯度严重缩水
+            if use_global_token_norm:
+                local_window_tokens = torch.zeros(num_accum_windows, device=device, dtype=torch.float32)
+                for w in range(num_accum_windows):
+                    w_start = w * samples_per_accum_window
+                    w_end = min(w_start + samples_per_accum_window, total_samples)
+                    w_indices = indices[w_start:w_end]
+                    local_window_tokens[w] = loss_mask[w_indices].sum().float()
+
+                if TrainerTools().parallel.parallel_train and dist.is_initialized():
+                    # 显式在当前卡 device 上进行原子 All-Reduce，跨卡汇总全网各累积窗口的真实有效 Token 总数
+                    dist.all_reduce(local_window_tokens, op=dist.ReduceOp.SUM)
+
+                # 每个累积窗口的有效归一化因子：
+                # 归一化因子 = 窗口全局 Token 总量 / (world_size * gradient_accumulation_steps)
+                # 梯度经过 _backward_loss (除以 GAS) 与分布式 All-Reduce/ReduceScatter (除以 world_size) 后，
+                # 累计梯度恰好等于：全网累积 Token 损失之和 / 全网当前更新步有效 Token 总数
+                world_size = TrainerTools().parallel.world_size
+                effective_divisor = max(float(world_size * accum_steps), 1.0)
+                window_norm_factors = torch.clamp(local_window_tokens / effective_divisor, min=1.0)
+            else:
+                window_norm_factors = None
+
             for i in range(0, total_samples, grpo_batch_size):
+                window_idx = min(i // samples_per_accum_window, num_accum_windows - 1)
+                avg_tokens_per_mb = (
+                    window_norm_factors[window_idx].item()
+                    if window_norm_factors is not None
+                    else None
+                )
                 mini_batch_indices = indices[i:i + grpo_batch_size]
 
                 mb_input_ids = input_ids[mini_batch_indices]
                 mb_attention_mask = attention_mask[mini_batch_indices]
                 mb_completion_ids = completion_ids[mini_batch_indices]
                 mb_loss_mask = loss_mask[mini_batch_indices]
-                mb_old_log_probs = old_log_probs[mini_batch_indices]
+                mb_old_log_probs = old_log_probs[mini_batch_indices] if old_log_probs is not None else None
                 mb_ref_log_probs = ref_log_probs[mini_batch_indices] if ref_log_probs is not None else None
                 mb_advantages = advantages[mini_batch_indices]
 
@@ -837,6 +921,13 @@ class GRPOTrainer(BaseTrainer):
                     log_probs, aux_loss = self._compute_completion_log_probs(
                         self.train_model, mb_input_ids, mb_attention_mask, mb_completion_ids
                     )
+
+                    # 核心复用：若 mb_old_log_probs 为 None（即首轮迭代且跳过了 Rollout 前向），
+                    # 直接就地 detach 复用本次带梯度的前向 log_probs
+                    if mb_old_log_probs is None:
+                        mb_old_log_probs = log_probs.detach()
+                        if cached_old_log_probs is not None:
+                            cached_old_log_probs[mini_batch_indices] = log_probs.detach().float()
 
                     loss, clip_frac = self.criterion(
                         log_probs=log_probs,
@@ -903,6 +994,9 @@ class GRPOTrainer(BaseTrainer):
 
                 if need_update_step:
                     self._update_step(is_last_step=is_last_mini_batch)
+
+            if cached_old_log_probs is not None and old_log_probs is None:
+                old_log_probs = cached_old_log_probs
 
 
         if total_micro_batches_processed > 0:

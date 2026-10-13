@@ -3,55 +3,368 @@ import math
 
 import torch
 from torch import nn
-import torch.distributed as dist
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint as torch_checkpoint
-
 from .partition_utils import maybe_gather_lm_head_ctx
+from .utils import log_softmax
 
 
-def _chunk_ce_kd_forward(
-        h_chunk: torch.Tensor,
-        w: torch.Tensor,
-        b: Optional[torch.Tensor],
-        lbl_chunk: torch.Tensor,
-        t_logits_chunk: Optional[torch.Tensor],
-        ignore_index: int,
-        kd_coef: float
-):
+class ChunkedCrossEntropyFunction(torch.autograd.Function):
     """
-    单个 chunk 内部的前向计算：运行在 torch.utils.checkpoint 内部
-    - 投影 GEMM 保持在 Tensor Core 原始精度 (bf16/fp16)，计算后转 float32 保证损失数值稳定性
-    - 同时完成 Student 投影、CE 损失与安全 KD 蒸馏损失计算
+    1. 前向：由外部调用模块（如 ChunkedLMLoss）统一包裹 maybe_gather_lm_head_ctx 保护 .apply() 调用，
+       算子内部直接执行分块 GEMM，累加标量损失，不保存任何中间 Logits，规避多层嵌套破坏 ZeRO-3 状态机。
+    2. 反向：在 backward 内部统一进入一次 maybe_gather_lm_head_ctx，保证分块重算与 GEMM 累积期间权重处于 AVAILABLE 状态且全卡对齐。
+    3. 彻底规避 torch.utils.checkpoint 的二次通信与反向访问已释放参数 (Data Hazard) 缺陷。
     """
-    with maybe_gather_lm_head_ctx(w, b):
-        s_logits = (h_chunk @ w.t()).float()
-        if b is not None:
-            s_logits = s_logits + b.float()
+    @staticmethod
+    def forward(
+            ctx,
+            hidden: torch.Tensor,
+            weight: torch.Tensor,
+            bias: Optional[torch.Tensor],
+            labels: torch.Tensor,
+            teacher_logits: Optional[torch.Tensor],
+            chunk_size: int,
+            ignore_index: int,
+            kd_coef: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        ctx.chunk_size = chunk_size
+        ctx.ignore_index = ignore_index
+        ctx.kd_coef = kd_coef
+        has_teacher = (teacher_logits is not None) and (kd_coef > 0.0)
 
-    s_log_p = F.log_softmax(s_logits, dim=-1)
-    chunk_ce_loss = F.nll_loss(s_log_p, lbl_chunk, ignore_index=ignore_index, reduction="sum")
+        orig_h_shape = hidden.shape
+        if hidden.dim() == 3:
+            hidden_flat = hidden.reshape(-1, hidden.shape[-1])
+            labels_flat = labels.reshape(-1)
+            t_logits_flat = teacher_logits.reshape(-1, teacher_logits.shape[-1]) if teacher_logits is not None else None
+        else:
+            hidden_flat = hidden
+            labels_flat = labels
+            t_logits_flat = teacher_logits
 
-    if t_logits_chunk is not None and kd_coef > 0.0:
-        valid = (lbl_chunk != ignore_index).float()
-        t_probs = F.softmax(t_logits_chunk.float(), dim=-1)
-        safe_s_log_p = torch.clamp(s_log_p, min=-100.0)
-        safe_prod = torch.where(t_probs > 0, t_probs * safe_s_log_p, torch.zeros_like(safe_s_log_p))
+        valid_mask = labels_flat != ignore_index
+        valid_indices = torch.nonzero(valid_mask).squeeze(-1)
+        n_valid = valid_indices.numel()
 
-        per_token_kd = -torch.sum(safe_prod, dim=-1)
-        per_token_kd = torch.where(valid > 0, per_token_kd, torch.zeros_like(per_token_kd))
-        chunk_kd_loss = per_token_kd.sum()
+        total_loss_sum = torch.zeros((), dtype=torch.float32, device=hidden.device)
+        ce_loss_sum = torch.zeros((), dtype=torch.float32, device=hidden.device)
 
-        chunk_total_loss = (1.0 - kd_coef) * chunk_ce_loss + kd_coef * chunk_kd_loss
+        # 方案优化：绝不将全量 [B, S, V] 或任何 GPU teacher_logits 存入 ctx.save_for_backward！
+        # 仅过滤有效 Token (valid_indices) 的 teacher_logits，并在需要时 offload 到 CPU (pinned memory)。
+        t_logits_cpu = None
+        if has_teacher and n_valid > 0:
+            t_logits_valid = t_logits_flat[valid_indices]
+            if t_logits_valid.is_cuda:
+                t_logits_cpu = t_logits_valid.to("cpu", non_blocking=True)
+                if torch.cuda.is_available():
+                    try:
+                        t_logits_cpu = t_logits_cpu.pin_memory()
+                    except Exception:
+                        pass
+            else:
+                t_logits_cpu = t_logits_valid
+        else:
+            t_logits_valid = None
+
+        if n_valid > 0:
+            for start in range(0, n_valid, chunk_size):
+                idx_c = valid_indices[start : start + chunk_size]
+                h_c = hidden_flat[idx_c]
+                lbl_c = labels_flat[idx_c]
+
+                logits_c = (h_c @ weight.t()).float()
+                if bias is not None:
+                    logits_c = logits_c + bias.float()
+
+                log_p_c = F.log_softmax(logits_c, dim=-1)
+                chunk_ce = F.nll_loss(log_p_c, lbl_c, ignore_index=ignore_index, reduction="sum")
+                ce_loss_sum = ce_loss_sum + chunk_ce
+
+                if has_teacher:
+                    if t_logits_valid.device.type == hidden.device.type:
+                        t_logits_c = t_logits_valid[start : start + chunk_size].float()
+                    else:
+                        t_logits_c = t_logits_valid[start : start + chunk_size].to(hidden.device, non_blocking=True).float()
+
+                    t_probs_c = F.softmax(t_logits_c, dim=-1)
+                    safe_log_p = torch.clamp(log_p_c, min=-100.0)
+                    prod = torch.where(t_probs_c > 0, t_probs_c * safe_log_p, torch.zeros_like(safe_log_p))
+                    chunk_kd = -prod.sum()
+                    chunk_total = (1.0 - kd_coef) * chunk_ce + kd_coef * chunk_kd
+                else:
+                    chunk_total = chunk_ce
+
+                total_loss_sum = total_loss_sum + chunk_total
+
+        denom = max(n_valid, 1)
+        total_loss = total_loss_sum / denom
+        ce_loss = (ce_loss_sum / denom).detach()
+
+        # 显式解除局部 GPU 临时张量引用
+        del t_logits_valid, t_logits_flat
+
+        ctx.save_for_backward(hidden, weight, bias, labels, valid_indices)
+
+        ctx.teacher_logits_cpu = t_logits_cpu
+        ctx.n_valid = n_valid
+        ctx.orig_h_shape = orig_h_shape
+        return total_loss, ce_loss
+
+    @staticmethod
+    def backward(ctx, grad_total_loss: torch.Tensor, grad_ce_loss: Optional[torch.Tensor]):
+        hidden, weight, bias, labels, valid_indices = ctx.saved_tensors
+        t_logits_cpu = getattr(ctx, "teacher_logits_cpu", None)
+        n_valid = ctx.n_valid
+        orig_h_shape = getattr(ctx, "orig_h_shape", hidden.shape)
+
+        needs_h_grad = ctx.needs_input_grad[0]
+        needs_w_grad = ctx.needs_input_grad[1]
+        needs_b_grad = bias is not None and ctx.needs_input_grad[2]
+
+        chunk_size = ctx.chunk_size
+        kd_coef = ctx.kd_coef
+        has_teacher = (t_logits_cpu is not None) and (kd_coef > 0.0)
+
+        g_out = grad_total_loss if grad_total_loss is not None else torch.zeros((), device=hidden.device)
+        scale = g_out / max(n_valid, 1)
+
+        grad_hidden = torch.zeros(orig_h_shape, dtype=hidden.dtype, device=hidden.device) if needs_h_grad else None
+        grad_hidden_flat = grad_hidden.view(-1, hidden.shape[-1]) if grad_hidden is not None else None
+
+        hidden_flat = hidden.reshape(-1, hidden.shape[-1]) if hidden.dim() == 3 else hidden
+        labels_flat = labels.reshape(-1) if labels.dim() > 1 else labels
+
+        # 整个反向重算循环进入 maybe_gather_lm_head_ctx，保证 weight/bias 处于 AVAILABLE 状态且所有 rank 集合通信严格对齐
+        # 严禁在 with 外面基于 n_valid == 0 提前 return，避免 NCCL AllGather 死锁！
+        with maybe_gather_lm_head_ctx(weight, bias):
+            vocab_size = weight.ds_shape[0] if hasattr(weight, "ds_shape") else weight.shape[0]
+            grad_weight = torch.zeros(weight.shape, dtype=torch.float32, device=weight.device) if needs_w_grad else None
+            grad_bias = torch.zeros(bias.shape, dtype=torch.float32, device=bias.device) if needs_b_grad else None
+
+            if n_valid > 0:
+                for start in range(0, n_valid, chunk_size):
+                    idx_c = valid_indices[start : start + chunk_size]
+                    h_c = hidden_flat[idx_c]
+                    lbl_c = labels_flat[idx_c]
+
+                    logits_c = (h_c @ weight.t()).float()
+                    if bias is not None:
+                        logits_c = logits_c + bias.float()
+
+                    d_logits = F.softmax(logits_c, dim=-1)
+
+                    if has_teacher:
+                        # 按需从 CPU 搬运当前 chunk 的切片到计算设备，避免全量 logits 常驻 GPU 显存
+                        t_logits_c = t_logits_cpu[start : start + chunk_size].to(hidden.device, non_blocking=True).float()
+                        t_probs_c = F.softmax(t_logits_c, dim=-1)
+                        # target_dist = (1 - kd_coef) * target_one_hot + kd_coef * t_probs_c
+                        # d_logits = probs - target_dist = probs - kd_coef * t_probs_c - (1 - kd_coef) * target_one_hot
+                        # 原地扣减蒸馏项与目标位置，彻底避免物化 [chunk_size, V] 的 Dense One-Hot 张量
+                        d_logits.sub_(t_probs_c.mul_(kd_coef))
+                        d_logits.scatter_add_(
+                            dim=1,
+                            index=lbl_c.unsqueeze(1),
+                            src=torch.full((lbl_c.shape[0], 1), -(1.0 - kd_coef), dtype=d_logits.dtype, device=d_logits.device),
+                        )
+                    else:
+                        # d_logits = probs - target_one_hot，直接通过 scatter_add_ 原地扣减目标位置的 1.0
+                        d_logits.scatter_add_(
+                            dim=1,
+                            index=lbl_c.unsqueeze(1),
+                            src=torch.full((lbl_c.shape[0], 1), -1.0, dtype=d_logits.dtype, device=d_logits.device),
+                        )
+
+                    d_logits.mul_(scale)
+                    d_logits_compute = d_logits.to(h_c.dtype)
+
+                    if needs_h_grad:
+                        grad_hidden_flat[idx_c] = d_logits_compute @ weight
+                    if needs_w_grad:
+                        grad_weight.add_(d_logits.t() @ h_c.float())
+                    if needs_b_grad:
+                        grad_bias.add_(d_logits.sum(dim=0))
+
+        # 反向计算完成后立即解除 CPU 引用，加快 Host 内存释放
+        if hasattr(ctx, "teacher_logits_cpu"):
+            del ctx.teacher_logits_cpu
+
+        return (
+            grad_hidden,
+            grad_weight.to(weight.dtype) if grad_weight is not None else None,
+            grad_bias.to(bias.dtype) if grad_bias is not None else None,
+            None, None, None, None, None
+        )
+
+
+class ChunkedLogProbFunction(torch.autograd.Function):
+    """
+    分块计算目标 token 的 log_probs，彻底避免物化 [B, S, V] 全量 Logits：
+    1. 前向：由外部调用函数（如 chunked_log_probs）统一包裹 maybe_gather_lm_head_ctx 保护 .apply() 调用，
+       算子内部直接执行分块 GEMM + log_softmax，仅保留目标 Token 的标量对数概率。
+    2. 反向：接收上游梯度 grad_log_probs，在 backward 内部统一进入一次 maybe_gather_lm_head_ctx，
+       分块重算并反向累积 hidden_states 与 lm_head.weight 梯度。
+    3. 全流程闭环兼容 DeepSpeed ZeRO-3 状态机，杜绝多层上下文嵌套带来的生命周期冲突。
+    """
+    @staticmethod
+    def forward(
+            ctx,
+            hidden: torch.Tensor,
+            weight: torch.Tensor,
+            bias: Optional[torch.Tensor],
+            targets: torch.Tensor,
+            chunk_size: int = 256,
+            ignore_index: int = -100,
+    ) -> torch.Tensor:
+        ctx.chunk_size = chunk_size
+        ctx.ignore_index = ignore_index
+
+        orig_targets_shape = targets.shape
+        orig_h_shape = hidden.shape
+        if hidden.dim() == 3:
+            hidden_flat = hidden.reshape(-1, hidden.shape[-1])
+            targets_flat = targets.reshape(-1)
+        else:
+            hidden_flat = hidden
+            targets_flat = targets
+
+        log_probs_flat = torch.zeros(targets_flat.shape, dtype=torch.float32, device=hidden.device)
+
+        vocab_size = weight.ds_shape[0] if hasattr(weight, "ds_shape") else weight.size(0)
+        valid_mask = (targets_flat != ignore_index) & (targets_flat >= 0) & (targets_flat < vocab_size)
+        valid_indices = torch.nonzero(valid_mask).squeeze(-1)
+        n_valid = valid_indices.numel()
+
+        if n_valid > 0:
+            for start in range(0, n_valid, chunk_size):
+                idx_c = valid_indices[start : start + chunk_size]
+                h_c = hidden_flat[idx_c]
+                tgt_c = targets_flat[idx_c]
+
+                logits_c = (h_c @ weight.t()).float()
+                if bias is not None:
+                    logits_c = logits_c + bias.float()
+
+                chunk_log_probs = log_softmax(logits_c, tgt_c)
+                log_probs_flat[idx_c] = chunk_log_probs
+
+        ctx.save_for_backward(hidden, weight, bias, targets, valid_indices)
+
+        ctx.n_valid = n_valid
+        ctx.orig_h_shape = orig_h_shape
+        ctx.orig_targets_shape = orig_targets_shape
+        return log_probs_flat.view(orig_targets_shape).to(hidden.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_log_probs: torch.Tensor):
+        hidden, weight, bias, targets, valid_indices = ctx.saved_tensors
+        n_valid = ctx.n_valid
+        orig_h_shape = getattr(ctx, "orig_h_shape", hidden.shape)
+
+        needs_h_grad = ctx.needs_input_grad[0]
+        needs_w_grad = ctx.needs_input_grad[1]
+        needs_b_grad = bias is not None and ctx.needs_input_grad[2]
+
+        chunk_size = ctx.chunk_size
+        g_in = grad_log_probs.float() if grad_log_probs is not None else None
+        g_in_flat = g_in.reshape(-1) if (g_in is not None and g_in.dim() > 1) else g_in
+
+        grad_hidden = torch.zeros(orig_h_shape, dtype=hidden.dtype, device=hidden.device) if needs_h_grad else None
+        grad_hidden_flat = grad_hidden.view(-1, hidden.shape[-1]) if grad_hidden is not None else None
+
+        hidden_flat = hidden.reshape(-1, hidden.shape[-1]) if hidden.dim() == 3 else hidden
+        targets_flat = targets.reshape(-1) if targets.dim() > 1 else targets
+
+        # 整个反向重算循环进入 maybe_gather_lm_head_ctx，保证 weight/bias 处于 AVAILABLE 状态且 rank 通信对齐
+        with maybe_gather_lm_head_ctx(weight, bias):
+            vocab_size = weight.ds_shape[0] if hasattr(weight, "ds_shape") else weight.size(0)
+            grad_weight = torch.zeros(weight.shape, dtype=torch.float32, device=weight.device) if needs_w_grad else None
+            grad_bias = torch.zeros(bias.shape, dtype=torch.float32, device=bias.device) if needs_b_grad else None
+
+            if n_valid > 0 and g_in_flat is not None:
+                for start in range(0, n_valid, chunk_size):
+                    idx_c = valid_indices[start : start + chunk_size]
+                    g_c = g_in_flat[idx_c]
+
+                    if not g_c.any():
+                        continue
+
+                    h_c = hidden_flat[idx_c]
+                    tgt_c = targets_flat[idx_c]
+
+                    logits_c = (h_c @ weight.t()).float()
+                    if bias is not None:
+                        logits_c = logits_c + bias.float()
+
+                    # d(log p_target) / dz = target_one_hot - probs = -probs + target_one_hot
+                    # 原地取负后通过 scatter_add_ 在目标位置加上 1.0，彻底消除数百 MB 的 Dense One-Hot 张量
+                    d_logits = F.softmax(logits_c, dim=-1).neg_()
+                    d_logits.scatter_add_(
+                        dim=1,
+                        index=tgt_c.unsqueeze(1),
+                        src=torch.ones((tgt_c.shape[0], 1), dtype=d_logits.dtype, device=d_logits.device),
+                    )
+                    d_logits.mul_(g_c.unsqueeze(-1))
+                    d_logits_compute = d_logits.to(h_c.dtype)
+
+                    if needs_h_grad:
+                        grad_hidden_flat[idx_c] = d_logits_compute @ weight
+                    if needs_w_grad:
+                        grad_weight.add_(d_logits.t() @ h_c.float())
+                    if needs_b_grad:
+                        grad_bias.add_(d_logits.sum(dim=0))
+
+        return (
+            grad_hidden,
+            grad_weight.to(weight.dtype) if grad_weight is not None else None,
+            grad_bias.to(bias.dtype) if grad_bias is not None else None,
+            None, None, None
+        )
+
+
+def chunked_log_probs(
+        hidden_states: torch.Tensor,
+        lm_head_weight: torch.Tensor,
+        targets: torch.Tensor,
+        lm_head_bias: Optional[torch.Tensor] = None,
+        chunk_size: int = 256,
+        ignore_index: int = -100
+) -> torch.Tensor:
+    """
+    分块计算目标 token 的 log_probs：
+    hidden_states: [B, S, H] 或 [N, H]
+    lm_head_weight: [V, H]
+    targets: [B, S] 或 [N]
+    Returns:
+        log_probs: 形状与 targets 一致 ([B, S] 或 [N])
+    """
+    orig_shape = targets.shape
+    if hidden_states.dim() == 3:
+        hidden = hidden_states.reshape(-1, hidden_states.size(-1))
+        flat_targets = targets.reshape(-1)
     else:
-        chunk_total_loss = chunk_ce_loss
+        hidden = hidden_states
+        flat_targets = targets
 
-    return chunk_total_loss, chunk_ce_loss
+    with maybe_gather_lm_head_ctx(lm_head_weight, lm_head_bias):
+        flat_log_probs = ChunkedLogProbFunction.apply(
+            hidden,
+            lm_head_weight,
+            lm_head_bias,
+            flat_targets,
+            chunk_size,
+            ignore_index
+        )
+
+    return flat_log_probs.view(orig_shape)
 
 
 class ChunkedLMLoss(nn.Module):
     """
     支持 Active Token Filtering + Chunked Cross Entropy + Chunked Knowledge Distillation
+    采用自定义 ChunkedCrossEntropyFunction (torch.autograd.Function) 实现:
+    1. 前向仅一次 maybe_gather_lm_head_ctx，分块 GEMM，累加标量损失，不保存中间大 Logits。
+    2. 反向显式进入一次 maybe_gather_lm_head_ctx，安全进行分块重算与梯度累积。
+    3. 彻底规避 torch.utils.checkpoint 与 ZeRO-3 状态机的死锁和内存提前释放缺陷。
     """
 
     def __init__(
@@ -74,91 +387,39 @@ class ChunkedLMLoss(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            hidden_states: [B, S, H]
+            hidden_states: [B, S, H] 或 [N, H]
             lm_head_weight: [V, H]
-            labels: [B, S]
+            labels: [B, S] 或 [N]
             lm_head_bias: [V] (可选)
-            teacher_logits: [B, S, V] (可选，Teacher 模型生成的软标签)
+            teacher_logits: [B, S, V] 或 [N, V] (可选)
             kd_coef: 知识蒸馏权重 (0.0 ~ 1.0)
         Returns:
             total_loss: 结合 CE 和 KD 的总损失 (标量)
             ce_loss: 纯 CE 损失 (标量)
         """
-        hidden = hidden_states[:, :-1, :].reshape(-1, hidden_states.size(-1))
-        shift_labels = labels[:, 1:].reshape(-1)
-        if teacher_logits is not None and kd_coef > 0.0:
-            shift_teacher_logits = teacher_logits[:, :-1, :].reshape(-1, teacher_logits.size(-1))
+        if hidden_states.dim() == 3:
+            hidden = hidden_states[:, :-1, :].reshape(-1, hidden_states.size(-1))
+            shift_labels = labels[:, 1:].reshape(-1)
+            if teacher_logits is not None and kd_coef > 0.0:
+                shift_teacher_logits = teacher_logits[:, :-1, :].reshape(-1, teacher_logits.size(-1))
+            else:
+                shift_teacher_logits = None
         else:
-            shift_teacher_logits = None
+            hidden = hidden_states
+            shift_labels = labels
+            shift_teacher_logits = teacher_logits
 
-        valid = shift_labels != self.ignore_index
-        n_valid_tensor = valid.sum()
-        order = valid.to(torch.int8).argsort(descending=True, stable=True)
-        hidden = hidden[order]
-        shift_labels = shift_labels[order]
-        if shift_teacher_logits is not None:
-            shift_teacher_logits = shift_teacher_logits[order]
-
-        n_valid_chunks = (n_valid_tensor + self.chunk_size - 1) // self.chunk_size
-
-        if dist.is_available() and dist.is_initialized():
-            max_chunks_tensor = n_valid_chunks.clone()
-            dist.all_reduce(max_chunks_tensor, op=dist.ReduceOp.MAX)
-            max_num_chunks = int(max_chunks_tensor.item())
-        else:
-            max_num_chunks = int(n_valid_chunks.item())
-
-        if max_num_chunks == 0:
-            with maybe_gather_lm_head_ctx(lm_head_weight, lm_head_bias):
-                loss = (hidden_states.float().sum() + lm_head_weight.float().sum()) * 0.0
-                if lm_head_bias is not None:
-                    loss = loss + lm_head_bias.float().sum() * 0.0
-            return loss, loss
-
-        max_padded = max_num_chunks * self.chunk_size
-        if max_padded > hidden.size(0):
-            pad_len = max_padded - hidden.size(0)
-            hidden = torch.cat([hidden, hidden.new_zeros((pad_len, hidden.size(-1)))], dim=0)
-            shift_labels = torch.cat([shift_labels, shift_labels.new_full((pad_len,), self.ignore_index)], dim=0)
-            if shift_teacher_logits is not None:
-                shift_teacher_logits = torch.cat([
-                    shift_teacher_logits,
-                    shift_teacher_logits.new_zeros((pad_len, shift_teacher_logits.size(-1)))
-                ], dim=0)
-        elif max_padded < hidden.size(0):
-            hidden = hidden[:max_padded]
-            shift_labels = shift_labels[:max_padded]
-            if shift_teacher_logits is not None:
-                shift_teacher_logits = shift_teacher_logits[:max_padded]
-
-        total_loss_accum = hidden.new_zeros((), dtype=torch.float32)
-        ce_loss_accum = hidden.new_zeros((), dtype=torch.float32)
-
-        for start in range(0, max_padded, self.chunk_size):
-            h_chunk = hidden[start: start + self.chunk_size]
-            lbl_chunk = shift_labels[start: start + self.chunk_size]
-            t_chunk = shift_teacher_logits[start: start + self.chunk_size] if shift_teacher_logits is not None else None
-            chunk_total, chunk_ce = torch_checkpoint(
-                _chunk_ce_kd_forward,
-                h_chunk,
+        with maybe_gather_lm_head_ctx(lm_head_weight, lm_head_bias):
+            return ChunkedCrossEntropyFunction.apply(
+                hidden,
                 lm_head_weight,
                 lm_head_bias,
-                lbl_chunk,
-                t_chunk,
+                shift_labels,
+                shift_teacher_logits,
+                self.chunk_size,
                 self.ignore_index,
-                kd_coef,
-                use_reentrant=False,
+                kd_coef
             )
-            total_loss_accum = total_loss_accum + chunk_total
-            ce_loss_accum = ce_loss_accum + chunk_ce
-
-        if n_valid_tensor > 0:
-            total_loss = total_loss_accum / n_valid_tensor
-            ce_loss = ce_loss_accum / n_valid_tensor
-        else:
-            total_loss = total_loss_accum * 0.0
-            ce_loss = ce_loss_accum * 0.0
-        return total_loss, ce_loss
 
 
 class LMLoss(nn.Module):
@@ -224,6 +485,17 @@ class KDLoss(nn.Module):
         return distil_loss
 
 
+def log1mexp(x: torch.Tensor) -> torch.Tensor:
+    """
+    Numerically stable computation of log(1 - exp(x)) for x <= 0.
+    Branches at -ln 2 ≈ -0.6931471805599453 to avoid catastrophic cancellation:
+    - For x < -ln 2, exp(x) < 0.5, so 1 - exp(x) does not suffer cancellation; use log1p(-exp(x)).
+    - For x >= -ln 2, exp(x) >= 0.5; use log(-expm1(x)) to preserve precision as expm1(x) avoids subtraction cancellation.
+    """
+    t = -0.6931471805599453
+    return torch.where(x < t, torch.log1p(-torch.exp(x)), torch.log(-torch.expm1(x)))
+
+
 class DPOLoss(nn.Module):
     def __init__(
             self,
@@ -244,19 +516,23 @@ class DPOLoss(nn.Module):
             self,
             policy_chosen_logps: torch.Tensor,
             policy_reject_logps: torch.Tensor,
-            ref_chosen_logps: torch.Tensor,
-            ref_reject_logps: torch.Tensor,
+            ref_chosen_logps: Optional[torch.Tensor] = None,
+            ref_reject_logps: Optional[torch.Tensor] = None,
             policy_chosen_means: Optional[torch.Tensor] = None,
-            policy_reject_means: Optional[torch.Tensor] = None
+            policy_reject_means: Optional[torch.Tensor] = None,
+            chosen_lengths: Optional[torch.Tensor] = None,
+            reject_lengths: Optional[torch.Tensor] = None,
+            ref_chosen_means: Optional[torch.Tensor] = None,
+            ref_reject_means: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.loss_type == 'orpo':
             # ORPO: Odds Ratio Preference Optimization
-            # Odds = P / (1 - P) => log(Odds) = log(P) - log(1 - P)
-            p_chosen = torch.clamp(policy_chosen_means.float(), max=-1e-6)
-            log_odds_chosen = p_chosen - torch.log1p(-torch.exp(p_chosen))
+            # Odds = P / (1 - P) => log(Odds) = log(P) - log(1 - P) = p - log1mexp(p)
+            p_chosen = torch.clamp(policy_chosen_means.float(), max=-1e-7)
+            log_odds_chosen = p_chosen - log1mexp(p_chosen)
 
-            p_reject = torch.clamp(policy_reject_means.float(), max=-1e-6)
-            log_odds_rejected = p_reject - torch.log1p(-torch.exp(p_reject))
+            p_reject = torch.clamp(policy_reject_means.float(), max=-1e-7)
+            log_odds_rejected = p_reject - log1mexp(p_reject)
 
             log_odds_ratio = log_odds_chosen - log_odds_rejected
             losses = self.beta * -F.logsigmoid(log_odds_ratio)
@@ -264,21 +540,40 @@ class DPOLoss(nn.Module):
 
         if self.loss_type == 'simpo':
             # SimPO: Simple Preference Optimization
-            reward_diff = self.beta * (policy_chosen_means.float() - policy_reject_means.float())
-            losses = -F.logsigmoid(reward_diff - self.simpo_gamma)
+            # Incorporates label_smoothing regularization
+            logits = (policy_chosen_means.float() - policy_reject_means.float()) - (self.simpo_gamma / self.beta)
+            losses = (
+                -F.logsigmoid(self.beta * logits) * (1.0 - self.label_smoothing)
+                - F.logsigmoid(-self.beta * logits) * self.label_smoothing
+            )
             return losses.mean()
 
         policy_chosen_logps = policy_chosen_logps.float()
         policy_reject_logps = policy_reject_logps.float()
-        ref_chosen_logps = ref_chosen_logps.float()
-        ref_reject_logps = ref_reject_logps.float()
+        ref_chosen_logps = ref_chosen_logps.float() if ref_chosen_logps is not None else torch.zeros_like(policy_chosen_logps)
+        ref_reject_logps = ref_reject_logps.float() if ref_reject_logps is not None else torch.zeros_like(policy_reject_logps)
 
         pi_logratios = policy_chosen_logps - policy_reject_logps
         ref_logratios = ref_chosen_logps - ref_reject_logps
         logits = pi_logratios - ref_logratios
 
         if self.ipo:
-            losses = (logits - 1 / (2 * self.beta)) ** 2  # Eq. 17 of https://arxiv.org/pdf/2310.12036v2.pdf
+            # IPO uses sequence-level log-prob differences; in code these are token-summed over the completion,
+            # which makes the squared loss scale quadratically with completion length.
+            # We therefore normalize by the number of completion tokens (average per token) to prevent squared loss explosion.
+            if chosen_lengths is not None and reject_lengths is not None:
+                chosen_avg_score = (policy_chosen_logps - ref_chosen_logps) / chosen_lengths.float().clamp(min=1.0)
+                reject_avg_score = (policy_reject_logps - ref_reject_logps) / reject_lengths.float().clamp(min=1.0)
+                ipo_delta = chosen_avg_score - reject_avg_score
+            elif (policy_chosen_means is not None and ref_chosen_means is not None and
+                  policy_reject_means is not None and ref_reject_means is not None):
+                chosen_avg_score = policy_chosen_means.float() - ref_chosen_means.float()
+                reject_avg_score = policy_reject_means.float() - ref_reject_means.float()
+                ipo_delta = chosen_avg_score - reject_avg_score
+            else:
+                ipo_delta = logits
+
+            losses = (ipo_delta - 1 / (2 * self.beta)) ** 2  # Eq. 17 of https://arxiv.org/pdf/2310.12036v2.pdf
         else:
             # Eq. 3 https://ericmitchell.ai/cdpo.pdf; label_smoothing=0 gives original DPO (Eq. 7 of https://arxiv.org/pdf/2305.18290.pdf)
             losses = (
@@ -421,7 +716,16 @@ class GRPOLoss(nn.Module):
 
         self.beta = beta
         self.clip_eps_low = clip_eps_low
-        self.clip_eps_high = clip_eps_high if clip_eps_high is not None else clip_eps_low
+        if loss_type == "cispo":
+            # ScaleRL paper (https://arxiv.org/abs/2510.13786) recommend epsilon_max = 5.0 for CISPO.
+            # If clip_eps_high is not specified or keeps the default <= 1.0 (e.g. 0.28 from DAPO/GRPO configs),
+            # adaptively initialize to the recommended 5.0.
+            if clip_eps_high is None or clip_eps_high <= 1.0:
+                self.clip_eps_high = 5.0
+            else:
+                self.clip_eps_high = clip_eps_high
+        else:
+            self.clip_eps_high = clip_eps_high if clip_eps_high is not None else clip_eps_low
         self.delta = delta
         self.importance_sampling_level = importance_sampling_level
         self.loss_type = loss_type
@@ -517,7 +821,7 @@ class GRPOLoss(nn.Module):
         coef_1 = raw_coef
 
         if self.loss_type == "cispo":
-            clamped_ratios = torch.clamp(coef_1, max=1 + self.clip_eps_high).detach()
+            clamped_ratios = torch.clamp(coef_1, max=self.clip_eps_high).detach()
             per_token_loss = -clamped_ratios * advantages * log_probs
 
         elif self.loss_type == "sapo":
@@ -575,15 +879,15 @@ class GRPOLoss(nn.Module):
         with torch.no_grad():
             if self.loss_type in ["grpo", "bnpo", "dr_grpo", "dapo", "luspo"]:
                 is_clipped = (
-                    (advantages > 0) & (raw_coef > 1 + self.clip_eps_high) |
-                    (advantages < 0) & (raw_coef < 1 - self.clip_eps_low)
+                    ((advantages > 0) & (raw_coef > 1 + self.clip_eps_high)) |
+                    ((advantages < 0) & (raw_coef < 1 - self.clip_eps_low))
                 )
             elif self.loss_type == "cispo":
-                is_clipped = raw_coef > 1 + self.clip_eps_high
+                is_clipped = (raw_coef > self.clip_eps_high) & (advantages > 0)
             else:
                 is_clipped = (
-                    (advantages > 0) & (raw_coef > 1 + self.clip_eps_high) |
-                    (advantages < 0) & (raw_coef < 1 - self.clip_eps_low)
+                    ((advantages > 0) & (raw_coef > 1 + self.clip_eps_high)) |
+                    ((advantages < 0) & (raw_coef < 1 - self.clip_eps_low))
                 )
             clip_frac = (is_clipped.float() * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
 

@@ -6,9 +6,9 @@ from torch.utils.data import Dataset
 from .base_trainer import BaseTrainer
 from .utils import pretrain_collate_fn
 from .dataset import PretrainDataset
-from .partition_utils import unwrap_model
 from .train_configs import TrainConfig, GenerationService
-from .loss import ChunkedLMLoss, LMLoss, KDLoss
+from .loss import LMLoss, KDLoss
+from .partition_utils import add_fused_lm_head
 
 
 class Trainer(BaseTrainer):
@@ -46,6 +46,10 @@ class Trainer(BaseTrainer):
 
         self.criterion, self.kd_loss = self._init_loss()
 
+    def _check_add_fused_head(self, model):
+        if self.chunked_cross_entropy_size is not None:
+            add_fused_lm_head(model, chunk_size=self.chunked_cross_entropy_size)
+
     def _convert_train_args(self) -> Tuple[dict, dict, dict]:
         parallel_kwargs, data_loader_kwargs, sampler_kwargs = super()._convert_train_args()
         data_loader_kwargs.update({"collate_fn": pretrain_collate_fn})
@@ -61,38 +65,24 @@ class Trainer(BaseTrainer):
         return None
 
     def _init_loss(self) -> Tuple[torch.nn.Module, Optional[torch.nn.Module]]:
-        if self.chunked_cross_entropy_size is not None:
-            criterion = ChunkedLMLoss(chunk_size= self.chunked_cross_entropy_size)
-        else:
-            criterion = LMLoss()
+        return LMLoss(), KDLoss() if self.pretrain_config.kd_config else None
 
-        return criterion, KDLoss() if self.pretrain_config.kd_config else None
+    def _get_teacher_logits_and_kd_coef(
+            self, inputs: torch.Tensor, attention_mask: Optional[torch.Tensor]
+    ) -> Tuple[Optional[torch.Tensor], float]:
+        kd_config = self.pretrain_config.kd_config
+        if kd_config is not None and kd_config.kd_coef > 0.0:
+            with torch.no_grad():
+                teacher_logits = kd_config.teacher_logits_provider(inputs, attention_mask)
+            return teacher_logits, kd_config.kd_coef
+        return None, 0.0
 
     def _calc_loss(self, inputs, attention_mask, result, labels, model: Optional[torch.nn.Module] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if isinstance(result, dict) and "loss" in result:
+            return result["loss"], result.get("ce_loss", result["loss"])
+
         kd_config = self.pretrain_config.kd_config
         has_kd = (kd_config is not None and kd_config.kd_coef > 0.0)
-
-        # calc loss
-        if isinstance(self.criterion, ChunkedLMLoss):
-            head_model = model if model is not None else unwrap_model(self.train_model)
-            lm_head = head_model.lm_head
-            teacher_logits = None
-            kd_coef = 0.0
-
-            if has_kd:
-                with torch.no_grad():
-                    teacher_logits = kd_config.teacher_logits_provider(inputs, attention_mask)
-                kd_coef = kd_config.kd_coef
-
-            total_loss, ce_loss = self.criterion(
-                hidden_states=result['hidden_states'],
-                lm_head_weight=lm_head.weight,
-                labels=labels,
-                lm_head_bias=getattr(lm_head, 'bias', None),
-                teacher_logits=teacher_logits,
-                kd_coef=kd_coef
-            )
-            return total_loss, ce_loss
 
         ce_loss = self.criterion(result['logits'], labels)
         if not has_kd:

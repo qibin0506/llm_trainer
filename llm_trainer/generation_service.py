@@ -5,11 +5,11 @@ import inspect
 
 import torch
 import torch.distributed as dist
-from llm_model import LlmModel, ModelConfig
+from llm_model import LlmModel, ModelConfig, VLMConfig, VlmModel
 
 from .tools import TrainerTools
 from .train_configs import GenerateConfig
-from .utils import get_dtype, empty_cache
+from .utils import get_dtype, empty_cache, batch_repeat_image_tok
 from .generate_utils import batch_generate, generate
 from .partition_utils import get_full_state_dict_on_rank0, unwrap_model,  unwrap_model_for_generation
 
@@ -43,7 +43,11 @@ class SyncCentralGenerationService(GenerationServiceBase):
         self.rank = TrainerTools().parallel.global_rank
 
         if TrainerTools().parallel.is_main_process:
-            self.gen_model = LlmModel(model_config).to(self.generation_device, get_dtype())
+            if isinstance(model_config, VLMConfig):
+                self.gen_model = VlmModel(model_config).to(self.generation_device, get_dtype())
+            else:
+                self.gen_model = LlmModel(model_config).to(self.generation_device, get_dtype())
+
             self.gen_model.eval()
             for param in self.gen_model.parameters():
                 param.requires_grad = False
@@ -93,6 +97,11 @@ class SyncCentralGenerationService(GenerationServiceBase):
                 target_prompts_tensor = torch.tensor(target_prompts, dtype=torch.long, device=self.generation_device)
                 attention_mask = (target_prompts_tensor != TrainerTools().tokenizer.pad).long()
 
+                if isinstance(self.gen_model, VlmModel) and tokens_per_image is not None and tokens_per_image > 1:
+                    target_prompts_tensor, attention_mask = batch_repeat_image_tok(
+                        target_prompts_tensor, tokens_per_image, attention_mask
+                    )
+
                 max_new_tokens = max(generate_config.max_seq_len - target_prompts_tensor.shape[1], 1)
                 completions = []
 
@@ -103,6 +112,10 @@ class SyncCentralGenerationService(GenerationServiceBase):
                 for chunk_start in range(0, len(target_prompts_tensor), actual_chunk_size):
                     chunk_prompts = target_prompts_tensor[chunk_start: chunk_start + actual_chunk_size]
                     chunk_mask = attention_mask[chunk_start: chunk_start + actual_chunk_size]
+
+                    chunk_pixel_values = None
+                    if pixel_values is not None:
+                        chunk_pixel_values = pixel_values[chunk_start: chunk_start + actual_chunk_size]
 
                     out_ids, _ = batch_generate(
                         model=self.gen_model,
@@ -115,6 +128,8 @@ class SyncCentralGenerationService(GenerationServiceBase):
                         repetition_penalty=generate_config.repetition_penalty,
                         exclude_penalty_tokens=generate_config.exclude_penalty_tokens,
                         suppress_tokens=generate_config.suppress_tokens,
+                        pixel_values=chunk_pixel_values,
+                        tokens_per_image=-1,
                         device=self.generation_device,
                         return_logits=False,
                         auto_prefix_cache=generate_config.auto_prefix_cache
@@ -145,7 +160,11 @@ class ParallelGenerationService(GenerationServiceBase):
         self.world_size = TrainerTools().parallel.world_size
         self.rank = TrainerTools().parallel.global_rank
 
-        self.gen_model = LlmModel(model_config).to(self.generation_device, get_dtype())
+        if isinstance(model_config, VLMConfig):
+            self.gen_model = VlmModel(model_config).to(self.generation_device, get_dtype())
+        else:
+            self.gen_model = LlmModel(model_config).to(self.generation_device, get_dtype())
+
         self.gen_model.eval()
         for param in self.gen_model.parameters():
             param.requires_grad = False
@@ -162,10 +181,25 @@ class ParallelGenerationService(GenerationServiceBase):
 
         comm_device = TrainerTools().parallel.device
         gen_device = self.generation_device
+        is_cross_device = torch.device(comm_device) != torch.device(gen_device)
 
         buckets = {}
         bucket_offsets = {}
         params_in_buckets = {}
+
+        def _synchronize_cross_device():
+            if not is_cross_device:
+                return
+            for dev in (comm_device, gen_device):
+                dev_type = torch.device(dev).type
+                if dev_type == 'cuda' and torch.cuda.is_available():
+                    torch.cuda.synchronize(dev)
+                elif dev_type == 'npu' and hasattr(torch, 'npu') and torch.npu.is_available():
+                    torch.npu.synchronize(dev)
+                elif dev_type == 'mlu' and hasattr(torch, 'mlu') and torch.mlu.is_available():
+                    torch.mlu.synchronize(dev)
+                elif dev_type == 'mps' and hasattr(torch, 'mps') and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                    torch.mps.synchronize()
 
         def get_bucket(dtype: torch.dtype) -> Tuple[torch.Tensor, int, list]:
             if dtype not in buckets:
@@ -190,13 +224,15 @@ class ParallelGenerationService(GenerationServiceBase):
             unpack_offset = 0
             for name, param, numel, param_shape in params_list:
                 param_slice = valid_buffer[unpack_offset: unpack_offset + numel].view(param_shape)
-                param.data.copy_(param_slice.to(gen_device, non_blocking=True))
+                param.data.copy_(param_slice.to(gen_device))
                 unpack_offset += numel
+
+            _synchronize_cross_device()
 
             bucket_offsets[dtype] = 0
             params_list.clear()
 
-        for name, param in self.gen_model.state_dict().items():
+        for name, param in sorted(self.gen_model.state_dict().items(), key=lambda x: x[0]):
             dtype = param.dtype
             numel = param.numel()
             buffer, offset, params_list = get_bucket(dtype)
@@ -205,11 +241,12 @@ class ParallelGenerationService(GenerationServiceBase):
                 flush_bucket(dtype)
                 if TrainerTools().parallel.is_main_process:
                     src_tensor = state_dict[name] if (state_dict is not None and name in state_dict) else param.data
-                    src_tensor = src_tensor.to(comm_device, dtype=param.dtype, non_blocking=True)
+                    src_tensor = src_tensor.to(comm_device, dtype=param.dtype).contiguous()
                 else:
                     src_tensor = torch.empty_like(param.data, device=comm_device)
                 dist.broadcast(src_tensor, src=0)
-                param.data.copy_(src_tensor.to(gen_device, non_blocking=True))
+                param.data.copy_(src_tensor.to(gen_device))
+                _synchronize_cross_device()
                 continue
 
             if offset + numel > buffer.numel():
@@ -223,7 +260,7 @@ class ParallelGenerationService(GenerationServiceBase):
             params_list.append((name, param, numel, param.shape))
             bucket_offsets[dtype] += numel
 
-        for dtype in buckets.keys():
+        for dtype in sorted(buckets.keys(), key=str):
             flush_bucket(dtype)
 
     def _eval(
@@ -231,7 +268,6 @@ class ParallelGenerationService(GenerationServiceBase):
             model: torch.nn.Module,
             prompt_ids: torch.Tensor,
             generate_config: GenerateConfig,
-            task_type: str,
             pixel_values: Optional[torch.Tensor] = None,
             tokens_per_image: Optional[int] = -1
     ):
@@ -243,6 +279,11 @@ class ParallelGenerationService(GenerationServiceBase):
         empty_cache()
 
         local_prompts_tensor = prompt_ids.to(self.generation_device)
+        if tokens_per_image is not None and tokens_per_image > 1:
+            from .utils import batch_repeat_image_tok
+            local_prompts_tensor, _ = batch_repeat_image_tok(local_prompts_tensor, tokens_per_image, None)
+            tokens_per_image = -1
+
         max_new_tokens = max(generate_config.max_seq_len - local_prompts_tensor.shape[1], 1)
         with torch.no_grad():
             out_ids = generate(
@@ -269,7 +310,6 @@ class ParallelGenerationService(GenerationServiceBase):
             model: torch.nn.Module,
             prompt_ids: torch.Tensor,
             generate_config: GenerateConfig,
-            task_type: str,
             pixel_values: Optional[torch.Tensor] = None,
             tokens_per_image: Optional[int] = -1
     ):
@@ -281,6 +321,11 @@ class ParallelGenerationService(GenerationServiceBase):
         empty_cache()
 
         local_prompts_tensor = prompt_ids.to(self.generation_device)
+        if tokens_per_image is not None and tokens_per_image > 1:
+            from .utils import batch_repeat_image_tok
+            local_prompts_tensor, _ = batch_repeat_image_tok(local_prompts_tensor, tokens_per_image, None)
+            tokens_per_image = -1
+
         if local_prompts_tensor.numel() == 0:
             return []
 
@@ -296,6 +341,11 @@ class ParallelGenerationService(GenerationServiceBase):
             chunk_prompts = local_prompts_tensor[chunk_start: chunk_start + actual_chunk_size]
             chunk_mask = attention_mask[chunk_start: chunk_start + actual_chunk_size]
 
+            if pixel_values is not None:
+                chunk_pixel_values = pixel_values[chunk_start: chunk_start + actual_chunk_size]
+            else:
+                chunk_pixel_values = None
+
             out_ids, _ = batch_generate(
                 model=self.gen_model,
                 tokens=chunk_prompts,
@@ -307,6 +357,8 @@ class ParallelGenerationService(GenerationServiceBase):
                 repetition_penalty=generate_config.repetition_penalty,
                 exclude_penalty_tokens=generate_config.exclude_penalty_tokens,
                 suppress_tokens=generate_config.suppress_tokens,
+                pixel_values=chunk_pixel_values,
+                tokens_per_image=tokens_per_image,
                 device=self.generation_device,
                 return_logits=False,
                 auto_prefix_cache=generate_config.auto_prefix_cache
@@ -328,11 +380,11 @@ class ParallelGenerationService(GenerationServiceBase):
     ) -> Dict[str, Any]:
         if task_type == 'eval':
             return {
-                'completions': self._eval(model, prompt_ids, generate_config, task_type, pixel_values, tokens_per_image)
+                'completions': self._eval(model, prompt_ids, generate_config, pixel_values, tokens_per_image)
             }
 
         return {
-            'completions': self._generate(model, prompt_ids, generate_config, task_type, pixel_values, tokens_per_image)
+            'completions': self._generate(model, prompt_ids, generate_config, pixel_values, tokens_per_image)
         }
 
 
@@ -398,8 +450,7 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
             ]
             if len(pos_params) == 1:
                 self._env_step_accepts_context = False
-        except Exception:
-            pass
+        except Exception: ...
 
     def _call_env_step(
             self,
@@ -419,6 +470,71 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
             return seq[first_valid_idx:]
         return torch.empty(0, dtype=torch.long, device=seq.device)
 
+    def _eval(
+            self,
+            model: torch.nn.Module,
+            prompt_ids: torch.Tensor,
+            generate_config: GenerateConfig,
+            pixel_values: Optional[torch.Tensor] = None,
+            tokens_per_image: Optional[int] = -1
+    ) -> Dict[str, Any]:
+        """
+        专用于 BaseTrainer._eval 阶段的纯文本生成，绝不触发 self.env_step 环境交互。
+        所有 Rank 同步参与，保证 ZeRO-3 集合通信严格对齐。
+        """
+        tokenizer = TrainerTools().tokenizer
+        device = TrainerTools().parallel.device
+        pad_token_id = tokenizer.pad
+        prompt_ids = prompt_ids.to(device)
+
+        if tokens_per_image is not None and tokens_per_image > 1:
+            from .utils import batch_repeat_image_tok
+            prompt_ids, _ = batch_repeat_image_tok(prompt_ids, tokens_per_image, None)
+            tokens_per_image = -1
+
+        attention_mask = (prompt_ids != pad_token_id).long()
+        if (attention_mask == 0).all():
+            attention_mask[:, -1] = 1
+
+        prompt_len = prompt_ids.shape[1]
+        max_new_tokens = max(generate_config.max_seq_len - prompt_len, 1)
+
+        with torch.no_grad(), unwrap_model_for_generation(model) as unwrapped_model:
+            gen_model = getattr(unwrapped_model, 'policy_model', unwrapped_model)
+            was_training = unwrapped_model.training
+            unwrapped_model.eval()
+            try:
+                out_ids, _ = batch_generate(
+                    model=gen_model,
+                    tokens=prompt_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=max_new_tokens,
+                    temperature=generate_config.temperature,
+                    top_p=generate_config.top_p,
+                    top_k=generate_config.top_k,
+                    repetition_penalty=generate_config.repetition_penalty,
+                    exclude_penalty_tokens=generate_config.exclude_penalty_tokens,
+                    suppress_tokens=generate_config.suppress_tokens,
+                    device=device,
+                    pixel_values=pixel_values,
+                    tokens_per_image=tokens_per_image,
+                    auto_prefix_cache=generate_config.auto_prefix_cache,
+                    return_logits=False
+                )
+            finally:
+                if was_training:
+                    unwrapped_model.train()
+
+        empty_cache()
+        completions = out_ids[:, prompt_len:].cpu().tolist()
+
+        return {
+            'completions': completions,
+            'dones': [True] * len(completions),
+            'generation_masks': [[True] * len(c) for c in completions],
+            'feedbacks': ["" for _ in completions]
+        }
+
     def __call__(
             self,
             model: torch.nn.Module,
@@ -428,6 +544,15 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
             pixel_values: Optional[torch.Tensor] = None,
             tokens_per_image: Optional[int] = -1
     ) -> Dict[str, Any]:
+
+        if task_type == 'eval':
+            return self._eval(
+                model=model,
+                prompt_ids=prompt_ids,
+                generate_config=generate_config,
+                pixel_values=pixel_values,
+                tokens_per_image=tokens_per_image
+            )
 
         tokenizer = TrainerTools().tokenizer
         device = TrainerTools().parallel.device
@@ -461,6 +586,8 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
 
         with torch.no_grad(), unwrap_model_for_generation(model) as unwrapped_model:
             gen_model = getattr(unwrapped_model, 'policy_model', unwrapped_model)
+            was_training = unwrapped_model.training
+            unwrapped_model.eval()
 
             for turn in range(self.max_turns):
                 for i in range(batch_size):
@@ -577,6 +704,7 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
                 empty_cache()
 
                 next_prompts_list = [None] * batch_size
+                batch_budget_exhausted = [False] * batch_size
                 tasks = []
 
                 if active_indices:
@@ -591,21 +719,16 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
                         new_tokens = outputs[local_idx, cur_prompt_len:]
                         valid_new_tokens = new_tokens[new_tokens != pad_token_id].tolist()
 
-                        # 严格限制本轮有效生成 token 数量不超过该样本的总完成预算
                         rem_budget = max(max_completion_budget - len(trajectories[global_idx]), 0)
-                        if len(valid_new_tokens) > rem_budget:
+                        if len(valid_new_tokens) >= rem_budget:
                             valid_new_tokens = valid_new_tokens[:rem_budget]
-                            loop_dones[global_idx] = True
+                            batch_budget_exhausted[global_idx] = True
 
                         generated_text = tokenizer.decode(valid_new_tokens)
-
                         history_tokens = list(trajectories[global_idx])
 
                         trajectories[global_idx].extend(valid_new_tokens)
                         generation_masks[global_idx].extend([True] * len(valid_new_tokens))
-
-                        if len(trajectories[global_idx]) >= max_completion_budget:
-                            loop_dones[global_idx] = True
 
                         tasks.append((global_idx, valid_new_tokens, initial_prompts[global_idx], history_tokens, generated_text))
 
@@ -667,8 +790,10 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
                     else:
                         consecutive_errors[idx] = 0
 
-                    if is_done or consecutive_errors[idx] >= self.max_consecutive_errors:
+                    if is_done:
                         terminals[idx] = True
+                        loop_dones[idx] = True
+                    elif batch_budget_exhausted[idx] or consecutive_errors[idx] >= self.max_consecutive_errors:
                         loop_dones[idx] = True
 
                     # 若样本已经结束交互（任务完成/连续异常/达到上限）或已是最后一轮，无需追加尾部 feedback 也无需构造下一轮 prompt
@@ -721,6 +846,9 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
                         reversed_prompts, batch_first=True, padding_value=pad_token_id
                     )
                     current_prompts = padded_reversed.flip(dims=(1,))
+
+            if was_training:
+                unwrapped_model.train()
 
         return {
             'completions': trajectories,

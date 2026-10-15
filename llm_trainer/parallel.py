@@ -93,9 +93,9 @@ class Parallel(ABC):
 
         return DataLoader(dataset=dataset, **data_loader_kwargs)
 
-    def on_epoch_start(self, epoch):
+    def on_epoch_start(self, epoch: int, file_idx: int = 0):
         if self._sampler:
-            self._sampler.set_epoch(epoch)
+            self._sampler.set_epoch(epoch * 10000 + file_idx)
 
     def on_epoch_end(self, epoch): ...
 
@@ -103,8 +103,7 @@ class Parallel(ABC):
         if self._use_parallel and dist.is_initialized():
             try:
                 dist.destroy_process_group()
-            except Exception:
-                pass
+            except Exception: ...
 
     @property
     def parallel_train(self) -> bool:

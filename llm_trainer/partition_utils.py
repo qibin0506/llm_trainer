@@ -90,7 +90,7 @@ def sync_model_state_dict(
 
     def _apply_mixup(p_from: torch.Tensor, p_to: torch.Tensor):
         copy_tensor = p_from.to(device=p_to.device, dtype=p_to.dtype)
-        if mixup_alpha == 1.0:
+        if mixup_alpha == 1.0 or not p_to.is_floating_point():
             p_to.copy_(copy_tensor)
         else:
             p_to.mul_(1.0 - mixup_alpha).add_(copy_tensor, alpha=mixup_alpha)
@@ -124,7 +124,11 @@ def sync_model_state_dict(
                     for pf, pt in zip(p_from_list, p_to_list):
                         _apply_mixup(pf, pt)
             elif not is_from_zero3 and is_to_zero3:
-                raise NotImplementedError('is_from_zero3=False and is_to_zero3=True is not implemented')
+                import deepspeed
+                with deepspeed.zero.GatheredParameters(p_to_list, modifier_rank=0):
+                    if TrainerTools().parallel.is_main_process:
+                        for pf, pt in zip(p_from_list, p_to_list):
+                            _apply_mixup(pf, pt)
             else:
                 for pf, pt in zip(p_from_list, p_to_list):
                     _apply_mixup(pf, pt)
@@ -158,8 +162,7 @@ def get_full_state_dict_on_rank0(
         import deepspeed
         if isinstance(model, deepspeed.DeepSpeedEngine):
             return _get_ds_full_state_dict_on_rank0(model, max_elements_per_chunk)
-    except (ImportError, ModuleNotFoundError):
-        pass
+    except (ImportError, ModuleNotFoundError): ...
 
     if TrainerTools().parallel.is_main_process:
         return {k: v.cpu().clone() for k, v in unwrap_model(model).state_dict().items()}
@@ -179,35 +182,25 @@ def unwrap_model(model) -> nn.Module:
 
 def maybe_gather_lm_head_ctx(*params: Optional[torch.nn.Parameter]):
     """
-    上下文管理器：当且仅当 DeepSpeed ZeRO-3 启用时，自动 AllGather 分片的 lm_head 权重/偏置。
-    非 ZeRO-3 环境下直接返回 nullcontext()，零额外开销。
+    上下文管理器：当且仅当 DeepSpeed ZeRO-3 启用且参数被分片时，自动 AllGather 分片的 lm_head 权重/偏置。
+    - 按 id(p) 去重，避免共享权重重复 gather；
+    - 已处于 AVAILABLE 状态的参数（如 tied embeddings 已被 embed_tokens 展开）不重复 gather，避免退出时误触发 re-partition。
     """
-    is_zero3 = False
-    try:
-        import deepspeed
-        if any(p is not None and hasattr(p, "ds_id") and deepspeed.zero.partition_parameters.is_zero_param(p) for p in params):
-            is_zero3 = True
-    except Exception:
-        pass
-
-    if not is_zero3:
-        return nullcontext()
-
     try:
         import deepspeed
         from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
-
-        to_gather = {
-            id(p): p for p in params
-            if p is not None and getattr(p, 'ds_status', None) != ZeroParamStatus.AVAILABLE
-        }
-
-        if not to_gather:
-            return nullcontext()
-
-        return deepspeed.zero.GatheredParameters(list(to_gather.values()))
-    except:
+    except ImportError:
         return nullcontext()
+
+    to_gather = {
+        id(p): p for p in params
+        if p is not None and hasattr(p, "ds_id") and getattr(p, "ds_status", None) != ZeroParamStatus.AVAILABLE
+    }
+
+    if not to_gather:
+        return nullcontext()
+
+    return deepspeed.zero.GatheredParameters(list(to_gather.values()))
 
 
 def _get_ds_full_state_dict_on_rank0(
@@ -230,14 +223,14 @@ def _get_ds_full_state_dict_on_rank0(
 
     if TrainerTools().parallel.is_main_process:
         for name, var in state_vars.items():
-            if not isinstance(var, torch.nn.Parameter):
+            if not (hasattr(var, 'ds_id') or isinstance(var, torch.nn.Parameter)):
                 state_dict[name] = var.cpu().clone()
 
     unique_params = []
     param_id_to_names = {}
 
     for name, var in state_vars.items():
-        if isinstance(var, torch.nn.Parameter):
+        if hasattr(var, 'ds_id') or isinstance(var, torch.nn.Parameter):
             pid = id(var)
             if pid not in param_id_to_names:
                 param_id_to_names[pid] = []
@@ -276,53 +269,59 @@ def _get_ds_full_state_dict_on_rank0(
 
 def _add_hooks(model: nn.Module) -> None:
     """Adds the optimizer hooks from a DeepSpeed ZeRO-3 model."""
-    import deepspeed
-    assert isinstance(model, deepspeed.DeepSpeedEngine)
-
-    if not hasattr(model, "optimizer") or model.optimizer is None:  # before the first training step, the model has no optimizer
+    optimizer_offload = _get_zero3_param_offload(model)
+    if optimizer_offload is None:
         return
-    if model.optimizer is not None and hasattr(model.optimizer, "parameter_offload"):
-        optimizer_offload = model.optimizer.parameter_offload
-    elif model.optimizer is not None:
-        optimizer_offload = model.optimizer
-    else:
-        raise RuntimeError("The model optimizer is None, which is not yet supported.")
 
+    import deepspeed
     if hasattr(optimizer_offload, "param_coordinator"):
         coordinator = optimizer_offload.param_coordinator
-        if not coordinator.is_invalid_trace():
+        if hasattr(coordinator, "is_invalid_trace") and not coordinator.is_invalid_trace():
             coordinator._invalidate_trace()
 
-    if version.parse(deepspeed.__version__) >= version.parse("0.16.4"):
+    if hasattr(optimizer_offload, "_register_deepspeed_module"):
         optimizer_offload._register_deepspeed_module(optimizer_offload.module)
-    else:
+    elif hasattr(optimizer_offload, "_register_hooks_recursively"):
         optimizer_offload._register_hooks_recursively(optimizer_offload.module)
 
 
 def _remove_hooks(model: nn.Module) -> None:
     """Removes the optimizer hooks from a DeepSpeed ZeRO-3 model."""
-    import deepspeed
-    assert isinstance(model, deepspeed.DeepSpeedEngine)
-
-    if not hasattr(model, "optimizer") or model.optimizer is None:  # before the first training step, the model has no optimizer
+    optimizer_offload = _get_zero3_param_offload(model)
+    if optimizer_offload is None:
         return
-    if model.optimizer is not None and hasattr(model.optimizer, "parameter_offload"):
-        optimizer_offload = model.optimizer.parameter_offload
-    elif model.optimizer is not None:
-        optimizer_offload = model.optimizer
-    else:
-        raise RuntimeError("The model optimizer is None, which is not yet supported.")
 
     for param in _iter_params(optimizer_offload.module, recurse=True):
-        param.ds_active_sub_modules.clear()
+        if hasattr(param, "ds_active_sub_modules"):
+            param.ds_active_sub_modules.clear()
 
-    for hook in optimizer_offload.forward_hooks:
+    for hook in getattr(optimizer_offload, "forward_hooks", []):
         hook.remove()
-    for hook in optimizer_offload.backward_hooks:
+    for hook in getattr(optimizer_offload, "backward_hooks", []):
         hook.remove()
 
     optimizer_offload.forward_hooks = []
     optimizer_offload.backward_hooks = []
+
+
+def _get_zero3_param_offload(model: nn.Module):
+    """
+    获取 DeepSpeed ZeRO-3 的参数协调器宿主对象 (兼容含 optimizer 的训练引擎与 optimizer=None 的 ref_model 引擎)。
+    """
+    import deepspeed
+    if not isinstance(model, deepspeed.DeepSpeedEngine) or model.zero_optimization_stage() != 3:
+        return None
+
+    optimizer = getattr(model, "optimizer", None)
+    if optimizer is not None:
+        if hasattr(optimizer, "parameter_offload"):
+            return optimizer.parameter_offload
+        return optimizer
+
+    if hasattr(model, "parameter_offload") and model.parameter_offload is not None:
+        return model.parameter_offload
+
+    return None
 
 
 def _iter_params(module, recurse=False):
@@ -336,140 +335,82 @@ def _get_all_parameters(sub_module, recurse=False):
 
 def _reset_zero3_state_machine(model: nn.Module) -> None:
     """
-    清洗并复位 DeepSpeed ZeRO-3 训练引擎的参数状态机与 Trace 队列：
-    1. 确保所有正向展开过的参数完全释放并重新分片 (回到 NOT_AVAILABLE 状态)；
-    2. 清理各参数残留的 ds_active_sub_modules 激活标记；
-    3. 强制作废无 Backward 期间录制的残缺 Trace，确保后续带梯度的训练 Forward 从头正确录制。
+    清洗并复位 DeepSpeed ZeRO-3 引擎（含 train_model 与 optimizer=None 的 ref_model）在 no_grad 前向后的参数状态机与 Trace：
+    1. 清理各参数残留的 ds_active_sub_modules 激活标记；
+    2. 确保非持久化分片参数安全释放归位为 NOT_AVAILABLE；
+    3. 强制作废残缺 Trace 队列 (进入 INVALID 状态，等待下一次 forward 自动重建)；
     """
     if not isinstance(TrainerTools().parallel, DsParallel):
         return
     try:
-        import deepspeed
-        if not isinstance(model, deepspeed.DeepSpeedEngine) or model.zero_optimization_stage() != 3:
+        optimizer_offload = _get_zero3_param_offload(model)
+        if optimizer_offload is None:
             return
 
-        optimizer = getattr(model, "optimizer", None)
-        if optimizer is None:
-            return
-
-        optimizer_offload = getattr(optimizer, "parameter_offload", optimizer)
-        # 1. 确保所有正向分片参数全部归位为 NOT_AVAILABLE
-        if hasattr(optimizer_offload, "partition_all_parameters"):
-            optimizer_offload.partition_all_parameters()
-
-        # 2. 清理所有子模块残留的激活标记，防止生命周期计数泄漏
+        # 1. 清理所有子模块残留的激活标记，防止生命周期计数泄漏阻碍参数释放
         for param in _iter_params(optimizer_offload.module, recurse=True):
             if hasattr(param, "ds_active_sub_modules"):
                 param.ds_active_sub_modules.clear()
 
-        # 3. 核心：强制作废残缺 Trace 队列
+        # 2. 释放非持久化的正向展开参数
+        if hasattr(optimizer_offload, "partition_all_parameters"):
+            optimizer_offload.partition_all_parameters()
+
+        # 3. 强制作废无 backward 的残缺 Trace 队列
         if hasattr(optimizer_offload, "param_coordinator"):
             coordinator = optimizer_offload.param_coordinator
             if hasattr(coordinator, "is_invalid_trace") and not coordinator.is_invalid_trace():
                 coordinator._invalidate_trace()
-    except Exception:
-        pass
+    except Exception as e:
+        from .log import Logger
+        Logger.std_log(f"WARN: _reset_zero3_state_machine encountered error: {e}")
 
 
 # 必选在maybe_gather_lm_head_ctx后面import
-from .loss import chunked_log_probs, ChunkedLMLoss
+from .loss import ChunkedLogProbFunction, ChunkedLMLoss
 
 
-def add_fused_lm_head(model: nn.Module, chunk_size: int):
+def add_fused_loss_head(model: nn.Module, chunk_size: int):
     """
     在模型被 DeepSpeed Engine 包装之前对 model.forward 进行 Monkey-Patch，
-    实现主干前向、分块 Loss 计算以及分块 LogProbs 计算的闭环封装。
-
-    1. 当 fused_lm_head=True 且 labels is not None 时 (SFT / Pretrain 模式)：
-      - 强制主干执行 return_logits=False (节约大量中间显存)；
-      - 在 model.forward 内部直接访问 self.lm_head 并通过 ChunkedLMLoss / ChunkedCrossEntropyFunction 计算损失；
-      - 返回包含 'loss' 和 'ce_loss' 的字典，使 DeepSpeed Engine 的输出 backward hooks
-        直接挂在 'loss' 根节点上，彻底解决孤儿参数和梯度累积尺度撕裂问题。
-    2. 当 fused_lm_head=True 且 completion_ids is not None 时 (PPO / GRPO 模式)：
-      - 强制主干执行 return_logits=False (彻底规避 [B, S, V] 巨额 Logits 物化)；
-      - 在 model.forward 内部直接访问 self.lm_head 并通过 ChunkedLogProbFunction 计算 Completion LogProbs；
-      - 返回包含 'log_probs' 的字典，Autograd 计算图直接闭环绑定到 lm_head.weight 与主干；
-    3. 当 fused_lm_head=False 时：
-      - 完全保留原模型 forward 行为（推理/评测/生成无缝兼容）。
+    实现主干前向与分块 Loss (ChunkedCrossEntropy / KD) 计算的闭环封装。
     """
     unwrapped = unwrap_model(model)
-    if getattr(unwrapped, "_has_fused_lm_head", False):
+    unwrapped._fused_loss_chunk_size = chunk_size
+    if getattr(unwrapped, "_has_fused_loss_head", False):
         return unwrapped
 
     original_forward = unwrapped.forward
+    chunked_loss_fn = ChunkedLMLoss(chunk_size=chunk_size)
 
     @functools.wraps(original_forward)
-    def _fused_forward(
+    def _fused_loss_forward(
         self,
         *args,
+        fused_loss: bool = False,
         fused_lm_head: bool = False,
         labels: Optional[torch.Tensor] = None,
-        completion_ids: Optional[torch.Tensor] = None,
-        completion_mask: Optional[torch.Tensor] = None,
         teacher_logits: Optional[torch.Tensor] = None,
         kd_coef: float = 0.0,
+        return_logits: bool = True,
+        output_hidden_states: bool = False,
         **kwargs
     ):
-        if not fused_lm_head or (labels is None and completion_ids is None):
+        use_fused = fused_loss or fused_lm_head
+        curr_chunk_size = getattr(self, "_fused_loss_chunk_size", chunk_size)
+        if not use_fused or labels is None:
             if labels is not None:
                 kwargs["labels"] = labels
-            if completion_ids is not None:
-                kwargs["completion_ids"] = completion_ids
-            if completion_mask is not None:
-                kwargs["completion_mask"] = completion_mask
-            return original_forward(*args, **kwargs)
+            return original_forward(*args, return_logits=return_logits, **kwargs)
 
         lm_head = getattr(self, "lm_head", None)
-        assert lm_head is not None, "Model must have lm_head for fused computation"
+        assert lm_head is not None, "Model must have lm_head for fused loss computation"
 
-        # 闭环分块计算：强制主干不生成全局大 logits，节约巨额显存
-        kwargs["return_logits"] = False
-        outputs = original_forward(*args, **kwargs)
+        outputs = original_forward(*args, return_logits=False, **kwargs)
         hidden_states = outputs["hidden_states"]
 
-        fused_outputs = dict(outputs)
-
-        # 模式 1: Fused Completion LogProbs (PPO / GRPO 模式)
-        if completion_ids is not None:
-            comp_len = completion_ids.size(1)
-            # 因果自回归：预测 completion_ids 的 hidden_states 是其前驱位置
-            hidden_comp = hidden_states[:, :-1, :][:, -comp_len:, :]
-
-            # Active Token Filtering: 过滤 Padding Token 冗余投影开销
-            targets = completion_ids.clone()
-            att_mask = kwargs.get("attention_mask", None)
-            if att_mask is None and len(args) > 1 and isinstance(args[1], torch.Tensor):
-                att_mask = args[1]
-
-            if completion_mask is not None:
-                targets = targets.masked_fill(~completion_mask.bool(), -100)
-            elif att_mask is not None and att_mask.dim() == 2 and att_mask.size(1) >= comp_len:
-                comp_att_mask = att_mask[:, -comp_len:].bool()
-                targets = targets.masked_fill(~comp_att_mask, -100)
-            else:
-                targets = targets.masked_fill(targets == TrainerTools().tokenizer.pad, -100)
-
-            log_probs = chunked_log_probs(
-                hidden_states=hidden_comp,
-                lm_head_weight=lm_head.weight,
-                targets=targets,
-                lm_head_bias=getattr(lm_head, "bias", None),
-                chunk_size=chunk_size,
-                ignore_index=-100
-            )
-            for k, v in list(fused_outputs.items()):
-                if isinstance(v, torch.Tensor) and k not in ("aux_loss",):
-                    fused_outputs[k] = v.detach()
-            fused_outputs["log_probs"] = log_probs
-            return fused_outputs
-
-        # 模式 2: Fused CE / KD Loss (SFT / Pretrain 模式)
-        criterion = getattr(self, "_chunked_lm_loss", None)
-        if criterion is None:
-            criterion = ChunkedLMLoss(chunk_size=chunk_size)
-            self._chunked_lm_loss = criterion
-
-        total_loss, ce_loss = criterion(
+        chunked_loss_fn.chunk_size = curr_chunk_size
+        total_loss, ce_loss = chunked_loss_fn(
             hidden_states=hidden_states,
             lm_head_weight=lm_head.weight,
             labels=labels,
@@ -478,15 +419,125 @@ def add_fused_lm_head(model: nn.Module, chunk_size: int):
             kd_coef=kd_coef,
         )
 
-        for k, v in list(fused_outputs.items()):
-            if isinstance(v, torch.Tensor) and k not in ("aux_loss",):
-                fused_outputs[k] = v.detach()
+        fused_outputs = dict(outputs)
+        if not output_hidden_states:
+            fused_outputs["hidden_states"] = None
         fused_outputs["loss"] = total_loss
         fused_outputs["ce_loss"] = ce_loss.detach() if isinstance(ce_loss, torch.Tensor) else ce_loss
         return fused_outputs
 
-    unwrapped.forward = types.MethodType(_fused_forward, unwrapped)
-    unwrapped._has_fused_lm_head = True
+    unwrapped.forward = types.MethodType(_fused_loss_forward, unwrapped)
+    unwrapped._has_fused_loss_head = True
+    return unwrapped
+
+
+def add_fused_log_prob_head(model: nn.Module, chunk_size: int):
+    """
+    在模型被 DeepSpeed Engine 包装之前对 model.forward 进行 Monkey-Patch，
+    实现主干前向与分块 LogProbs (ChunkedLogProbFunction) 计算的闭环封装。
+    - 无条件执行 masked_scatter，保证全 -100 微批次在反向传播中保持计算图连通，彻底消除 ZeRO-3 死锁；
+    - 优先使用 completion_mask 决定 completion 区域的 labels，防止 pad_token_id == eos_token_id 时首个 EOS 被 att_mask 误置为 -100。
+    """
+    unwrapped = unwrap_model(model)
+    unwrapped._fused_log_prob_chunk_size = chunk_size
+    if getattr(unwrapped, "_has_fused_log_prob_head", False):
+        return unwrapped
+
+    original_forward = unwrapped.forward
+
+    @functools.wraps(original_forward)
+    def _fused_log_prob_forward(
+        self,
+        *args,
+        fused_log_probs: bool = False,
+        fused_lm_head: bool = False,
+        labels: Optional[torch.Tensor] = None,
+        completion_ids: Optional[torch.Tensor] = None,
+        completion_mask: Optional[torch.Tensor] = None,
+        temperature: float = 1.0,
+        return_logits: bool = True,
+        output_hidden_states: bool = False,
+        **kwargs
+    ):
+        use_fused = fused_log_probs or fused_lm_head
+        curr_chunk_size = getattr(self, "_fused_log_prob_chunk_size", chunk_size)
+        if not use_fused or (labels is None and completion_ids is None):
+            if labels is not None:
+                kwargs["labels"] = labels
+            if completion_ids is not None:
+                kwargs["completion_ids"] = completion_ids
+            if completion_mask is not None:
+                kwargs["completion_mask"] = completion_mask
+            return original_forward(*args, return_logits=return_logits, **kwargs)
+
+        lm_head = getattr(self, "lm_head", None)
+        assert lm_head is not None, "Model must have lm_head for fused log_probs computation"
+
+        outputs = original_forward(*args, return_logits=False, **kwargs)
+        hidden_states = outputs["hidden_states"]
+
+        comp_len = completion_ids.size(1) if completion_ids is not None else None
+        if labels is None and completion_ids is not None:
+            inp_ids = kwargs.get("input_ids", None)
+            if inp_ids is None and len(args) > 0 and isinstance(args[0], torch.Tensor):
+                inp_ids = args[0]
+            if inp_ids is not None:
+                labels = inp_ids.clone()
+                labels[:, :-comp_len] = -100
+                if completion_mask is not None:
+                    # 当显式提供 completion_mask (如 loss_mask) 时，直接由 completion_mask 决定有效位置，
+                    # 避免 pad_token_id == eos_token_id 时首个 EOS token 被 att_mask == 0 提前抹为 -100
+                    labels[:, -comp_len:] = labels[:, -comp_len:].masked_fill(~completion_mask.bool(), -100)
+                else:
+                    att_mask = kwargs.get("attention_mask", None)
+                    if att_mask is None and len(args) > 1 and isinstance(args[1], torch.Tensor):
+                        att_mask = args[1]
+                    if att_mask is not None:
+                        labels[:, -comp_len:] = labels[:, -comp_len:].masked_fill(att_mask[:, -comp_len:] == 0, -100)
+            else:
+                raise ValueError("input_ids must be provided to compute completion log_probs")
+        elif labels is not None and completion_mask is not None and comp_len is not None:
+            labels = labels.clone()
+            labels[:, -comp_len:] = labels[:, -comp_len:].masked_fill(~completion_mask.bool(), -100)
+
+        assert labels is not None, "labels must be provided or derivable in fused log_probs mode"
+
+        # 直接切片后用 mask 索引（布尔索引自动返回连续张量，避免全量 [B, S-1, H] .contiguous() 显存拷贝）
+        hidden = hidden_states[:, :-1, :]
+        shift_labels = labels[:, 1:]
+
+        weight = lm_head.weight
+        bias = getattr(lm_head, "bias", None)
+        vocab_size = weight.ds_shape[0] if hasattr(weight, "ds_shape") else weight.size(0)
+        mask = (shift_labels != -100) & (shift_labels >= 0) & (shift_labels < vocab_size)
+
+        with maybe_gather_lm_head_ctx(weight, bias):
+            per_token_logps = ChunkedLogProbFunction.apply(
+                hidden[mask],
+                weight,
+                bias,
+                shift_labels[mask],
+                curr_chunk_size,
+                -100,
+                temperature
+            )
+
+        # 即使当前 rank 的 mask 全为 False (per_token_logps 形状为 [0])，也必须保持 full_log_probs 连接到
+        # ChunkedLogProbFunctionBackward，确保 backward 时所有 rank 同步进入 maybe_gather_lm_head_ctx，杜绝 NCCL 死锁
+        full_log_probs = per_token_logps.new_zeros(shift_labels.shape).masked_scatter(mask, per_token_logps)
+
+        fused_outputs = dict(outputs)
+        if not output_hidden_states:
+            fused_outputs["hidden_states"] = None
+        if comp_len is not None:
+            fused_outputs["log_probs"] = full_log_probs[:, -comp_len:]
+        else:
+            fused_outputs["log_probs"] = full_log_probs
+
+        return fused_outputs
+
+    unwrapped.forward = types.MethodType(_fused_log_prob_forward, unwrapped)
+    unwrapped._has_fused_log_prob_head = True
     return unwrapped
 
 

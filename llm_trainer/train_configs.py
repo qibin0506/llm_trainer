@@ -93,7 +93,7 @@ class DsZeROConfig:
     reduce_scatter: Optional[bool] = True
     reduce_bucket_size: Optional[Union[str, int]] = 5e8
     contiguous_gradients: Optional[bool] = True
-    ignore_unused_parameters: Optional[bool] = False
+    ignore_unused_parameters: Optional[bool] = True
     communication_data_type: Optional[str] = None  # "fp16" or "bf16"
 
 
@@ -377,6 +377,7 @@ class DPOConfig:
     loss_ipo: bool = False
     nll_loss_coef: Optional[float] = None
     simpo_gamma: float = 0.5
+    chunked_log_probs_size: Optional[int] = None
 
 
 @dataclass(kw_only=True)
@@ -441,7 +442,7 @@ class GRPOConfig:
         rollout_eval_batch_size (`Optional[int]`): 样本 Batch 维度（Backbone 主干前向）的分块批次大小，用于在 Rollout 评估阶段（计算旧策略及参考模型 Log Prob）分批前向模型主干，降低激活值显存峰值。若为 None 则默认一次性前向全部样本。
         loss_beta (`float`): KL 惩罚强度。在特定模式下(loss_importance_sampling_level=sequence) 可设为 0.0 改为隐式约束。
         loss_clip_eps (`float`): PPO 基础截断的下限 epsilon (token 级截断推荐 0.2，sequence 级截断如 GSPO 推荐 3e-4)。
-        loss_clip_eps_high (`Optional[float]`): 不对称裁剪中的上限 epsilon (若为 None 则对称裁剪)。
+        loss_clip_eps_high (`Optional[float]`): 不对称裁剪中的上限参数。在常规模式（如 grpo/dapo）下代表偏移量 epsilon_high（默认 0.28，即裁剪上界为 1 + 0.28）；在 loss_type='cispo' 下代表重要性采样比率的绝对上界 epsilon_max（ScaleRL 论文推荐值为 5.0）。
         loss_delta (`Optional[float]`): Advantage 权重的绝对上限阈值。
         loss_importance_sampling_level (`str`): 组相对优化的计算层级，支持 'token' 或 'sequence' 级截断。
         loss_type (`str`): GRPO 的 Loss 变体族，支持 'grpo', 'bnpo', 'dr_grpo', 'cispo', 'dapo', 'luspo', 'sapo', 'vespo' 等前沿算子。

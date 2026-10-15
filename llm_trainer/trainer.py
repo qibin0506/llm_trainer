@@ -8,7 +8,7 @@ from .utils import pretrain_collate_fn
 from .dataset import PretrainDataset
 from .train_configs import TrainConfig, GenerationService
 from .loss import LMLoss, KDLoss
-from .partition_utils import add_fused_lm_head
+from .partition_utils import add_fused_loss_head
 
 
 class Trainer(BaseTrainer):
@@ -48,7 +48,7 @@ class Trainer(BaseTrainer):
 
     def _check_add_fused_head(self, model):
         if self.chunked_cross_entropy_size is not None:
-            add_fused_lm_head(model, chunk_size=self.chunked_cross_entropy_size)
+            add_fused_loss_head(model, chunk_size=self.chunked_cross_entropy_size)
 
     def _convert_train_args(self) -> Tuple[dict, dict, dict]:
         parallel_kwargs, data_loader_kwargs, sampler_kwargs = super()._convert_train_args()
@@ -77,20 +77,27 @@ class Trainer(BaseTrainer):
             return teacher_logits, kd_config.kd_coef
         return None, 0.0
 
-    def _calc_loss(self, inputs, attention_mask, result, labels, model: Optional[torch.nn.Module] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def _calc_loss(
+            self,
+            inputs,
+            attention_mask,
+            result,
+            labels,
+            model: Optional[torch.nn.Module] = None,
+            teacher_logits: Optional[torch.Tensor] = None,
+            kd_coef: float = 0.0
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if isinstance(result, dict) and "loss" in result:
             return result["loss"], result.get("ce_loss", result["loss"])
 
-        kd_config = self.pretrain_config.kd_config
-        has_kd = (kd_config is not None and kd_config.kd_coef > 0.0)
-
         ce_loss = self.criterion(result['logits'], labels)
-        if not has_kd:
+
+        if teacher_logits is None and self.pretrain_config.kd_config is not None and self.pretrain_config.kd_config.kd_coef > 0.0:
+            teacher_logits, kd_coef = self._get_teacher_logits_and_kd_coef(inputs, attention_mask)
+
+        if teacher_logits is None or kd_coef <= 0.0:
             return ce_loss, ce_loss
 
-        with torch.no_grad():
-            teacher_logits = kd_config.teacher_logits_provider(inputs, attention_mask)
-
         kd_loss = self.kd_loss(result['logits'], teacher_logits, labels)
-        total_loss = (1.0 - kd_config.kd_coef) * ce_loss + kd_config.kd_coef * kd_loss
+        total_loss = (1.0 - kd_coef) * ce_loss + kd_coef * kd_loss
         return total_loss, ce_loss

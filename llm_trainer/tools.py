@@ -140,49 +140,51 @@ def compute_lr_scheduler_steps(
     world_size = TrainerTools().parallel.world_size
     batch_per_step_all_gpus = batch_size * world_size
 
-    # 支持从 kwargs 中显式传入各文件样本量列表
     data_sizes_per_file = kwargs.get('data_sizes_per_file', None)
     if data_sizes_per_file is not None and isinstance(data_sizes_per_file, (list, tuple)):
         all_data_size = data_sizes_per_file
 
-    # 基础 dataloader 的总 batch 数量（每个 GPU 上的 batch 数）
-    # 当数据集拆分为多个文件时，每个文件独立构建 DataLoader 并执行 drop_last=True 截断
     if isinstance(all_data_size, (list, tuple)):
-        batches_per_gpu_per_epoch = sum(
-            size // batch_per_step_all_gpus for size in all_data_size
-        )
-        dataloader_batches_per_gpu = epochs * batches_per_gpu_per_epoch
+        file_sizes = list(all_data_size)
     else:
-        dataloader_batches_per_gpu = epochs * (all_data_size // batch_per_step_all_gpus)
+        file_sizes = [all_data_size]
+
+    batches_per_file = [size // batch_per_step_all_gpus for size in file_sizes]
 
     if train_stage in ['pretrain', 'midtrain', 'sft', 'dpo']:
-        # DPO 和常规的 SFT/Pretrain 更新逻辑一致：直接在 dataloader batch 级别上做梯度累积
-        train_batch_per_world = dataloader_batches_per_gpu / gradient_accumulation_steps
+        steps_per_epoch = sum(
+            math.ceil(batches / gradient_accumulation_steps)
+            for batches in batches_per_file
+        )
+        train_batch_per_world = epochs * steps_per_epoch
     elif train_stage == 'ppo':
-        # PPO 算法特性：
-        # - 数据加载：每次 dataloader 给出 batch_size 条数据进行 1 次 Rollout。
-        # - 训练拆分：对 Rollout 数据训练 ppo_epochs 次，每次按 ppo_batch_size 拆分成 micro_batch 进行 forward+backward。
-        # - 梯度累积：每 gradient_accumulation_steps 个 micro_batch 执行一次 step()。
         ppo_epochs = kwargs.get('ppo_epochs', 1)
         ppo_batch_size = kwargs.get('ppo_batch_size', 1)
 
-        updates_per_dataloader_batch = (ppo_epochs * batch_size / ppo_batch_size) / gradient_accumulation_steps
+        micro_batches_per_ppo_epoch = math.ceil(batch_size / ppo_batch_size)
+        updates_per_ppo_epoch = math.ceil(micro_batches_per_ppo_epoch / gradient_accumulation_steps)
+        updates_per_dataloader_batch = ppo_epochs * updates_per_ppo_epoch
+
+        dataloader_batches_per_gpu = epochs * sum(batches_per_file)
         train_batch_per_world = dataloader_batches_per_gpu * updates_per_dataloader_batch
     elif train_stage == 'grpo':
-        # GRPO 算法特性：
-        # - 数据加载：每次 dataloader 给出 batch_size 个 prompt，内部生成 batch_size * group_size 条数据。
-        # - 训练拆分：对这批扩增后的数据训练 grpo_epochs 次，按 grpo_batch_size 拆分为 micro_batch。
-        # - 梯度累积：每 gradient_accumulation_steps 个 micro_batch 执行一次 step()。
         grpo_epochs = kwargs.get('grpo_epochs', 1)
         group_size = kwargs.get('group_size', 1)
         grpo_batch_size = kwargs.get('grpo_batch_size', 1)
 
-        updates_per_dataloader_batch = (grpo_epochs * batch_size * group_size / grpo_batch_size) / gradient_accumulation_steps
+        micro_batches_per_grpo_epoch = math.ceil((batch_size * group_size) / grpo_batch_size)
+        updates_per_grpo_epoch = math.ceil(micro_batches_per_grpo_epoch / gradient_accumulation_steps)
+        updates_per_dataloader_batch = grpo_epochs * updates_per_grpo_epoch
+
+        dataloader_batches_per_gpu = epochs * sum(batches_per_file)
         train_batch_per_world = dataloader_batches_per_gpu * updates_per_dataloader_batch
     else:
-        train_batch_per_world = dataloader_batches_per_gpu / gradient_accumulation_steps
+        steps_per_epoch = sum(
+            math.ceil(batches / gradient_accumulation_steps)
+            for batches in batches_per_file
+        )
+        train_batch_per_world = epochs * steps_per_epoch
 
-    # 由于最后一个 step (is_last_step) 会强制更新未满足完整 gas 的余数 batch，因此总步数向上取整与实际执行步数对齐
     train_batch_per_world = math.ceil(train_batch_per_world)
     warmup_iters = int(warmup_rate * train_batch_per_world)
 

@@ -50,8 +50,7 @@ def save_ds_checkpoint(
             oldest_ckpt = sorted(ckpt_paths, key=os.path.getmtime)[0]
             try:
                 shutil.rmtree(oldest_ckpt)
-            except OSError:
-                pass
+            except OSError: ...
 
     TrainerTools().parallel.wait('remove old ds checkpoint')
 

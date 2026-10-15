@@ -20,7 +20,13 @@ from .generate_utils import generate
 from .log import Logger, _get_log_dir
 from .train_configs import TrainConfig, GenerationService
 from .scheduler import LRScheduler, WarmupCosineAnnealingLRScheduler, NoneLRScheduler
-from .checkpoint import load_checkpoint, save_checkpoint, load_steps, save_steps
+from .checkpoint import (
+    load_checkpoint,
+    save_checkpoint,
+    load_steps,
+    save_steps,
+    restore_rng_state_dict
+)
 from .utils import (
     default_seed,
     set_seed,
@@ -76,6 +82,8 @@ class BaseTrainer:
         self.resume_epoch = 0
         self.resume_file_idx = 0
         self.resume_batch_idx = 0
+        self.resume_rng_state: Optional[dict] = None
+        self.resume_dataloader_rng_state: Optional[torch.Tensor] = None
 
         self.logger = Logger('log.txt')
 
@@ -90,10 +98,10 @@ class BaseTrainer:
         self.train_model, self.optimizer = self._init_train_model_and_optim(initial_lr)
         self.lr_scheduler = self._init_lr_scheduler(initial_lr, self.optimizer)
 
+        set_seed(default_seed + TrainerTools().parallel.global_rank)
+
         self._load_train_model_checkpoint()
         self._apply_restore_ckpt()
-
-        set_seed(default_seed + TrainerTools().parallel.global_rank)
 
         if TrainerTools().parallel.is_main_process:
             Logger.std_log(f'parallel_kwargs={self.parallel_kwargs}')
@@ -299,13 +307,28 @@ class BaseTrainer:
 
         group_data = self._build_optimizer_param_groups(model, optim_config, name_prefix="base")
         if group_data["type"] == "muon":
+            all_raw_groups = group_data["muon_groups"] + group_data["adamw_groups"]
+        else:
+            all_raw_groups = group_data["groups"]
+
+        # 记录每个参数及原始参数组对应的 max_lr，防止 DeepSpeed 包装 optimizer 时抹除自定义 'max_lr' 字段
+        self._param_id_to_max_lr = {}
+        self._orig_group_max_lrs = []
+        for g in all_raw_groups:
+            g_max_lr = g.get("max_lr")
+            if g_max_lr is None:
+                g_max_lr = optim_config.max_lr if optim_config.max_lr is not None else g.get("lr", initial_lr)
+            self._orig_group_max_lrs.append(g_max_lr)
+            for p in g.get("params", []):
+                self._param_id_to_max_lr[id(p)] = g_max_lr
+
+        if group_data["type"] == "muon":
             muon_wd = optim_config.muon_weight_decay
             if muon_wd is None:
                 muon_wd = optim_config.weight_decay if optim_config.weight_decay is not None else 0.01
 
-            if isinstance(TrainerTools().parallel, DsParallel):
-                all_groups = group_data["muon_groups"] + group_data["adamw_groups"]
-                ds_muon = _get_ds_muon(all_groups)
+            if self.is_ds:
+                ds_muon = _get_ds_muon(all_raw_groups)
 
                 if ds_muon is None:
                     raise RuntimeError('Current DeepSpeed version does not support Muon optimizer.')
@@ -328,15 +351,17 @@ class BaseTrainer:
             return optim_cls(
                 group_data["groups"],
                 lr=initial_lr,
-                betas=optim_config.betas if optim_config.betas is not None else ((0.95, 0.98) if optim_config.optim_type == 'lion' else (0.9, 0.999)),
-                weight_decay=optim_config.weight_decay if optim_config.weight_decay is not None else (0.015 if optim_config.optim_type == 'lion' else 0.01)
+                betas=optim_config.betas if optim_config.betas is not None else (
+                    (0.95, 0.98) if optim_config.optim_type == 'lion' else (0.9, 0.999)),
+                weight_decay=optim_config.weight_decay if optim_config.weight_decay is not None else (
+                    0.015 if optim_config.optim_type == 'lion' else 0.01)
             )
 
     def _get_optim_cls(self):
         optimizer = None
 
         if (self.train_config.optim_config.auto_optimize_optimizer
-                and isinstance(TrainerTools().parallel, DsParallel)
+                and self.is_ds
                 and self.parallel_kwargs
         ):
             import deepspeed
@@ -396,7 +421,12 @@ class BaseTrainer:
             if optim_config.betas is not None:
                 g["betas"] = optim_config.betas
             else:
-                g["betas"] = (0.95, 0.98) if optim_type == 'lion' else (0.9, 0.999)
+                if optim_type == 'lion':
+                    g["betas"] = (0.95, 0.98)
+                elif optim_type == 'muon':
+                    g["betas"] = (0.9, 0.95)
+                else:
+                    g["betas"] = (0.9, 0.999)
             return g
 
         if optim_type != 'muon':
@@ -455,11 +485,41 @@ class BaseTrainer:
 
     def _init_lr_scheduler(self, initial_lr: float, optimizer) -> LRScheduler:
         if self.train_config.optim_config.enable_lr_scheduler:
-            warmup_iters = self.train_config.optim_config.warmup_iters
-            min_lr = self.train_config.optim_config.min_lr
-            max_lr = self.train_config.optim_config.max_lr
-            cosine_annealing_period = self.train_config.optim_config.cosine_annealing_period
-            cosine_annealing_period_mul = self.train_config.optim_config.cosine_annealing_period_mul
+            optim_config = self.train_config.optim_config
+            warmup_iters = optim_config.warmup_iters
+            min_lr = optim_config.min_lr
+            max_lr = optim_config.max_lr
+            cosine_annealing_period = optim_config.cosine_annealing_period
+            cosine_annealing_period_mul = optim_config.cosine_annealing_period_mul
+
+            # 兼容 DeepSpeed 包装层级，恢复被 DeepSpeed 重建 param_groups 时可能剔除的 'max_lr'
+            param_groups = getattr(optimizer, 'param_groups', None)
+            if param_groups is None and hasattr(optimizer, 'optimizer'):
+                param_groups = getattr(optimizer.optimizer, 'param_groups', None)
+
+            if param_groups:
+                param_id_to_max_lr = getattr(self, '_param_id_to_max_lr', {})
+                orig_group_max_lrs = getattr(self, '_orig_group_max_lrs', [])
+                muon_lr = optim_config.muon_lr if optim_config.muon_lr is not None else 0.02
+                default_max_lr = max_lr if max_lr is not None else initial_lr
+
+                for idx, g in enumerate(param_groups):
+                    if g.get('max_lr') is not None:
+                        continue
+                    # 1. 优先通过 use_muon 标记或参数属性判定
+                    params = g.get('params', [])
+                    if g.get('use_muon', False) or any(getattr(p, 'use_muon', False) for p in params):
+                        g['max_lr'] = muon_lr
+                        continue
+                    # 2. 通过参数内存 ID 映射恢复
+                    matched_lrs = [param_id_to_max_lr[id(p)] for p in params if id(p) in param_id_to_max_lr]
+                    if matched_lrs:
+                        g['max_lr'] = matched_lrs[0]
+                    # 3. 若组数未变，按初始参数组顺序恢复
+                    elif idx < len(orig_group_max_lrs) and len(param_groups) == len(orig_group_max_lrs):
+                        g['max_lr'] = orig_group_max_lrs[idx]
+                    else:
+                        g['max_lr'] = default_max_lr
 
             return WarmupCosineAnnealingLRScheduler(
                 optimizer=optimizer,
@@ -487,17 +547,21 @@ class BaseTrainer:
             self.resume_epoch = steps_dict.get('epoch', 0)
             self.resume_file_idx = steps_dict.get('file_idx', 0)
             self.resume_batch_idx = steps_dict.get('batch_idx', 0)
+            self.resume_rng_state = steps_dict.get('rng_state', None)
+            self.resume_dataloader_rng_state = steps_dict.get('dataloader_rng_state', None)
 
             self.lr_scheduler.restore_ckpt_dict(steps_dict)
+            restore_rng_state_dict(self.resume_rng_state)
 
             if TrainerTools().parallel.is_main_process:
-                Logger.std_log(f'restore steps_dict={steps_dict}')
+                log_dict = {k: v for k, v in steps_dict.items() if k not in ('rng_state', 'dataloader_rng_state')}
+                Logger.std_log(f'restore steps_dict={log_dict}')
 
     def _convert_train_args(self) -> Tuple[dict, dict, dict]:
         parallel_kwargs: Optional[Dict[str, Any]] = None
         ds_config = self.train_config.ds_config
 
-        if isinstance(TrainerTools().parallel, DsParallel) and ds_config:
+        if self.is_ds and ds_config:
             parallel_kwargs = _build_deepspeed_kwargs(
                 ds_config,
                 self.gradient_accumulation_steps,
@@ -516,7 +580,7 @@ class BaseTrainer:
     def _init_ref_model_args(self, model_config: Optional[ModelConfig] = None) -> dict:
         parallel_kwargs = copy.deepcopy(self.parallel_kwargs) if self.parallel_kwargs else None
 
-        if parallel_kwargs and isinstance(TrainerTools().parallel, DsParallel):
+        if parallel_kwargs and self.is_ds:
             stage = parallel_kwargs.get("zero_optimization", {}).get("stage", 0)
             if stage == 3:
                 zero_optimization = parallel_kwargs.get("zero_optimization", {})
@@ -539,7 +603,16 @@ class BaseTrainer:
 
     def _create_dataset(self, file_idx) -> Tuple[Dataset, str]: ...
 
-    def _calc_loss(self, inputs, attention_mask, result, labels, model: Optional[torch.nn.Module] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]: ...
+    def _calc_loss(
+            self,
+            inputs: torch.Tensor,
+            attention_mask: Optional[torch.Tensor],
+            result: dict,
+            labels: torch.Tensor,
+            model: Optional[torch.nn.Module] = None,
+            teacher_logits: Optional[torch.Tensor] = None,
+            kd_coef: float = 0.0
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]: ...
 
     def _get_teacher_logits_and_kd_coef(
             self, inputs: torch.Tensor, attention_mask: Optional[torch.Tensor]
@@ -561,9 +634,10 @@ class BaseTrainer:
                 attention_mask=attention_mask,
                 pixel_values=pixel_values,
                 labels=labels,
-                fused_lm_head=True,
+                fused_loss=True,
                 teacher_logits=teacher_logits,
                 kd_coef=kd_coef,
+                return_logits=False
             )
             loss = result["loss"]
             ce_loss = result.get("ce_loss", loss)
@@ -574,7 +648,17 @@ class BaseTrainer:
                 pixel_values=pixel_values,
                 return_logits=self.return_logits
             )
-            loss, ce_loss = self._calc_loss(inputs, attention_mask, result, labels, model=model)
+            loss, ce_loss = self._calc_loss(
+                inputs,
+                attention_mask,
+                result,
+                labels,
+                model=model,
+                teacher_logits=teacher_logits,
+                kd_coef=kd_coef
+            )
+
+        del teacher_logits
 
         if result.get('aux_loss') is not None:
             aux_loss = result['aux_loss'].to(loss.dtype)
@@ -585,7 +669,7 @@ class BaseTrainer:
         return total_loss_unscaled, ce_loss, aux_loss
 
     def _backward_loss(self, total_loss_unscaled, gradient_accumulation_steps, step = True):
-        if isinstance(TrainerTools().parallel, DsParallel):
+        if self.is_ds:
             self.train_model.backward(total_loss_unscaled)
             if step:
                 self.train_model.step()
@@ -596,7 +680,7 @@ class BaseTrainer:
     def _apply_grad_clipping(self):
         clip_norm = self.train_config.gradient_clipping
         if clip_norm is not None and clip_norm > 0:
-            if not isinstance(TrainerTools().parallel, DsParallel) and self.lr_scheduler.can_clip_grad():
+            if self.is_ds:
                 self.scaler.unscale_(self.optimizer)
 
                 if hasattr(self.train_model, 'policy_model') and hasattr(self.train_model, 'value_model'):
@@ -613,7 +697,7 @@ class BaseTrainer:
                         torch.nn.utils.clip_grad_norm_(trainable_params, clip_norm)
 
     def _apply_step(self):
-        if not isinstance(TrainerTools().parallel, DsParallel):
+        if not self.is_ds:
             self.scaler.step(self.optimizer)
             self.scaler.update()
             self.optimizer.zero_grad(set_to_none=True)
@@ -708,8 +792,7 @@ class BaseTrainer:
         if dist.is_available() and dist.is_initialized():
             try:
                 dist.destroy_process_group()
-            except Exception:
-                pass
+            except Exception: ...
 
         raise e
 
@@ -836,7 +919,7 @@ class BaseTrainer:
                 )
 
                 batch_count_per_file = len(train_data_loader)
-                TrainerTools().parallel.on_epoch_start(epoch)
+                TrainerTools().parallel.on_epoch_start(epoch, file_idx)
                 self._on_file_start(epoch, file_path)
 
                 skip_batches = 0
@@ -845,12 +928,21 @@ class BaseTrainer:
                     if skip_batches > 0 and TrainerTools().parallel.is_main_process:
                         Logger.std_log(f"Fast forwarding {skip_batches} batches in {file_path}...")
 
+                if skip_batches > 0 and self.resume_dataloader_rng_state is not None:
+                    torch.set_rng_state(self.resume_dataloader_rng_state.cpu().to(torch.uint8))
+                    self.resume_dataloader_rng_state = None
+
+                dataloader_rng_state = torch.get_rng_state()
                 data_iterator = iter(train_data_loader)
 
                 if skip_batches > 0:
                     data_iterator = islice(data_iterator, skip_batches, None)
 
                 for batch, batch_data in enumerate(data_iterator):
+                    if self.resume_rng_state is not None:
+                        restore_rng_state_dict(self.resume_rng_state)
+                        self.resume_rng_state = None
+
                     batch = skip_batches + batch
 
                     inputs = batch_data['inputs']
@@ -870,14 +962,21 @@ class BaseTrainer:
                                 labels
                             )
 
-                        # 每个 epoch 的最后一个 batch 作为累积边界强制提交梯度，防止跨 epoch 泄漏
-                        is_last_step = (
-                            file_idx == file_count - 1
-                            and batch == batch_count_per_file - 1
-                        )
+                        window_start = (batch // self.gradient_accumulation_steps) * self.gradient_accumulation_steps
+                        actual_accum_steps = min(self.gradient_accumulation_steps, batch_count_per_file - window_start)
+
+                        # 每个文件的最后一个 batch 作为累积边界强制提交梯度，确保每个文件起点 batches_accumulated 恒为 0，
+                        is_last_step = (batch == batch_count_per_file - 1)
 
                         need_update_step = self._need_update_step(batches_accumulated, is_last_step)
-                        self._backward_loss(total_loss_unscaled, self.gradient_accumulation_steps)
+                        if self.is_ds:
+                            if actual_accum_steps < self.gradient_accumulation_steps:
+                                scale_factor = self.gradient_accumulation_steps / actual_accum_steps
+                                self._backward_loss(total_loss_unscaled * scale_factor, actual_accum_steps)
+                            else:
+                                self._backward_loss(total_loss_unscaled, self.gradient_accumulation_steps)
+                        else:
+                            self._backward_loss(total_loss_unscaled, actual_accum_steps)
 
                         loss_accumulation += total_loss_unscaled.detach().item()
                         aux_loss_accumulation += aux_loss.detach().item()
@@ -928,7 +1027,8 @@ class BaseTrainer:
                                     epoch=epoch,
                                     file_idx=file_idx,
                                     batch_idx=batch + 1,
-                                    lr_scheduler=self.lr_scheduler
+                                    lr_scheduler=self.lr_scheduler,
+                                    dataloader_rng_state=dataloader_rng_state
                                 )
                                 global_steps_since_last_save = 0
 
@@ -938,11 +1038,16 @@ class BaseTrainer:
                     except Exception as e:
                         self._on_exception(e, epoch, batch)
 
+                if self.resume_rng_state is not None:
+                    restore_rng_state_dict(self.resume_rng_state)
+                    self.resume_rng_state = None
+
                 try:
                     # 一个文件训练结束后，清理内存
                     del train_data_loader
                     del dataset
                     del data_iterator
+                    del dataloader_rng_state
                     del batch_data
                     del inputs
                     del labels
@@ -951,8 +1056,7 @@ class BaseTrainer:
                     del ce_loss
                     del aux_loss
                     del pixel_values
-                except (NameError, UnboundLocalError):
-                    pass
+                except (NameError, UnboundLocalError): ...
 
                 if hasattr(TrainerTools().parallel, '_sampler'):
                     TrainerTools().parallel._sampler = None
@@ -961,13 +1065,6 @@ class BaseTrainer:
                 empty_cache()
 
             # end epoch
-            if batches_accumulated > 0:
-                self._update_step(is_last_step=True)
-                batches_accumulated = 0
-                loss_accumulation = 0.0
-                aux_loss_accumulation = 0.0
-                ce_loss_accumulation = 0.0
-
             # reset resume state
             self.resume_file_idx = 0
             self.resume_batch_idx = 0

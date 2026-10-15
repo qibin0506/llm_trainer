@@ -163,43 +163,56 @@ class MuonWithAdamW(torch.optim.Optimizer):
             momentum=muon_momentum,
             ns_steps=muon_ns_steps,
             adjust_lr_fn=muon_adjust_lr_fn
-        )
+        ) if muon_params else None
+
         self.adamw_optim = adamw_cls(
             adamw_params,
             lr=adamw_lr,
             betas=adamw_betas,
             weight_decay=adamw_weight_decay
-        )
+        ) if adamw_params else None
 
-        param_groups = self.muon_optim.param_groups + self.adamw_optim.param_groups
-        defaults = {**self.muon_optim.defaults, **self.adamw_optim.defaults}
+        param_groups = (
+            (self.muon_optim.param_groups if self.muon_optim else []) +
+            (self.adamw_optim.param_groups if self.adamw_optim else [])
+        )
+        defaults = {
+            **(self.muon_optim.defaults if self.muon_optim else {}),
+            **(self.adamw_optim.defaults if self.adamw_optim else {})
+        }
         super().__init__(param_groups, defaults)
 
-        self.muon_optim.state = self.state
-        self.adamw_optim.state = self.state
+        if self.muon_optim:
+            self.muon_optim.state = self.state
+        if self.adamw_optim:
+            self.adamw_optim.state = self.state
 
     def step(self, closure=None):
         loss = None
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
-        self.muon_optim.step()
-        self.adamw_optim.step()
+        if self.muon_optim:
+            self.muon_optim.step()
+        if self.adamw_optim:
+            self.adamw_optim.step()
         return loss
 
     def zero_grad(self, set_to_none: bool = True):
-        self.muon_optim.zero_grad(set_to_none=set_to_none)
-        self.adamw_optim.zero_grad(set_to_none=set_to_none)
+        if self.muon_optim:
+            self.muon_optim.zero_grad(set_to_none=set_to_none)
+        if self.adamw_optim:
+            self.adamw_optim.zero_grad(set_to_none=set_to_none)
 
     def load_state_dict(self, state_dict: dict):
         super().load_state_dict(state_dict)
-
-        self.muon_optim.state = self.state
-        self.adamw_optim.state = self.state
-
-        num_muon_groups = len(self.muon_optim.param_groups)
-        self.muon_optim.param_groups = self.param_groups[:num_muon_groups]
-        self.adamw_optim.param_groups = self.param_groups[num_muon_groups:]
+        num_muon_groups = len(self.muon_optim.param_groups) if self.muon_optim else 0
+        if self.muon_optim:
+            self.muon_optim.state = self.state
+            self.muon_optim.param_groups = self.param_groups[:num_muon_groups]
+        if self.adamw_optim:
+            self.adamw_optim.state = self.state
+            self.adamw_optim.param_groups = self.param_groups[num_muon_groups:]
 
 
 def _get_ds_muon(params):

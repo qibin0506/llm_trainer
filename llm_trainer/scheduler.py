@@ -19,9 +19,6 @@ class LRScheduler(ABC):
     def step(self): ...
 
     @abstractmethod
-    def can_clip_grad(self): ...
-
-    @abstractmethod
     def get_ckpt_dict(self) -> dict: ...
 
     @abstractmethod
@@ -45,9 +42,16 @@ class WarmupCosineAnnealingLRScheduler(LRScheduler):
         super().__init__()
 
         self._optimizer = optimizer
-        self._initial_lr = initial_lr
         self._min_lr = min_lr if min_lr is not None else 0.0
-        self._max_lr = max_lr if max_lr is not None else initial_lr
+        self._warmup_iters = warmup_iters if warmup_iters is not None else 0
+
+        if max_lr is None:
+            self._max_lr = initial_lr
+            self._initial_lr = self._min_lr if self._warmup_iters > 0 else initial_lr
+        else:
+            self._max_lr = max_lr
+            self._initial_lr = initial_lr
+
         self._cosine_annealing_period = cosine_annealing_period
         self._cosine_annealing_period_mul = cosine_annealing_period_mul
         self.param_group_indices = param_group_indices
@@ -56,19 +60,22 @@ class WarmupCosineAnnealingLRScheduler(LRScheduler):
         for g in self._optimizer.param_groups:
             g_max = g.get('max_lr')
             if g_max is None:
-                g_max = self._max_lr
+                params = g.get('params', [])
+                if g.get('use_muon', False) or any(getattr(p, 'use_muon', False) for p in params):
+                    g_max = g.get('lr', self._max_lr)
+                else:
+                    g_max = self._max_lr
             self._group_max_lrs.append(g_max)
 
-        self.T_cur = 0  # 当前周期内已走过的步数
-        self.cycle = 0  # 当前周期编号
+        self.T_cur = 0
+        self.cycle = 0
 
-        self._warmup_iters = warmup_iters if warmup_iters is not None else 0
-        if self._warmup_iters != 0:
+        if self._warmup_iters > 0:
             self._lr_increment = (self._max_lr - self._initial_lr) / self._warmup_iters
         else:
-            self._lr_increment = 0
+            self._lr_increment = 0.0
 
-        self._steps = -1
+        self._steps = 0
         self._current_lr = self._initial_lr
         self._cosine_annealing_base_lr = None
 
@@ -76,6 +83,8 @@ class WarmupCosineAnnealingLRScheduler(LRScheduler):
             self.logger = Logger('lr.txt')
         else:
             self.logger = None
+
+        self._apply_lr(self._initial_lr)
 
     @property
     def cur_steps(self):
@@ -88,9 +97,6 @@ class WarmupCosineAnnealingLRScheduler(LRScheduler):
     def step(self):
         self._steps += 1
         self._update_lr()
-
-    def can_clip_grad(self):
-        return self._steps > self._warmup_iters
 
     def _apply_lr(self, lr: float):
         self._current_lr = lr
@@ -110,19 +116,21 @@ class WarmupCosineAnnealingLRScheduler(LRScheduler):
             self.logger.log(f"step: {self.cur_steps}, lr: {lr}", log_to_console=False)
 
     def _update_lr(self):
-        # 如果period_mul是0，则认为没有周期，超过余弦退火总步数，则一直保持最小lr
-        if self._cosine_annealing_period_mul == 0 and self._steps >= self._cosine_annealing_period + self._warmup_iters:
-            lr = self._min_lr
-        elif self._steps <= self._warmup_iters:
-            # Warmup: adjust learning rate linearly
-            # (max_lr - initial_lr) / warmup_iters
+        # 1. Warmup 阶段优先判断
+        if self._steps <= self._warmup_iters:
             lr = self._initial_lr + self._steps * self._lr_increment
-        # 3. Cosine 退火阶段
+        # 2. 未配置余弦退火周期或周期 <= 0 时保持 max_lr
+        elif not self._cosine_annealing_period or self._cosine_annealing_period <= 0:
+            lr = self._max_lr
+        # 3. 超出最大退火步数且无后续周期时保持 min_lr
+        elif self._cosine_annealing_period_mul == 0 and self._steps >= self._cosine_annealing_period + self._warmup_iters:
+            lr = self._min_lr
+        # 4. 余弦退火阶段
         else:
             if self._cosine_annealing_base_lr is None:
-                self._cosine_annealing_base_lr = self.cur_lr
+                self._cosine_annealing_base_lr = self._max_lr
 
-            T_max = self._cosine_annealing_period * (max(self._cosine_annealing_period_mul, 1) ** self.cycle)
+            T_max = max(1, self._cosine_annealing_period * (max(self._cosine_annealing_period_mul, 1) ** self.cycle))
             self.T_cur += 1
             calc_t = self.T_cur
 
@@ -183,9 +191,6 @@ class NoneLRScheduler(LRScheduler):
 
     def step(self): ...
 
-    def can_clip_grad(self):
-        return True
-
     def get_ckpt_dict(self) -> dict:
         return {'cur_lr': self._current_lr}
 
@@ -209,9 +214,6 @@ class CompositeLRScheduler(LRScheduler):
     def step(self):
         for scheduler in self.schedulers:
             scheduler.step()
-
-    def can_clip_grad(self):
-        return all(s.can_clip_grad() for s in self.schedulers)
 
     def get_ckpt_dict(self) -> dict:
         ckpt = {}

@@ -191,16 +191,20 @@ def create_doc_boundary_mask(
     # key_doc_ids 形状:   (bsz, 1, seq_len)
     query_doc_ids = doc_ids.unsqueeze(2)
     key_doc_ids = doc_ids.unsqueeze(1)
+    doc_mask = (query_doc_ids != key_doc_ids)
+
+    causal_mask = torch.triu(
+        torch.ones((seq_len, seq_len), device=input_ids.device, dtype=torch.bool),
+        diagonal=1
+    ).unsqueeze(0)  # (1, seq_len, seq_len)
 
     # 利用 PyTorch 的广播机制，`query_doc_ids > key_doc_ids` 会创建一个
     # 形状为 (bsz, seq_len, seq_len) 的布尔张量。
     # 当 query 的文档 ID 大于 key 的文档 ID 时，值为 True，这正是我们需要屏蔽的位置。
-    boundary_mask = query_doc_ids > key_doc_ids
+    boundary_mask = doc_mask | causal_mask
 
     # 4. 将布尔 mask 转换为 attention 机制所需的浮点数 mask (-inf 和 0)
-    final_mask = torch.zeros(
-        (bsz, seq_len, seq_len), device=input_ids.device, dtype=dtype
-    )
+    final_mask = torch.zeros((bsz, seq_len, seq_len), device=input_ids.device, dtype=dtype)
     final_mask.masked_fill_(boundary_mask, torch.finfo(dtype).min)
 
     # 5. 增加一个维度以匹配 attention head 的输入要求 (bsz, num_heads, seq_len, seq_len)
@@ -286,6 +290,7 @@ def batch_repeat_image_tok(
     new_tokens_list = []
     new_masks_list = []
     has_mask = attention_mask is not None
+    pad_id = TrainerTools().tokenizer.pad
 
     for i in range(len(tokens)):
         token_seq = tokens[i]
@@ -299,9 +304,26 @@ def batch_repeat_image_tok(
             new_tok, _ = repeat_image_tok(token_seq, tokens_per_image)
             new_tokens_list.append(new_tok)
 
-    ret_tokens = torch.stack(new_tokens_list, dim=0)
+    # 使用 pad_sequence 进行动态左对齐/右对齐填充，替代直接 torch.stack
+    max_len = max(t.size(0) for t in new_tokens_list)
+    padded_tokens = []
+    padded_masks = []
+
+    for i, t in enumerate(new_tokens_list):
+        pad_size = max_len - t.size(0)
+        if pad_size > 0:
+            # 保持右侧或左侧一致填充
+            padded_tokens.append(F.pad(t, (0, pad_size), value=pad_id))
+            if has_mask:
+                padded_masks.append(F.pad(new_masks_list[i], (0, pad_size), value=0))
+        else:
+            padded_tokens.append(t)
+            if has_mask:
+                padded_masks.append(new_masks_list[i])
+
+    ret_tokens = torch.stack(padded_tokens, dim=0)
     if has_mask:
-        ret_masks = torch.stack(new_masks_list, dim=0)
+        ret_masks = torch.stack(padded_masks, dim=0)
         return ret_tokens, ret_masks
 
     return ret_tokens, None
@@ -385,12 +407,12 @@ def get_dpo_collate_fn(mask_prompt: bool):
         chosen_inputs = torch.tensor(chosen_inputs).long()
         chosen_labels = torch.tensor(chosen_labels).long()
         if mask_prompt:
-            chosen_labels = _mask_prompt(chosen_labels)
+            chosen_labels = _mask_dpo_prompt(chosen_labels)
 
         rejected_inputs = torch.tensor(rejected_inputs).long()
         rejected_labels = torch.tensor(rejected_labels).long()
         if mask_prompt:
-            rejected_labels = _mask_prompt(rejected_labels)
+            rejected_labels = _mask_dpo_prompt(rejected_labels)
 
         return {
             'chosen_inputs': chosen_inputs,
@@ -590,9 +612,17 @@ def truncate_sequences_at_eos(
 
 
 def disable_dropout_in_model(model: torch.nn.Module) -> None:
+    if hasattr(model, "config"):
+        if hasattr(model.config, "attention_dropout"):
+            model.config.attention_dropout = 0.0
+        if getattr(model.config, "moe_config", None) is not None and hasattr(model.config.moe_config, "router_jitter_noise"):
+            model.config.moe_config.router_jitter_noise = 0.0
+
     for module in model.modules():
         if isinstance(module, torch.nn.Dropout):
-            module.p = 0
+            module.p = 0.0
+        if hasattr(module, "drop_rate"):
+            module.drop_rate = 0.0
 
 
 def _masked_mean_and_var(
@@ -727,6 +757,9 @@ def _mask_prompt(sequences: torch.Tensor) -> torch.Tensor:
         ends = [idx for idx, val in enumerate(row) if val == end_id]
 
         if not starts:
+            for idx, val in enumerate(row):
+                if val == assistant_id:
+                    sequences[i, idx] = ignore_index
             continue
 
         start_idx_ptr = 0
@@ -754,6 +787,46 @@ def _mask_prompt(sequences: torch.Tensor) -> torch.Tensor:
                 next_s_idx += 1
 
             start_idx_ptr = next_s_idx
+
+        for idx in range(seq_len):
+            if row[idx] == assistant_id and sequences[i, idx] != ignore_index:
+                sequences[i, idx] = ignore_index
+
+    return sequences
+
+
+def _mask_dpo_prompt(sequences: torch.Tensor) -> torch.Tensor:
+    """
+    DPO 专用 Prompt Mask
+    在多轮对话偏好对齐中，历史轮次（包括历史的 <assistant> 回复）均属于给定的 Context/Prompt，
+    仅最后一轮评估的候选回答才是 Completion。
+    策略：仅保留最后一个 <assistant> 之后的 Token，将其余前缀（含最后一个 <assistant> 自身）全部 Mask 为 -100。
+    例如：
+    1. 单轮: <system>system</s><user>user</s><assistant>content</s>
+       mask: mask mask mask mask mask mask mask content</s>
+    2. 多轮: <system>system</s><user>u1</s><assistant>a1</s><user>u2</s><assistant>a2</s>
+       mask: mask mask mask mask mask mask mask mask mask mask mask mask mask a2</s>
+    """
+    tokenizer = TrainerTools().tokenizer
+    system_id = tokenizer.system
+    user_id = tokenizer.user
+    assistant_id = tokenizer.assistant
+    ignore_index = -100
+
+    cpu_seqs = sequences.cpu().tolist()
+
+    for i in range(len(cpu_seqs)):
+        row = cpu_seqs[i]
+        last_assistant_idx = -1
+        for idx in range(len(row) - 1, -1, -1):
+            if row[idx] == assistant_id:
+                last_assistant_idx = idx
+                break
+
+        if last_assistant_idx != -1:
+            sequences[i, :last_assistant_idx + 1] = ignore_index
+        elif any(val == system_id or val == user_id for val in row):
+            sequences[i, :] = ignore_index
 
     return sequences
 
@@ -821,7 +894,7 @@ def _build_deepspeed_kwargs(
     elif compute_dtype == 'fp16':
         enable_fp16 = True
     elif compute_dtype == 'fp32':
-        pass
+        ...
     elif ds_config.bf16_config and ds_config.bf16_config.enabled and is_bf16_supported():
         enable_bf16 = True
     elif ds_config.fp16_config and is_fp16_supported():
@@ -972,7 +1045,7 @@ def fold_rewards_to_preceding_action(
 
     device = rewards_tensor.device
     action_mask = action_mask.bool()
-    non_action_rewards = (rewards_tensor != 0) & (~action_mask)
+    non_action_rewards = (rewards_tensor != 0) & (~torch.isnan(rewards_tensor)) & (~action_mask)
 
     if not non_action_rewards.any():
         return rewards_tensor
@@ -1018,3 +1091,39 @@ def fold_rewards_to_preceding_action(
         out_rewards[fold_b, fold_t] = 0.0
 
     return out_rewards
+
+
+def build_completion_mask(
+        completion_ids: torch.Tensor,
+        eos_token_id: int,
+        pad_token_id: int
+) -> torch.Tensor:
+    """
+    构造精确的 Completion Mask：
+    1. 首个 EOS 之后的所有 Token 严格截断（置为 False）。
+    2. 当 pad_token_id == eos_token_id 时，首个 EOS 本身必须被保留为 True（保障结束符策略学习）。
+    """
+    device = completion_ids.device
+    seq_len = completion_ids.size(1)
+
+    is_eos = (completion_ids == eos_token_id)
+    # 找到每行第一个 EOS 出现的位置，若无 EOS 则指向 seq_len
+    has_eos = is_eos.any(dim=1)
+    first_eos_idx = torch.where(
+        has_eos,
+        is_eos.int().argmax(dim=1),
+        torch.full((completion_ids.size(0),), seq_len, dtype=torch.long, device=device)
+    )
+
+    seq_indices = torch.arange(seq_len, device=device).unsqueeze(0)
+    # 必须在第一个 EOS 或之前
+    before_or_at_eos = seq_indices <= first_eos_idx.unsqueeze(1)
+
+    if pad_token_id == eos_token_id:
+        # 当 pad == eos 时，在第一个 EOS 处强制为 True，而其前必须非 pad，其后全为 False
+        is_first_eos = (seq_indices == first_eos_idx.unsqueeze(1)) & has_eos.unsqueeze(1)
+        valid_non_pad = (completion_ids != pad_token_id) & (seq_indices < first_eos_idx.unsqueeze(1))
+        return valid_non_pad | is_first_eos
+    else:
+        # 常规情况：在 EOS 之前且不是 padding
+        return before_or_at_eos & (completion_ids != pad_token_id)

@@ -52,7 +52,16 @@ class PretrainDataset(Dataset):
             tokens = []
             with open(file_path, 'r') as f:
                 for line in f:
-                    tokens.extend(TrainerTools().tokenizer.encode(json.loads(line.strip())['text']))
+                    line_str = line.strip()
+                    if not line_str:
+                        continue
+
+                    doc_tokens = TrainerTools().tokenizer.encode(json.loads(line_str)['text'])
+                    if doc_tokens:
+                        if doc_tokens[-1] != TrainerTools().tokenizer.end:
+                            doc_tokens.append(TrainerTools().tokenizer.end)
+                        tokens.extend(doc_tokens)
+
             self.input_ids = torch.tensor(tokens, dtype=torch.int32)
             del tokens
         elif file_type == 'pkl':
@@ -145,7 +154,8 @@ class SFTDataset(Dataset):
             with open(image_tags_file_path, 'r') as f:
                 csv_reader = csv.reader(f)
                 for line in csv_reader:
-                    self.image_tags.append(line[0])
+                    if line:
+                        self.image_tags.append(line[0])
 
     def __len__(self):
         return len(self.input_ids)
@@ -161,17 +171,30 @@ class SFTDataset(Dataset):
         else:
             inputs = torch.tensor(inputs).long()
 
-        image_tag = self.image_tags[item] if self.image_tags else None
+        image_tok = TrainerTools().tokenizer.image
+        image_tag = self.image_tags[item] if (self.image_tags and item < len(self.image_tags)) else None
 
-        if not image_tag:
-            image_tag = None
-
-        if self.tokens_per_image != -1:
+        if self.tokens_per_image != -1 and image_tag and (inputs == image_tok).any().item():
             inputs, _ = repeat_image_tok(inputs, self.tokens_per_image)
         else:
             image_tag = None
 
-        inputs = inputs[:self.block_size]
+        if len(inputs) > self.block_size:
+            inputs = inputs[:self.block_size]
+            if self.tokens_per_image != -1 and image_tag:
+                actual_img_tokens = (inputs == image_tok).sum().item()
+                if actual_img_tokens % self.tokens_per_image != 0:
+                    valid_len = actual_img_tokens - (actual_img_tokens % self.tokens_per_image)
+                    if valid_len == 0:
+                        inputs = inputs[inputs != image_tok]
+                        image_tag = None
+                    else:
+                        # 移除末尾残缺的超出部分 <image> token
+                        img_indices = (inputs == image_tok).nonzero(as_tuple=True)[0]
+                        to_remove_indices = img_indices[valid_len:]
+                        keep_mask = torch.ones_like(inputs, dtype=torch.bool)
+                        keep_mask[to_remove_indices] = False
+                        inputs = inputs[keep_mask]
 
         return {
             'inputs': inputs,
@@ -235,14 +258,9 @@ class DPODataset(Dataset):
     def __len__(self):
         return len(self.data)
 
-    def _truncate_sequence(self, token_ids: list) -> list:
-        """ 超出长度限制，进行左侧截断 """
-        if len(token_ids) <= self.block_size:
-            return token_ids
-
-        assistant_id =  TrainerTools().tokenizer.assistant
-        user_id =  TrainerTools().tokenizer.user
-        system_id =  TrainerTools().tokenizer.system
+    def _split_prompt_completion(self, token_ids: list):
+        """将序列按最后一个 <assistant> 切分为 (prompt_ids, completion_ids)"""
+        assistant_id = TrainerTools().tokenizer.assistant
 
         last_assistant_idx = -1
         for idx in range(len(token_ids) - 1, -1, -1):
@@ -251,28 +269,15 @@ class DPODataset(Dataset):
                 break
 
         if last_assistant_idx == -1:
-            return token_ids[:self.block_size]
+            return None, None
 
         prompt_ids = token_ids[:last_assistant_idx + 1]
         completion_ids = token_ids[last_assistant_idx + 1:]
 
         if len(completion_ids) == 0:
-            return token_ids[:self.block_size]
+            return None, None
 
-        min_prompt_len = 4
-        max_comp_len = max(self.block_size - min_prompt_len, 1)
-
-        if len(completion_ids) > max_comp_len:
-            completion_ids = completion_ids[:max_comp_len]
-
-        avail_prompt_len = self.block_size - len(completion_ids)
-
-        if len(prompt_ids) > avail_prompt_len:
-            prompt_ids = prompt_ids[-avail_prompt_len:]
-            if prompt_ids[0] not in (user_id, system_id):
-                prompt_ids[0] = user_id
-
-        return prompt_ids + completion_ids
+        return prompt_ids, completion_ids
 
     def __getitem__(self, item):
         record = self.data[item]
@@ -290,9 +295,52 @@ class DPODataset(Dataset):
         if isinstance(chosen_id, (np.ndarray, torch.Tensor)): chosen_id = chosen_id.tolist()
         if isinstance(rejected_id, (np.ndarray, torch.Tensor)): rejected_id = rejected_id.tolist()
 
+        chosen_prompt, chosen_comp = self._split_prompt_completion(chosen_id)
+        rejected_prompt, rejected_comp = self._split_prompt_completion(rejected_id)
+
+        user_id = TrainerTools().tokenizer.user
+        system_id = TrainerTools().tokenizer.system
+        assistant_id = TrainerTools().tokenizer.assistant
+
+        # 如果未找到 assistant 标记或无有效回答，将 [user_id, assistant_id] 置于序列开头，确保后续 token 作为回答保留
+        if chosen_prompt is None or rejected_prompt is None:
+            max_body = max(self.block_size - 2, 1)
+            safe_chosen = ([user_id, assistant_id] + chosen_id[:max_body]) if chosen_prompt is None else chosen_id[
+                                                                                                         :self.block_size]
+            safe_rejected = (
+                        [user_id, assistant_id] + rejected_id[:max_body]) if rejected_prompt is None else rejected_id[
+                                                                                                          :self.block_size]
+            return {
+                'chosen': safe_chosen,
+                'rejected': safe_rejected
+            }
+
+        min_prompt_len = 2
+        max_comp_len = max(self.block_size - min_prompt_len, 1)
+
+        if len(chosen_comp) > max_comp_len:
+            chosen_comp = chosen_comp[:max_comp_len]
+        if len(rejected_comp) > max_comp_len:
+            rejected_comp = rejected_comp[:max_comp_len]
+
+        avail_prompt_len = max(self.block_size - max(len(chosen_comp), len(rejected_comp)), min_prompt_len)
+
+        def _truncate_prompt(p_ids: list) -> list:
+            res = list(p_ids)
+            if len(res) > avail_prompt_len:
+                res = res[-avail_prompt_len:]
+                if res[0] not in (user_id, system_id) and len(res) >= 2:
+                    res[0] = user_id
+                if res[-1] != assistant_id:
+                    res[-1] = assistant_id
+            return res
+
+        c_prompt_ids = _truncate_prompt(chosen_prompt)
+        r_prompt_ids = c_prompt_ids if chosen_prompt == rejected_prompt else _truncate_prompt(rejected_prompt)
+
         return {
-            'chosen': self._truncate_sequence(chosen_id),
-            'rejected': self._truncate_sequence(rejected_id)
+            'chosen': c_prompt_ids + chosen_comp,
+            'rejected': r_prompt_ids + rejected_comp
         }
 
 
@@ -378,4 +426,3 @@ class RLDataset(Dataset):
             'prompt': prompt_tensor,
             'answer': answer_tensor
         }
-

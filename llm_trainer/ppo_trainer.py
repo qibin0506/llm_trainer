@@ -30,11 +30,18 @@ from .utils import (
     empty_cache,
     _build_deepspeed_kwargs,
     _build_data_loader_config,
-    fold_rewards_to_preceding_action
+    fold_rewards_to_preceding_action,
+    build_completion_mask,
+    _masked_var
 )
-from .checkpoint import save_checkpoint, save_steps, load_checkpoint
+from .checkpoint import (
+    save_checkpoint,
+    save_steps,
+    load_checkpoint,
+    restore_rng_state_dict,
+)
 from .scheduler import LRScheduler, WarmupCosineAnnealingLRScheduler, CompositeLRScheduler, NoneLRScheduler
-from .partition_utils import unwrap_model_for_generation, zero3_trace_guard, add_fused_lm_head
+from .partition_utils import unwrap_model_for_generation, zero3_trace_guard, add_fused_log_prob_head
 from .muon import MuonWithAdamW, _get_ds_muon
 
 
@@ -56,19 +63,15 @@ class ValueModel(nn.Module):
         # 分配全量状态（如 AdamW 的 exp_avg, exp_avg_sq 等），浪费数 GB 至十数 GB 显存。
         # 注意：如果启用了 tie_word_embeddings，lm_head.weight 与 embed_tokens.weight 共享，则不可冻结。
         if hasattr(self.base_model, 'lm_head'):
-            is_tied = (
-                hasattr(self.base_model, 'embed_tokens')
-                and hasattr(self.base_model.lm_head, 'weight')
-                and (self.base_model.lm_head.weight is getattr(self.base_model.embed_tokens, 'weight', None))
-            )
-            if not is_tied:
-                for p in self.base_model.lm_head.parameters():
+            embed_weight = getattr(getattr(self.base_model, 'embed_tokens', None), 'weight', None)
+            for p in self.base_model.lm_head.parameters():
+                if p is not embed_weight:
                     p.requires_grad = False
 
         self.value_head = ValueHead(base_model.config.hidden_size, 1, bias=True)
 
     def forward(self, *args, **kwargs) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        base_kwargs = {k: v for k, v in kwargs.items() if k not in ('return_logits', 'logits_to_keep', 'fused_lm_head', 'completion_ids', 'completion_mask')}
+        base_kwargs = {k: v for k, v in kwargs.items() if k not in ('return_logits', 'logits_to_keep', 'fused_lm_head', 'fused_loss', 'fused_log_probs', 'completion_ids', 'completion_mask', 'temperature')}
         outputs = self.base_model(*args, return_logits=False, **base_kwargs)
         # [batch_size, seq_len, hidden_size]
         last_hidden_state = outputs['hidden_states']
@@ -204,7 +207,7 @@ class PPOTrainer(BaseTrainer):
             self._load_external_weights(
                 train_model,
                 self.ppo_config.value_model_weights_path,
-                prefixes=['value_model.']
+                prefixes=['value_model.', 'value_model.base_model.']
             )
 
         optimizer = self._config_optim(train_model, initial_lr)
@@ -220,7 +223,7 @@ class PPOTrainer(BaseTrainer):
 
     def _check_add_fused_head(self, model):
         if self.chunked_log_probs_size is not None:
-            add_fused_lm_head(model, chunk_size=self.chunked_log_probs_size)
+            add_fused_log_prob_head(model, chunk_size=self.chunked_log_probs_size)
 
     def _config_optim(self, model, initial_lr):
         policy_config = self.train_config.optim_config
@@ -257,7 +260,7 @@ class PPOTrainer(BaseTrainer):
             if muon_wd is None:
                 muon_wd = policy_config.weight_decay if policy_config.weight_decay is not None else 0.01
 
-            if isinstance(TrainerTools().parallel, DsParallel):
+            if self.is_ds:
                 unified_momentum = policy_config.muon_momentum if policy_config.muon_momentum is not None else (
                     value_config.muon_momentum if value_config.muon_momentum is not None else 0.95
                 )
@@ -357,32 +360,44 @@ class PPOTrainer(BaseTrainer):
                 value_indices = recovered_value_indices
 
         # 策略 3: 若策略 2 仍无法完全解析（如极端 ZeRO-3 虚拟参数切片），按初始组分配顺序兜底
-        if not policy_indices and not value_indices:
+        if not policy_indices or not value_indices:
             orig_owners = getattr(self, '_orig_group_owners', None)
             if orig_owners and len(orig_owners) == len(param_groups):
-                policy_indices = [i for i, o in enumerate(orig_owners) if o == 'policy']
-                value_indices = [i for i, o in enumerate(orig_owners) if o == 'value']
+                if not policy_indices:
+                    policy_indices = [i for i, o in enumerate(orig_owners) if o == 'policy']
+                if not value_indices:
+                    value_indices = [i for i, o in enumerate(orig_owners) if o == 'value']
             else:
                 num_policy = getattr(self, '_num_policy_groups', 0)
                 if 0 < num_policy < len(param_groups):
-                    policy_indices = list(range(num_policy))
-                    value_indices = list(range(num_policy, len(param_groups)))
+                    if not policy_indices:
+                        policy_indices = list(range(num_policy))
+                    if not value_indices:
+                        value_indices = list(range(num_policy, len(param_groups)))
                 else:
-                    policy_indices = list(range(len(param_groups)))
-                    value_indices = []
+                    if not policy_indices:
+                        policy_indices = list(range(len(param_groups)))
 
         # 确保每个 group 拥有正确的 max_lr 属性（防止 DeepSpeed 剔除自定义字段导致 scheduler 回退失效）
         for idx in policy_indices:
             if idx < len(param_groups):
                 g = param_groups[idx]
-                if 'max_lr' not in g and policy_config is not None:
-                    g['max_lr'] = policy_config.max_lr if policy_config.max_lr is not None else policy_config.initial_lr
+                if g.get('max_lr') is None and policy_config is not None:
+                    params = g.get('params', [])
+                    if g.get('use_muon', False) or any(getattr(p, 'use_muon', False) for p in params):
+                        g['max_lr'] = policy_config.muon_lr if policy_config.muon_lr is not None else 0.02
+                    else:
+                        g['max_lr'] = policy_config.max_lr if policy_config.max_lr is not None else policy_config.initial_lr
 
         for idx in value_indices:
             if idx < len(param_groups):
                 g = param_groups[idx]
-                if 'max_lr' not in g and value_config is not None:
-                    g['max_lr'] = value_config.max_lr if value_config.max_lr is not None else value_config.initial_lr
+                if g.get('max_lr') is None and value_config is not None:
+                    params = g.get('params', [])
+                    if g.get('use_muon', False) or any(getattr(p, 'use_muon', False) for p in params):
+                        g['max_lr'] = value_config.muon_lr if value_config.muon_lr is not None else 0.02
+                    else:
+                        g['max_lr'] = value_config.max_lr if value_config.max_lr is not None else value_config.initial_lr
 
         if TrainerTools().parallel.is_main_process:
             Logger.std_log(
@@ -475,7 +490,7 @@ class PPOTrainer(BaseTrainer):
         parallel_kwargs: Optional[Dict[str, Any]] = None
         ds_config = self.train_config.ds_config
 
-        if isinstance(TrainerTools().parallel, DsParallel) and ds_config:
+        if self.is_ds and ds_config:
             value_is_muon = (
                     self.ppo_config.value_optim_config is not None and
                     self.ppo_config.value_optim_config.optim_type == 'muon'
@@ -541,13 +556,17 @@ class PPOTrainer(BaseTrainer):
         for t in reversed(range(seq_len)):
             is_action = action_mask[:, t]  # [batch_size] bool
 
-            # 若未来存在下一动作，直接桥接下一动作起始状态的 Value 与 Advantage；
-            # 若不存在（整条轨迹末尾），则依据 dones 判断是否为自然终止态 (0.0) 或截断引导值 (last_values)
+            bootstrap_val = torch.where(
+                dones.bool(),
+                torch.zeros_like(last_values),
+                last_values.to(dtype=torch.float32)
+            )
             next_val = torch.where(
                 has_next_action,
                 next_action_val,
-                torch.where(dones, 0.0, last_values)
+                bootstrap_val
             )
+
             next_adv = torch.where(has_next_action, next_action_adv, 0.0)
             next_discount = torch.where(has_next_action, gamma * lam, 0.0)
 
@@ -570,51 +589,50 @@ class PPOTrainer(BaseTrainer):
             input_ids: torch.Tensor,
             attention_mask: Optional[torch.Tensor],
             completion_ids: torch.Tensor,
+            completion_mask: Optional[torch.Tensor] = None,
             batch_size: Optional[int] = None,
             forward_type: str = 'both'
     ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
-        """
-        计算 LogProbs 与 Values：
-        1. 支持 forward_type='both'（Policy 与 Value 共同前向）或 'value'（仅 Value 前向）
-        2. 支持 batch_size 样本维度切片：None 为全量计算，整数则按样本批次分块前向以降低显存峰值
-        3. 在 no_grad 模式下自动对每个 forward 应用细粒度 zero3_trace_guard 保护，杜绝跨 batch Trace 累积
-        """
         is_no_grad = not torch.is_grad_enabled()
-
         use_fused = (self.chunked_log_probs_size is not None)
 
-        def _step_forward(inp_ids, att_mask, comp_ids):
-            pos_ids = calc_position_ids(att_mask)
-            comp_len = comp_ids.size(1)
-            comp_mask = att_mask[:, -comp_len:].bool() if (att_mask is not None and att_mask.size(1) >= comp_len) else None
-
+        def _step_forward(inp_ids, att_mask, comp_ids, comp_mask):
             guard = zero3_trace_guard(model) if is_no_grad else nullcontext()
             with guard:
+                pos_ids = calc_position_ids(att_mask)
+                comp_len = comp_ids.size(1)
+                if comp_mask is None and att_mask is not None and att_mask.size(1) >= comp_len:
+                    comp_mask = att_mask[:, -comp_len:].bool()
+
+                temperature = self.ppo_config.generate_config.temperature or 1.0
                 policy_output, value_output = model(
                     inp_ids,
                     attention_mask=att_mask,
                     position_ids=pos_ids,
                     completion_ids=comp_ids if (use_fused and forward_type in ('both', 'policy')) else None,
                     completion_mask=comp_mask if (use_fused and forward_type in ('both', 'policy')) else None,
-                    fused_lm_head=use_fused if forward_type in ('both', 'policy') else False,
+                    fused_log_probs=use_fused if forward_type in ('both', 'policy') else False,
                     forward_type=forward_type,
+                    temperature=temperature,
                     return_logits=not use_fused
                 )
 
-            if policy_output is not None:
-                if 'log_probs' in policy_output:
-                    log_probs = policy_output['log_probs']
+                if policy_output is not None:
+                    if 'log_probs' in policy_output:
+                        log_probs = policy_output['log_probs']
+                    else:
+                        logits_completion = policy_output['logits'][:, :-1, :][:, -comp_len:, :].float()
+                        if temperature != 1.0:
+                            logits_completion = logits_completion / temperature
+                        log_probs = log_softmax(logits_completion, comp_ids)
                 else:
-                    logits_completion = policy_output['logits'][:, :-1, :][:, -comp_len:, :].float()
-                    log_probs = log_softmax(logits_completion, comp_ids)
-            else:
-                log_probs = None
-            values = value_output[0] if value_output is not None else None
+                    log_probs = None
+                values = value_output[0] if value_output is not None else None
 
-            return log_probs, values
+                return log_probs, values
 
         if batch_size is None or batch_size <= 0 or batch_size >= input_ids.size(0):
-            return _step_forward(input_ids, attention_mask, completion_ids)
+            return _step_forward(input_ids, attention_mask, completion_ids, completion_mask)
 
         all_log_probs = []
         all_values = []
@@ -622,7 +640,8 @@ class PPOTrainer(BaseTrainer):
             c_input_ids = input_ids[i: i + batch_size]
             c_attention_mask = attention_mask[i: i + batch_size] if attention_mask is not None else None
             c_completion_ids = completion_ids[i: i + batch_size]
-            log_probs, values = _step_forward(c_input_ids, c_attention_mask, c_completion_ids)
+            c_completion_mask = completion_mask[i: i + batch_size] if completion_mask is not None else None
+            log_probs, values = _step_forward(c_input_ids, c_attention_mask, c_completion_ids, c_completion_mask)
             if log_probs is not None:
                 all_log_probs.append(log_probs)
             all_values.append(values)
@@ -637,50 +656,52 @@ class PPOTrainer(BaseTrainer):
             input_ids: torch.Tensor,
             attention_mask: Optional[torch.Tensor],
             completion_ids: torch.Tensor,
+            completion_mask: Optional[torch.Tensor] = None,
             batch_size: Optional[int] = None
     ) -> torch.Tensor:
-        """
-        计算参考模型的 LogProbs：
-        在 no_grad 模式下自动对每个 forward 应用细粒度 zero3_trace_guard 保护，杜绝跨 batch Trace 累积
-        """
         is_no_grad = not torch.is_grad_enabled()
-
         use_fused = (self.chunked_log_probs_size is not None)
+        temperature = self.ppo_config.generate_config.temperature or 1.0
 
-        def _step_forward(inp_ids, att_mask, comp_ids):
-            pos_ids = calc_position_ids(att_mask)
-            comp_len = comp_ids.size(1)
-            comp_mask = att_mask[:, -comp_len:].bool() if (att_mask is not None and att_mask.size(1) >= comp_len) else None
-
+        def _step_forward(inp_ids, att_mask, comp_ids, comp_mask):
             guard = zero3_trace_guard(model) if is_no_grad else nullcontext()
             with guard:
+                pos_ids = calc_position_ids(att_mask)
+                comp_len = comp_ids.size(1)
+                if comp_mask is None and att_mask is not None and att_mask.size(1) >= comp_len:
+                    comp_mask = att_mask[:, -comp_len:].bool()
+
                 outputs = model(
                     inp_ids,
                     attention_mask=att_mask,
                     position_ids=pos_ids,
                     completion_ids=comp_ids if use_fused else None,
                     completion_mask=comp_mask if use_fused else None,
-                    fused_lm_head=use_fused,
+                    temperature=temperature,
+                    fused_log_probs=use_fused,
                     return_logits=not use_fused
                 )
 
-            if isinstance(outputs, dict) and 'log_probs' in outputs:
-                log_probs = outputs['log_probs']
-            else:
-                logits_completion = outputs['logits'][:, :-1, :][:, -comp_len:, :].float()
-                log_probs = log_softmax(logits_completion, comp_ids)
+                if isinstance(outputs, dict) and 'log_probs' in outputs:
+                    log_probs = outputs['log_probs']
+                else:
+                    logits_completion = outputs['logits'][:, :-1, :][:, -comp_len:, :].float()
+                    if temperature != 1.0:
+                        logits_completion = logits_completion / temperature
+                    log_probs = log_softmax(logits_completion, comp_ids)
 
-            return log_probs
+                return log_probs
 
         if batch_size is None or batch_size <= 0 or batch_size >= input_ids.size(0):
-            return _step_forward(input_ids, attention_mask, completion_ids)
+            return _step_forward(input_ids, attention_mask, completion_ids, completion_mask)
 
         all_log_probs = []
         for i in range(0, input_ids.size(0), batch_size):
             c_input_ids = input_ids[i: i + batch_size]
             c_attention_mask = attention_mask[i: i + batch_size] if attention_mask is not None else None
             c_completion_ids = completion_ids[i: i + batch_size]
-            log_probs = _step_forward(c_input_ids, c_attention_mask, c_completion_ids)
+            c_completion_mask = completion_mask[i: i + batch_size] if completion_mask is not None else None
+            log_probs = _step_forward(c_input_ids, c_attention_mask, c_completion_ids, c_completion_mask)
             all_log_probs.append(log_probs)
 
         return torch.cat(all_log_probs, dim=0)
@@ -783,62 +804,66 @@ class PPOTrainer(BaseTrainer):
                 TrainerTools().parallel.wait('rollout')
             else:
                 with unwrap_model_for_generation(self.train_model) as unwrapped_model:
-                    gen_chunk_size = self.ppo_config.generate_config.chunked_generate_size
-                    if gen_chunk_size is None or gen_chunk_size <= 0:
-                        gen_chunk_size = padded_prompt_ids.size(0)
+                    unwrapped_model.eval()
+                    try:
+                        gen_chunk_size = self.ppo_config.generate_config.chunked_generate_size
+                        if gen_chunk_size is None or gen_chunk_size <= 0:
+                            gen_chunk_size = padded_prompt_ids.size(0)
 
-                    chunk_completions = []
-                    max_comp_len = 0
-                    for start_idx in range(0, padded_prompt_ids.size(0), gen_chunk_size):
-                        chunk_prompts = padded_prompt_ids[start_idx: start_idx + gen_chunk_size]
-                        chunk_masks = prompt_masks[start_idx: start_idx + gen_chunk_size]
-                        chunk_out, _ = batch_generate(
-                            model=unwrapped_model.policy_model,
-                            tokens=chunk_prompts,
-                            attention_mask=chunk_masks,
-                            max_new_tokens=max_new_tokens,
-                            temperature=self.ppo_config.generate_config.temperature,
-                            top_k=self.ppo_config.generate_config.top_k,
-                            top_p=self.ppo_config.generate_config.top_p,
-                            repetition_penalty=self.ppo_config.generate_config.repetition_penalty,
-                            exclude_penalty_tokens=self.ppo_config.generate_config.exclude_penalty_tokens,
-                            suppress_tokens=self.ppo_config.generate_config.suppress_tokens,
-                            device=device,
-                            return_logits=False,
-                            auto_prefix_cache=self.ppo_config.generate_config.auto_prefix_cache
-                        )
-                        comp = chunk_out[:, prompt_len:]
-                        max_comp_len = max(max_comp_len, comp.shape[1])
-                        chunk_completions.append(comp)
-
-                    # 跨卡全局同步最大补全长度：
-                    # 消除不同 Rank 因提前遇到 EOS 生成长度不同导致的退出相移死锁
-                    if TrainerTools().parallel.parallel_train and dist.is_initialized():
-                        max_comp_len_t = torch.tensor(max_comp_len, dtype=torch.long, device=device)
-                        dist.all_reduce(max_comp_len_t, op=dist.ReduceOp.MAX)
-                        max_comp_len = int(max_comp_len_t.item())
-
-                    if max_comp_len == 0:
-                        if TrainerTools().parallel.is_main_process:
-                            Logger.std_log(
-                                "WARN: All sequences generated 0 new tokens (empty completion). "
-                                "Padding completion length to 1 with pad_token_id to prevent negative slice crash."
+                        chunk_completions = []
+                        max_comp_len = 0
+                        for start_idx in range(0, padded_prompt_ids.size(0), gen_chunk_size):
+                            chunk_prompts = padded_prompt_ids[start_idx: start_idx + gen_chunk_size]
+                            chunk_masks = prompt_masks[start_idx: start_idx + gen_chunk_size]
+                            chunk_out, _ = batch_generate(
+                                model=unwrapped_model.policy_model,
+                                tokens=chunk_prompts,
+                                attention_mask=chunk_masks,
+                                max_new_tokens=max_new_tokens,
+                                temperature=self.ppo_config.generate_config.temperature,
+                                top_k=self.ppo_config.generate_config.top_k,
+                                top_p=self.ppo_config.generate_config.top_p,
+                                repetition_penalty=self.ppo_config.generate_config.repetition_penalty,
+                                exclude_penalty_tokens=self.ppo_config.generate_config.exclude_penalty_tokens,
+                                suppress_tokens=self.ppo_config.generate_config.suppress_tokens,
+                                device=device,
+                                return_logits=False,
+                                auto_prefix_cache=self.ppo_config.generate_config.auto_prefix_cache
                             )
-                        max_comp_len = 1
-                        chunk_completions = [
-                            torch.full((comp.size(0), 1), pad_token_id, dtype=torch.long, device=device)
+                            comp = chunk_out[:, prompt_len:]
+                            max_comp_len = max(max_comp_len, comp.shape[1])
+                            chunk_completions.append(comp)
+
+                        # 跨卡全局同步最大补全长度：
+                        # 消除不同 Rank 因提前遇到 EOS 生成长度不同导致的退出相移死锁
+                        if TrainerTools().parallel.parallel_train and dist.is_initialized():
+                            max_comp_len_t = torch.tensor(max_comp_len, dtype=torch.long, device=device)
+                            dist.all_reduce(max_comp_len_t, op=dist.ReduceOp.MAX)
+                            max_comp_len = int(max_comp_len_t.item())
+
+                        if max_comp_len == 0:
+                            if TrainerTools().parallel.is_main_process:
+                                Logger.std_log(
+                                    "WARN: All sequences generated 0 new tokens (empty completion). "
+                                    "Padding completion length to 1 with pad_token_id to prevent negative slice crash."
+                                )
+                            max_comp_len = 1
+                            chunk_completions = [
+                                torch.full((comp.size(0), 1), pad_token_id, dtype=torch.long, device=device)
+                                for comp in chunk_completions
+                            ]
+
+                        padded_comps = [
+                            F.pad(comp, (0, max_comp_len - comp.shape[1]), value=pad_token_id)
+                            if comp.shape[1] < max_comp_len else comp
                             for comp in chunk_completions
                         ]
+                        completion_ids = torch.cat(padded_comps, dim=0)
+                        full_ids = torch.cat([padded_prompt_ids, completion_ids], dim=1)
 
-                    padded_comps = [
-                        F.pad(comp, (0, max_comp_len - comp.shape[1]), value=pad_token_id)
-                        if comp.shape[1] < max_comp_len else comp
-                        for comp in chunk_completions
-                    ]
-                    completion_ids = torch.cat(padded_comps, dim=0)
-                    full_ids = torch.cat([padded_prompt_ids, completion_ids], dim=1)
-
-                    TrainerTools().parallel.wait('rollout')
+                        TrainerTools().parallel.wait('rollout')
+                    finally:
+                        unwrapped_model.train()
                 dones = torch.any(completion_ids == eos_token_id, dim=1)
 
         return {
@@ -857,7 +882,6 @@ class PPOTrainer(BaseTrainer):
     def _evaluate_rollout_data(self, sample_data: dict) -> dict:
         device = TrainerTools().parallel.device
         pad_token_id = TrainerTools().tokenizer.pad
-        eos_token_id = TrainerTools().tokenizer.end
 
         prompt_ids = sample_data['prompt_ids']
         gt_answer_ids = sample_data['gt_answer_ids']
@@ -870,28 +894,37 @@ class PPOTrainer(BaseTrainer):
         external_gen_mask = sample_data['external_gen_mask']
         padded_gen_masks = sample_data['padded_gen_masks']
 
-        full_attention_mask = self._calc_attention_mask(full_ids)
+        eos_token_id = TrainerTools().tokenizer.end
+        if external_gen_mask is not None:
+            # 多轮 Agent 模式沿用原 external_gen_mask 逻辑
+            completion_pad_mask = (completion_ids != pad_token_id)
+            loss_mask = completion_pad_mask & external_gen_mask
+        else:
+            # 单轮模式：使用精准的 EOS 截断与 pad==eos 保护
+            loss_mask = build_completion_mask(completion_ids, eos_token_id, pad_token_id)
+            completion_pad_mask = loss_mask
+
+        prompt_masks = self._calc_attention_mask(padded_prompt_ids)
+        full_attention_mask = torch.cat([prompt_masks, completion_pad_mask], dim=1)
 
         total_samples = full_ids.size(0)
         accum_steps = self.gradient_accumulation_steps
         samples_per_accum_window = self.ppo_config.ppo_batch_size * accum_steps
         can_skip_policy = (
-            (self.ppo_config.kl_beta == 0.0 or self.ref_model is None)
-            and (total_samples <= samples_per_accum_window)
+                (self.ppo_config.kl_beta == 0.0 or self.ref_model is None)
+                and (total_samples <= samples_per_accum_window)
         )
 
         eval_batch_size = self.rollout_eval_batch_size
         with torch.no_grad():
             with autocast(TrainerTools().parallel.device_type):
                 if can_skip_policy:
-                    # kl_beta == 0 且单累积窗口对齐时，Rollout 阶段无需 Policy 前向计算 old_log_probs，
-                    # 仅前向 Value 模型计算状态价值，完全跳过庞大的 Policy 策略主干与 LM Head，
-                    # 节省约 50% 算力与通信，并从源头消除 Policy 模型的 ZeRO-3 Trace 隐患
                     old_log_probs, value_output = self._compute_log_probs_and_values(
                         self.train_model,
                         full_ids,
                         full_attention_mask,
                         completion_ids,
+                        completion_mask=loss_mask,
                         batch_size=eval_batch_size,
                         forward_type='value'
                     )
@@ -901,6 +934,7 @@ class PPOTrainer(BaseTrainer):
                         full_ids,
                         full_attention_mask,
                         completion_ids,
+                        completion_mask=loss_mask,
                         batch_size=eval_batch_size,
                         forward_type='both'
                     )
@@ -911,18 +945,15 @@ class PPOTrainer(BaseTrainer):
                         full_ids,
                         full_attention_mask,
                         completion_ids,
+                        completion_mask=loss_mask,
                         batch_size=eval_batch_size
                     )
                 else:
                     ref_log_probs_completion = None
 
             rewards = torch.zeros_like(completion_ids, dtype=torch.float32, device=device)
-            completion_pad_mask = (completion_ids != pad_token_id)
 
-            if external_gen_mask is not None:
-                loss_mask = completion_pad_mask & external_gen_mask
-            else:
-                loss_mask = completion_pad_mask
+
 
             if self.ppo_config.kl_beta > 0.0 and ref_log_probs_completion is not None and old_log_probs is not None:
                 logr = ref_log_probs_completion.float() - old_log_probs.float()
@@ -952,10 +983,12 @@ class PPOTrainer(BaseTrainer):
                 gt_answer_ids,
                 **extra_reward_kwargs
             )
+
             if isinstance(raw_env_rewards, torch.Tensor):
                 env_rewards_tensor = raw_env_rewards.to(device=device, dtype=torch.float32)
             else:
                 env_rewards_tensor = torch.tensor(raw_env_rewards, device=device, dtype=torch.float32)
+            env_rewards_tensor = torch.nan_to_num(env_rewards_tensor, nan=0.0, posinf=0.0, neginf=0.0)
 
             # 统一计算每个样本在模型生成区域（action tokens）的最后一个有效 Token 位置与结束符判断
             gen_indices = torch.where(
@@ -1001,7 +1034,7 @@ class PPOTrainer(BaseTrainer):
                 )
 
                 # 屏蔽非生成 / Padding 位置的噪声，精确注入到各 Token
-                env_rewards_masked = env_rewards_tensor * loss_mask.float()
+                env_rewards_masked = torch.where(loss_mask, env_rewards_tensor, torch.zeros_like(env_rewards_tensor))
                 raw_reward_mean = env_rewards_masked.sum(dim=1).mean()
 
             elif env_rewards_tensor.dim() == 1:
@@ -1042,20 +1075,23 @@ class PPOTrainer(BaseTrainer):
         loss_mask = rollout_data['loss_mask']
         rewards = rollout_data['rewards']
 
+        # 安全 nan_to_num 保护
+        env_rewards_tensor = torch.nan_to_num(env_rewards_tensor, nan=0.0)
+
         if env_rewards_tensor.dim() == 2:
             env_rewards_masked = env_rewards_tensor * loss_mask.float()
             if self.ppo_config.normalize_rewards:
-                # 基于整条轨迹的累计回报 (Trajectory Return) 进行尺度缩放，
-                # 避免将海量全零 Token 纳入方差统计导致 batch_std 被严重稀释进而将奖励错误放大数十倍
                 trajectory_returns = env_rewards_masked.sum(dim=-1)
                 if self.reward_normalizer:
                     self.reward_normalizer.update(trajectory_returns)
-                    env_rewards_masked = self.reward_normalizer(env_rewards_masked, shift_mean=False) * loss_mask.float()
+                    env_rewards_masked = self.reward_normalizer(env_rewards_masked,
+                                                                shift_mean=False) * loss_mask.float()
                 else:
-                    if trajectory_returns.numel() > 1:
-                        batch_std = trajectory_returns.std()
-                        if not torch.isnan(batch_std) and batch_std > 1e-8:
-                            env_rewards_masked = (env_rewards_masked / batch_std) * loss_mask.float()
+                    # 跨卡分布式全局方差计算
+                    var = _masked_var(trajectory_returns, torch.ones_like(trajectory_returns), distributed=True)
+                    batch_std = torch.sqrt(var)
+                    if not torch.isnan(batch_std) and batch_std > 1e-8:
+                        env_rewards_masked = (env_rewards_masked / batch_std) * loss_mask.float()
 
             rewards += env_rewards_masked
 
@@ -1069,7 +1105,8 @@ class PPOTrainer(BaseTrainer):
                     self.reward_normalizer.update(env_rewards_tensor)
                     env_rewards_tensor = self.reward_normalizer(env_rewards_tensor, shift_mean=False)
                 else:
-                    batch_std = env_rewards_tensor.std()
+                    var = _masked_var(env_rewards_tensor, torch.ones_like(env_rewards_tensor), distributed=True)
+                    batch_std = torch.sqrt(var)
                     if not torch.isnan(batch_std) and batch_std > 1e-8:
                         env_rewards_tensor = env_rewards_tensor / batch_std
 
@@ -1108,14 +1145,18 @@ class PPOTrainer(BaseTrainer):
 
         comp_values = old_values[:, -(comp_len + 1):]
         values_for_gae = comp_values[:, :-1]
+        next_state_values = comp_values[:, 1:]
         assert values_for_gae.shape[1] == comp_len
 
-        # completion_pad_mask 统计每行有效 token 数量 K (范围 1 ~ max_comp_len)
-        valid_lengths = completion_pad_mask.sum(dim=-1).clamp(min=1)  # [batch_size]
+        last_token_indices = rollout_data['last_token_indices'].clamp(min=0)
+        valid_indices_mask = rollout_data['valid_indices_mask']
+        batch_range = rollout_data['batch_range']
+        last_values = torch.zeros(batch_size, device=prompt_ids.device, dtype=old_values.dtype)
 
-        # 提取有效末尾位置对应的 Value，作为真实的未终止状态截断引导值
-        batch_indices = torch.arange(batch_size, device=prompt_ids.device)
-        last_values = comp_values[batch_indices, valid_lengths]  # [batch_size]
+        if valid_indices_mask.any():
+            last_values[valid_indices_mask] = next_state_values[
+                batch_range[valid_indices_mask], last_token_indices[valid_indices_mask]
+            ]
 
         advantages, returns = self._compute_advantages_and_returns(
             rewards, values_for_gae, last_values, completion_pad_mask, dones, action_mask=loss_mask
@@ -1125,7 +1166,8 @@ class PPOTrainer(BaseTrainer):
         advantages_whitened = torch.masked_fill(advantages_whitened, ~loss_mask, 0.0)
 
         input_ids = torch.cat((prompt_ids, completion_ids), dim=1)
-        attention_mask = self._calc_attention_mask(input_ids)
+        prompt_masks = self._calc_attention_mask(prompt_ids)
+        attention_mask = torch.cat((prompt_masks, completion_pad_mask), dim=1)
 
         ppo_stats = {
             "loss": 0.0, "moe_aux_loss": 0.0, "actor_loss": 0.0,
@@ -1152,18 +1194,19 @@ class PPOTrainer(BaseTrainer):
                 mb_returns = returns[mini_batch_indices]
                 mb_advantages = advantages_whitened[mini_batch_indices]
                 mb_position_ids = calc_position_ids(mb_attention_mask)
+                temperature = self.ppo_config.generate_config.temperature or 1.0
 
                 with autocast(TrainerTools().parallel.device_type):
                     mb_comp_len = mb_completion_ids.size(1)
-                    mb_comp_mask = mb_attention_mask[:, -mb_comp_len:].bool() if (mb_attention_mask is not None and mb_attention_mask.size(1) >= mb_comp_len) else None
                     use_fused = (self.chunked_log_probs_size is not None)
                     policy_output, value_output = self.train_model(
                         mb_input_ids,
                         attention_mask=mb_attention_mask,
                         position_ids=mb_position_ids,
                         completion_ids=mb_completion_ids if use_fused else None,
-                        completion_mask=mb_comp_mask if use_fused else None,
-                        fused_lm_head=use_fused,
+                        completion_mask=mb_loss_mask if use_fused else None,
+                        temperature=temperature,
+                        fused_log_probs=use_fused,
                         forward_type='both',
                         return_logits=not use_fused
                     )
@@ -1172,6 +1215,8 @@ class PPOTrainer(BaseTrainer):
                         current_log_probs = policy_output['log_probs']
                     else:
                         logits_completion = policy_output['logits'][:, :-1, :][:, -mb_comp_len:, :].float()
+                        if temperature != 1.0:
+                            logits_completion = logits_completion / temperature
                         current_log_probs = log_softmax(logits_completion, mb_completion_ids)
 
                     # 核心复用：若 mb_old_log_probs 为 None（即首轮迭代且跳过了 Rollout Policy 前向），
@@ -1213,6 +1258,10 @@ class PPOTrainer(BaseTrainer):
 
                 # 每个 ppo_epoch 的最后一个 micro-batch 强制作为边界提交累积梯度，防止跨 epoch 泄漏
                 is_last_mini_batch = (i + ppo_batch_size >= batch_size)
+                total_mbs = math.ceil(batch_size / ppo_batch_size)
+                mb_idx_0 = i // ppo_batch_size
+                window_start_mb = (mb_idx_0 // self.gradient_accumulation_steps) * self.gradient_accumulation_steps
+                actual_accum_steps = min(self.gradient_accumulation_steps, total_mbs - window_start_mb)
 
                 if self.is_ds:
                     if is_last_mini_batch:
@@ -1220,14 +1269,19 @@ class PPOTrainer(BaseTrainer):
                         need_update_step = True
                     else:
                         need_update_step = self.train_model.is_gradient_accumulation_boundary()
+
+                    if actual_accum_steps < self.gradient_accumulation_steps:
+                        scale_factor = self.gradient_accumulation_steps / actual_accum_steps
+                        self._backward_loss(ppo_loss_unscaled * scale_factor, actual_accum_steps)
+                    else:
+                        self._backward_loss(ppo_loss_unscaled, self.gradient_accumulation_steps)
                 else:
                     micro_batch_idx += 1
                     need_update_step = (
-                        micro_batch_idx % self.gradient_accumulation_steps == 0
-                        or is_last_mini_batch
+                            micro_batch_idx % self.gradient_accumulation_steps == 0
+                            or is_last_mini_batch
                     )
-
-                self._backward_loss(ppo_loss_unscaled, self.gradient_accumulation_steps)
+                    self._backward_loss(ppo_loss_unscaled, actual_accum_steps)
 
                 ppo_stats["loss"] += ppo_loss_unscaled.detach().item()
                 ppo_stats["moe_aux_loss"] += aux_loss.detach().item()
@@ -1264,6 +1318,7 @@ class PPOTrainer(BaseTrainer):
         global_steps_per_rollout = max(1, updates_per_rollout)
 
         for epoch in range(self.resume_epoch, self.train_config.n_epochs):
+            self.train_model.train()
             file_count = len(self.train_config.file_dataset)
             start_file_idx = self.resume_file_idx if epoch == self.resume_epoch else 0
 
@@ -1276,7 +1331,7 @@ class PPOTrainer(BaseTrainer):
                 )
 
                 batch_count_per_file = len(train_data_loader)
-                TrainerTools().parallel.on_epoch_start(epoch)
+                TrainerTools().parallel.on_epoch_start(epoch, file_idx)
                 self._on_file_start(epoch, file_path)
 
                 skip_batches = 0
@@ -1285,11 +1340,20 @@ class PPOTrainer(BaseTrainer):
                     if skip_batches > 0 and TrainerTools().parallel.is_main_process:
                         Logger.std_log(f"Fast forwarding {skip_batches} batches in {file_path}...")
 
+                if skip_batches > 0 and self.resume_dataloader_rng_state is not None:
+                    torch.set_rng_state(self.resume_dataloader_rng_state.cpu().to(torch.uint8))
+                    self.resume_dataloader_rng_state = None
+
+                dataloader_rng_state = torch.get_rng_state()
                 data_iterator = iter(train_data_loader)
                 if skip_batches > 0:
                     data_iterator = islice(data_iterator, skip_batches, None)
 
                 for batch, batch_data in enumerate(data_iterator):
+                    if self.resume_rng_state is not None:
+                        restore_rng_state_dict(self.resume_rng_state)
+                        self.resume_rng_state = None
+
                     batch = skip_batches + batch
                     sample_data = None
                     sample_error = None
@@ -1398,7 +1462,8 @@ class PPOTrainer(BaseTrainer):
                                 epoch=epoch,
                                 file_idx=file_idx,
                                 batch_idx=batch + 1,
-                                lr_scheduler=self.lr_scheduler
+                                lr_scheduler=self.lr_scheduler,
+                                dataloader_rng_state=dataloader_rng_state
                             )
                             global_steps_since_last_save %= self.train_config.save_interval
 
@@ -1410,11 +1475,16 @@ class PPOTrainer(BaseTrainer):
                     except Exception as e:
                         self._on_exception(e, epoch, batch)
 
+                if self.resume_rng_state is not None:
+                    restore_rng_state_dict(self.resume_rng_state)
+                    self.resume_rng_state = None
+
                 try:
                     # 一个文件训练结束后，清理内存
                     del train_data_loader
                     del dataset
                     del data_iterator
+                    del dataloader_rng_state
                     del batch_data
                     del ppo_stats
                 except UnboundLocalError: ...
@@ -1426,7 +1496,6 @@ class PPOTrainer(BaseTrainer):
                 empty_cache()
 
             # end epoch
-
             # reset resume state
             self.resume_file_idx = 0
             self.resume_batch_idx = 0

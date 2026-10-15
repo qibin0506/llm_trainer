@@ -113,6 +113,9 @@ def _top_p_warper(
     :param min_tokens_to_keep:
     :return:
     """
+    if top_p is None or top_p >= 1.0:
+        return logits
+
     # 正序排列 eg: [0.1, 0.2, 0.3]
     sorted_logits, sorted_indices = torch.sort(logits, dim=-1, descending=False)
     # cumsum求和, 每一个元素的值都是与之前元素的求和
@@ -235,7 +238,7 @@ def _generate(
                     attention_mask=current_attention_mask,
                     past_key_values=kv_cache,
                     use_cache=True,
-                    pixel_values=pixel_values
+                    pixel_values=pixel_values if i == 0 else None
                 )
 
                 # logits (batch, seq_len, vocab_size)
@@ -569,7 +572,7 @@ def batch_generate(
                         position_ids=current_position_ids,
                         past_key_values=kv_cache,
                         use_cache=True,
-                        pixel_values=pixel_values
+                        pixel_values=pixel_values if i == 0 else None
                     )
                     logits = result['logits']
 

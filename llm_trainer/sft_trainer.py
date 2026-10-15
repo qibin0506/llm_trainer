@@ -10,7 +10,7 @@ from llm_model import VLMConfig, LlmModel, VlmModel
 from .train_configs import TrainConfig, GenerationService
 from .loss import LMLoss, KDLoss
 from .utils import get_sft_collate_fn, get_dtype
-from .partition_utils import add_fused_lm_head
+from .partition_utils import add_fused_loss_head
 
 
 class SFTTrainer(BaseTrainer):
@@ -80,7 +80,7 @@ class SFTTrainer(BaseTrainer):
 
     def _check_add_fused_head(self, model):
         if self.chunked_cross_entropy_size is not None:
-            add_fused_lm_head(model, chunk_size=self.chunked_cross_entropy_size)
+            add_fused_loss_head(model, chunk_size=self.chunked_cross_entropy_size)
 
     def _convert_train_args(self) -> Tuple[dict, dict, dict]:
         sft_collate_fn = get_sft_collate_fn(self.sft_config.mask_prompt)
@@ -100,12 +100,15 @@ class SFTTrainer(BaseTrainer):
         return None
 
     def _get_eval_pixel_values_and_tokens_count(self, eval_idx):
-        if not self.eval_image_tags:
+        if not self.eval_image_tags or eval_idx >= len(self.eval_image_tags):
             return None, None
 
         eval_image_tag = self.eval_image_tags[eval_idx]
         if isinstance(self.train_config.model_config, VLMConfig) and self.pixel_values_provider and eval_image_tag:
-            return self.pixel_values_provider([eval_image_tag]), self.train_config.model_config.tokens_per_image
+            raw_pixel_values = self.pixel_values_provider([eval_image_tag])
+            if raw_pixel_values is not None:
+                pixel_values = raw_pixel_values.to(TrainerTools().parallel.device, get_dtype())
+                return pixel_values, self.train_config.model_config.tokens_per_image
 
         return None, None
 
@@ -138,20 +141,27 @@ class SFTTrainer(BaseTrainer):
             return teacher_logits, kd_config.kd_coef
         return None, 0.0
 
-    def _calc_loss(self, inputs, attention_mask, result, labels, model: Optional[torch.nn.Module] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def _calc_loss(
+            self,
+            inputs,
+            attention_mask,
+            result,
+            labels,
+            model: Optional[torch.nn.Module] = None,
+            teacher_logits: Optional[torch.Tensor] = None,
+            kd_coef: float = 0.0
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if isinstance(result, dict) and "loss" in result:
             return result["loss"], result.get("ce_loss", result["loss"])
 
-        kd_config = self.sft_config.kd_config
-        has_kd = (kd_config is not None and kd_config.kd_coef > 0.0)
-
         ce_loss = self.criterion(result['logits'], labels)
-        if not has_kd:
+
+        if teacher_logits is None and self.sft_config.kd_config is not None and self.sft_config.kd_config.kd_coef > 0.0:
+            teacher_logits, kd_coef = self._get_teacher_logits_and_kd_coef(inputs, attention_mask)
+
+        if teacher_logits is None or kd_coef <= 0.0:
             return ce_loss, ce_loss
 
-        with torch.no_grad():
-            teacher_logits = kd_config.teacher_logits_provider(inputs, attention_mask)
-
         kd_loss = self.kd_loss(result['logits'], teacher_logits, labels)
-        total_loss = (1.0 - kd_config.kd_coef) * ce_loss + kd_config.kd_coef * kd_loss
+        total_loss = (1.0 - kd_coef) * ce_loss + kd_coef * kd_loss
         return total_loss, ce_loss

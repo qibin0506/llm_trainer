@@ -13,8 +13,8 @@ from .tools import TrainerTools
 from .log import Logger
 from .train_configs import TrainConfig, GenerationService
 from .utils import autocast, get_dpo_collate_fn, log_softmax, disable_dropout_in_model, empty_cache
-from .checkpoint import save_checkpoint, save_steps
-from .partition_utils import zero3_trace_guard
+from .checkpoint import save_checkpoint, save_steps, restore_rng_state_dict
+from .partition_utils import zero3_trace_guard, add_fused_log_prob_head
 
 
 class DPOTrainer(BaseTrainer):
@@ -40,6 +40,7 @@ class DPOTrainer(BaseTrainer):
             generation_service: Optional[GenerationService] = None,
     ):
         self.dpo_config = train_config.dpo_config
+        self.chunked_log_probs_size = self.dpo_config.chunked_log_probs_size
         super().__init__(
             train_config=train_config,
             eval_prompts=eval_prompts,
@@ -50,6 +51,7 @@ class DPOTrainer(BaseTrainer):
         self.criterion = self._init_loss()
 
         if self.dpo_config.loss_type == 'orpo' and (self.dpo_config.nll_loss_coef is None or self.dpo_config.nll_loss_coef == 0.0):
+            self.dpo_config.nll_loss_coef = 1.0
             if TrainerTools().parallel.is_main_process:
                 Logger.std_log("WARN: ORPO highly recommends using an NLL (SFT) loss. Please set `nll_loss_coef` (e.g., 1.0) in DPOConfig!")
 
@@ -72,6 +74,7 @@ class DPOTrainer(BaseTrainer):
         for param in ref_model.parameters():
             param.requires_grad = False
 
+        self._check_add_fused_head(ref_model)
         self._load_external_weights(ref_model, self.dpo_config.ref_model_weights_path)
 
         ref_model, _ = TrainerTools().parallel.process(
@@ -82,6 +85,10 @@ class DPOTrainer(BaseTrainer):
         )
 
         return ref_model
+
+    def _check_add_fused_head(self, model):
+        if self.chunked_log_probs_size is not None:
+            add_fused_log_prob_head(model, chunk_size=self.chunked_log_probs_size)
 
     def _new_model(self, train_config: TrainConfig):
         model = super()._new_model(train_config)
@@ -115,31 +122,29 @@ class DPOTrainer(BaseTrainer):
         block_size = self.train_config.dataset_block_size
         return DPODataset(file_path, block_size), file_path
 
-    def _logprobs(self, logits, labels):
+    def _logprobs(self, logits_or_logprobs, labels, is_logprobs: bool = False):
         """
         Calculate the average log probabilities for a batch of sequences.
 
         Args:
-            logits (torch.Tensor): Logits from the model with shape (B, T, V)
+            logits_or_logprobs (torch.Tensor): Logits from model (B, T, V) or log_probs (B, T-1).
             labels (torch.Tensor): Ground truth labels with shape (B, T).
+            is_logprobs (bool): Whether logits_or_logprobs is already per-token log_probs.
 
         Returns:
             torch.Tensor: Average log probabilities for each sequence in the batch.
-                          Shape is (B,) representing the mean log probability for each sequence.
         """
         loss_masks = (labels != -100)
-
-        logits = logits[:, :-1, :]
-        labels = labels[:, 1:].clone()
         loss_masks = loss_masks[:, 1:]
 
-        # dummy token; we'll ignore the losses on these tokens later
-        labels[labels == -100] = 0
+        if is_logprobs:
+            per_token_logps = logits_or_logprobs
+        else:
+            logits = logits_or_logprobs[:, :-1, :]
+            shift_labels = labels[:, 1:].clone()
+            per_token_logps = log_softmax(logits, shift_labels)
 
-        # Gather the log probabilities for the actual labels
-        per_token_logps = log_softmax(logits, labels)
-
-        # Apply the mask to set log-probs of padding tokens to 0
+        # Apply the mask to set log-probs of padding/prompt tokens to 0
         logprobs_sums = (per_token_logps * loss_masks).sum(-1)
         logprobs_means = (per_token_logps * loss_masks).sum(-1) / loss_masks.sum(-1).clamp(min=1.0)
         mask_sums = loss_masks.sum(-1)
@@ -177,7 +182,7 @@ class DPOTrainer(BaseTrainer):
                 )
 
                 batch_count_per_file = len(train_data_loader)
-                TrainerTools().parallel.on_epoch_start(epoch)
+                TrainerTools().parallel.on_epoch_start(epoch, file_idx)
                 self._on_file_start(epoch, file_path)
 
                 skip_batches = 0
@@ -186,11 +191,20 @@ class DPOTrainer(BaseTrainer):
                     if skip_batches > 0 and TrainerTools().parallel.is_main_process:
                         Logger.std_log(f"Fast forwarding {skip_batches} batches in {file_path}...")
 
+                if skip_batches > 0 and self.resume_dataloader_rng_state is not None:
+                    torch.set_rng_state(self.resume_dataloader_rng_state.cpu().to(torch.uint8))
+                    self.resume_dataloader_rng_state = None
+
+                dataloader_rng_state = torch.get_rng_state()
                 data_iterator = iter(train_data_loader)
                 if skip_batches > 0:
                     data_iterator = islice(data_iterator, skip_batches, None)
 
                 for batch, batch_data in enumerate(data_iterator):
+                    if self.resume_rng_state is not None:
+                        restore_rng_state_dict(self.resume_rng_state)
+                        self.resume_rng_state = None
+
                     batch = skip_batches + batch
 
                     try:
@@ -209,12 +223,20 @@ class DPOTrainer(BaseTrainer):
                         concat_labels = torch.concat([chosen_labels, rejected_labels], dim=0)
                         concat_attention_masks = torch.concat([chosen_attention_masks, rejected_attention_masks], dim=0)
 
+                        use_fused = (self.chunked_log_probs_size is not None)
                         with autocast(TrainerTools().parallel.device_type):
                             if self.ref_model is not None:
                                 with torch.no_grad():
                                     with zero3_trace_guard(self.ref_model):
-                                        ref_outputs = self.ref_model(concat_inputs, attention_mask=concat_attention_masks)
-                                        ref_logprobs_sums, ref_logprobs_means, _ = self._logprobs(ref_outputs['logits'], concat_labels)
+                                        ref_outputs = self.ref_model(
+                                            concat_inputs,
+                                            attention_mask=concat_attention_masks,
+                                            labels=concat_labels if use_fused else None,
+                                            fused_log_probs=use_fused,
+                                            return_logits=not use_fused
+                                        )
+                                        ref_data = ref_outputs['log_probs'] if use_fused else ref_outputs['logits']
+                                        ref_logprobs_sums, ref_logprobs_means, _ = self._logprobs(ref_data, concat_labels, is_logprobs=use_fused)
                                         del ref_outputs
 
                                     ref_chosen_logps = ref_logprobs_sums[:chosen_inputs.shape[0]]
@@ -227,8 +249,15 @@ class DPOTrainer(BaseTrainer):
                                 ref_chosen_means = None
                                 ref_rejected_means = None
 
-                            policy_outputs = self.train_model(concat_inputs, attention_mask=concat_attention_masks)
-                            policy_logprobs_sums, policy_logprobs_means, policy_mask_sums = self._logprobs(policy_outputs['logits'], concat_labels)
+                            policy_outputs = self.train_model(
+                                concat_inputs,
+                                attention_mask=concat_attention_masks,
+                                labels=concat_labels if use_fused else None,
+                                fused_log_probs=use_fused,
+                                return_logits=not use_fused
+                            )
+                            policy_data = policy_outputs['log_probs'] if use_fused else policy_outputs['logits']
+                            policy_logprobs_sums, policy_logprobs_means, policy_mask_sums = self._logprobs(policy_data, concat_labels, is_logprobs=use_fused)
 
                             aux_loss = policy_outputs['aux_loss']
                             del policy_outputs
@@ -273,9 +302,8 @@ class DPOTrainer(BaseTrainer):
                                 if self.dpo_config.loss_type == 'orpo':
                                     p_c = torch.clamp(policy_chosen_means.float(), max=-1e-7)
                                     p_r = torch.clamp(policy_rejected_means.float(), max=-1e-7)
-                                    # Odds: log(Odds) = p - log(1 - exp(p))
-                                    chosen_rewards = p_c - log1mexp(p_c)
-                                    rejected_rewards = p_r - log1mexp(p_r)
+                                    chosen_rewards = torch.where(chosen_mask_sums > 0, p_c - log1mexp(p_c), torch.zeros_like(p_c))
+                                    rejected_rewards = torch.where(rejected_mask_sums > 0, p_r - log1mexp(p_r), torch.zeros_like(p_r))
                                 elif self.dpo_config.loss_type == 'simpo':
                                     chosen_rewards = beta * policy_chosen_means
                                     rejected_rewards = beta * policy_rejected_means
@@ -289,13 +317,21 @@ class DPOTrainer(BaseTrainer):
 
                         total_loss_unscaled = loss + aux_loss + nll_loss
 
-                        # 每个 epoch 的最后一个 batch 作为累积边界强制提交梯度，防止跨 epoch 泄漏
-                        is_last_step = (
-                            file_idx == file_count - 1 and
-                            batch == batch_count_per_file - 1
-                        )
+                        window_start = (batch // self.gradient_accumulation_steps) * self.gradient_accumulation_steps
+                        actual_accum_steps = min(self.gradient_accumulation_steps, batch_count_per_file - window_start)
+
+                        # 每个文件的最后一个 batch 作为累积边界强制提交梯度，确保每个文件起点 batches_accumulated 恒为 0，
+                        is_last_step = (batch == batch_count_per_file - 1)
+
                         need_update_step = self._need_update_step(batches_accumulated, is_last_step)
-                        self._backward_loss(total_loss_unscaled, self.gradient_accumulation_steps)
+                        if self.is_ds:
+                            if actual_accum_steps < self.gradient_accumulation_steps:
+                                scale_factor = self.gradient_accumulation_steps / actual_accum_steps
+                                self._backward_loss(total_loss_unscaled * scale_factor, actual_accum_steps)
+                            else:
+                                self._backward_loss(total_loss_unscaled, self.gradient_accumulation_steps)
+                        else:
+                            self._backward_loss(total_loss_unscaled, actual_accum_steps)
 
                         loss_accumulation += total_loss_unscaled.detach().item()
                         dpo_loss_accumulation += loss.detach().item()
@@ -374,7 +410,8 @@ class DPOTrainer(BaseTrainer):
                                     epoch=epoch,
                                     file_idx=file_idx,
                                     batch_idx=batch + 1,
-                                    lr_scheduler=self.lr_scheduler
+                                    lr_scheduler=self.lr_scheduler,
+                                    dataloader_rng_state=dataloader_rng_state
                                 )
                                 global_steps_since_last_save = 0
 
@@ -384,10 +421,15 @@ class DPOTrainer(BaseTrainer):
                     except Exception as e:
                         self._on_exception(e, epoch, batch)
 
+                if self.resume_rng_state is not None:
+                    restore_rng_state_dict(self.resume_rng_state)
+                    self.resume_rng_state = None
+
                 try:
                     del train_data_loader
                     del dataset
                     del data_iterator
+                    del dataloader_rng_state
                     del batch_data
                     del concat_inputs
                     del concat_labels
@@ -413,8 +455,7 @@ class DPOTrainer(BaseTrainer):
                     del rejected_rewards
                     del reward_margin
                     del reward_accuracy
-                except (NameError, UnboundLocalError):
-                    pass
+                except (NameError, UnboundLocalError): ...
 
                 if hasattr(TrainerTools().parallel, '_sampler'):
                     TrainerTools().parallel._sampler = None
@@ -423,19 +464,6 @@ class DPOTrainer(BaseTrainer):
                 empty_cache()
 
             # end epoch
-            if batches_accumulated > 0:
-                self._update_step(is_last_step=True)
-                batches_accumulated = 0
-                loss_accumulation = 0.0
-                dpo_loss_accumulation = 0.0
-                aux_loss_accumulation = 0.0
-                nll_loss_accumulation = 0.0
-                ce_loss_accumulation = 0.0
-                chosen_reward_accumulation = 0.0
-                rejected_reward_accumulation = 0.0
-                reward_margin_accumulation = 0.0
-                reward_accuracy_accumulation = 0.0
-
             # reset resume state
             self.resume_file_idx = 0
             self.resume_batch_idx = 0

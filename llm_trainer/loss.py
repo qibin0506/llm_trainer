@@ -33,7 +33,7 @@ class ChunkedCrossEntropyFunction(torch.autograd.Function):
     1. 前向：由外部调用模块（如 ChunkedLMLoss）统一包裹 maybe_gather_lm_head_ctx 保护 .apply() 调用，
        算子内部直接执行分块 GEMM，累加标量损失，不保存任何中间 Logits，规避多层嵌套破坏 ZeRO-3 状态机。
     2. 反向：在 backward 内部统一进入一次 maybe_gather_lm_head_ctx，保证分块重算与 GEMM 累积期间权重处于 AVAILABLE 状态且全卡对齐。
-    3. 显式记录 compute_dtype 并全程采用 FP32 累加 grad_hidden 与 grad_weight，对标 TRL 精度与 Tensor Core 性能。
+    3. 显式记录 compute_dtype 并全程采用 FP32 累加 grad_hidden 与 grad_weight
     """
     @staticmethod
     def forward(
@@ -268,7 +268,6 @@ class ChunkedCrossEntropyFunction(torch.autograd.Function):
 class ChunkedLogProbFunction(torch.autograd.Function):
     """
     分块计算目标 token 的 log_probs，彻底避免物化 [B, S, V] 全量 Logits。
-    参考 TRL (trl/kernels/chunked_logprob.py:ChunkedLogProbFunction) 实现：
     - 统一捕获 compute_dtype 并在前反向中对齐矩阵乘精度；
     - 反向传播中 grad_hidden 与 grad_weight 均采用 FP32 缓冲区配合 _addmm_fp32 累加；
     - 区分连续切片视图 (is_all_valid=True) 与花式索引拷贝 (is_all_valid=False)，杜绝花式索引导致梯度丢失。

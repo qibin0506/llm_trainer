@@ -400,6 +400,7 @@ class PPOConfig:
         vf_coef (`float`): 总 Loss 中 Value Loss 的权重系数。
         kl_beta (`float`): 基于 KL 散度的初始惩罚奖励系数。
         kl_estimator (`str`): 计算近似 KL 散度的方法，支持 "k1" (log ratio) 或 "k3" (严格近似)。
+        value_loss_type (`str`): Value 损失函数类型，支持 "mse" (标准 0.5 * MSE) 或 "huber" (Smooth L1 Loss)。默认 "mse"。
         huber_delta (`float`): Value 损失函数中 Smooth L1 (Huber Loss) 的平滑阈值 beta。
         missing_eos_penalty (`Optional[float]`): 针对模型未能正常生成 EOS (结束符) 的硬性奖励惩罚值。
         normalize_rewards (`bool`): 是否在喂给 GAE 前对环境 Reward 进行标准化。
@@ -421,6 +422,7 @@ class PPOConfig:
     vf_coef: float = 0.1
     kl_beta: float = 0.02
     kl_estimator: str = 'k1'
+    value_loss_type: str = 'mse'
     huber_delta: float = 1.0
     missing_eos_penalty: Optional[float] = None
     normalize_rewards: bool = False

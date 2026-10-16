@@ -362,11 +362,14 @@ class ChunkedLogProbFunction(torch.autograd.Function):
 
                         chunk_max = logits_v.max(dim=-1).values
                         new_m = torch.maximum(m, chunk_max)
-                        s = s * torch.exp(m - new_m) + torch.exp(logits_v - new_m.unsqueeze(-1)).sum(dim=-1)
+                        safe_new_m = torch.where(torch.isinf(new_m), torch.zeros_like(new_m), new_m)
+                        rescale = torch.where(m == new_m, torch.ones_like(m), torch.exp(m - safe_new_m))
+                        s = s * rescale + torch.exp(logits_v - safe_new_m.unsqueeze(-1)).sum(dim=-1)
                         m = new_m
 
                     lse_c = m + torch.log(s)
-                    log_probs_flat[idx_c] = target_logits - lse_c
+                    safe_lse_c = torch.where(torch.isinf(lse_c), torch.zeros_like(lse_c), lse_c)
+                    log_probs_flat[idx_c] = target_logits - safe_lse_c
                     lse_flat[idx_c] = lse_c
 
         ctx.save_for_backward(hidden, weight, bias, targets, valid_indices, lse_flat)
@@ -466,7 +469,8 @@ class ChunkedLogProbFunction(torch.autograd.Function):
                             if temperature != 1.0:
                                 logits_v = logits_v * inv_t
 
-                            d_logits_v = torch.exp(logits_v - lse_c.unsqueeze(-1)).neg_()
+                            safe_lse_c = torch.where(torch.isinf(lse_c), torch.zeros_like(lse_c), lse_c)
+                            d_logits_v = torch.exp(logits_v - safe_lse_c.unsqueeze(-1)).neg_()
                             in_chunk = (tgt_c >= v_start) & (tgt_c < v_end)
                             if in_chunk.any():
                                 in_chunk_indices = torch.nonzero(in_chunk).squeeze(-1)
@@ -781,20 +785,30 @@ class PPOLoss(nn.Module):
             clip_eps: float,
             vf_coef: float,
             huber_delta: float = 1.0,
-            value_clip_eps: Optional[float] = None
+            value_clip_eps: Optional[float] = None,
+            value_loss_type: str = 'mse',
     ):
         """
         初始化PPO损失函数。
         :param clip_eps: PPO策略裁剪范围的epsilon值。
         :param vf_coef: 价值函数损失的系数。
-        :param huber_delta: Huber Loss 的阈值。
+        :param huber_delta: Huber Loss 的阈值（当 value_loss_type='huber' 时生效）。
         :param value_clip_eps: 价值函数裁剪范围的epsilon值。若为 None 则默认使用 clip_eps；若 <= 0 则禁用价值裁剪。
+        :param value_loss_type: 价值函数损失类型，支持 'mse' 或 'huber'。
         """
         super().__init__()
         self.clip_eps = clip_eps
         self.vf_coef = vf_coef
         self.huber_delta = huber_delta
         self.value_clip_eps = value_clip_eps if value_clip_eps is not None else clip_eps
+        self.value_loss_type = value_loss_type
+
+    def _compute_elementwise_vf_loss(self, pred_values: torch.Tensor, target_returns: torch.Tensor) -> torch.Tensor:
+        if self.value_loss_type == 'huber':
+            # F.smooth_l1_loss 内部在 |x - y| < beta 二次区间已包含 0.5 系数
+            return F.smooth_l1_loss(pred_values, target_returns, reduction='none', beta=self.huber_delta)
+        # 标准 PPO / TRL 的 MSE Value Loss: 0.5 * (V - R)^2，与 Huber 二次区间的 0.5 系数严格对齐
+        return 0.5 * ((pred_values - target_returns) ** 2)
 
     def forward(
             self,
@@ -834,13 +848,13 @@ class PPOLoss(nn.Module):
         # Value Loss (价值损失) with optional independent clipping
         if self.value_clip_eps is not None and self.value_clip_eps > 0:
             values_clipped = old_values + torch.clamp(values - old_values, -self.value_clip_eps, self.value_clip_eps)
-            vf_loss_unclipped = F.smooth_l1_loss(values, returns, reduction='none', beta=self.huber_delta)
-            vf_loss_clipped = F.smooth_l1_loss(values_clipped, returns, reduction='none', beta=self.huber_delta)
+            vf_loss_unclipped = self._compute_elementwise_vf_loss(values, returns)
+            vf_loss_clipped = self._compute_elementwise_vf_loss(values_clipped, returns)
             value_loss = torch.max(vf_loss_unclipped, vf_loss_clipped)
         else:
-            value_loss = F.smooth_l1_loss(values, returns, reduction='none', beta=self.huber_delta)
+            value_loss = self._compute_elementwise_vf_loss(values, returns)
 
-        # Apply mask and average (F.smooth_l1_loss 内部二次区间已包含 0.5 系数，无需外层再乘 0.5)
+        # Apply mask and average (MSE 与 Huber 内部均已包含 0.5 系数，外层无需重复乘 0.5)
         value_loss = (value_loss * value_mask).sum() / value_mask.sum().clamp(min=1.0)
         value_loss = value_loss * self.vf_coef
 

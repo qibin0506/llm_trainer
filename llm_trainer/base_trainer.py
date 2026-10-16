@@ -680,7 +680,7 @@ class BaseTrainer:
     def _apply_grad_clipping(self):
         clip_norm = self.train_config.gradient_clipping
         if clip_norm is not None and clip_norm > 0:
-            if self.is_ds:
+            if not self.is_ds:
                 self.scaler.unscale_(self.optimizer)
 
                 if hasattr(self.train_model, 'policy_model') and hasattr(self.train_model, 'value_model'):

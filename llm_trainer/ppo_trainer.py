@@ -473,7 +473,8 @@ class PPOTrainer(BaseTrainer):
             clip_eps=self.ppo_config.clip_eps,
             vf_coef=self.ppo_config.vf_coef,
             huber_delta=self.ppo_config.huber_delta,
-            value_clip_eps=self.ppo_config.value_clip_eps
+            value_clip_eps=self.ppo_config.value_clip_eps,
+            value_loss_type=self.ppo_config.value_loss_type,
         )
 
         return ppo_criterion

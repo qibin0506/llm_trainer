@@ -5,6 +5,7 @@ from itertools import islice
 
 import torch
 from torch.utils.data import Dataset
+import torch.distributed as dist
 
 from .base_trainer import BaseTrainer
 from .dataset import DPODataset
@@ -271,7 +272,15 @@ class DPOTrainer(BaseTrainer):
                             rejected_mask_sums = policy_mask_sums[chosen_inputs.shape[0]:]
 
                             # 采用标准 Token-level 交叉熵损失 (Token-level NLL)，避免“均值的均值”导致长短样本 token 梯度失衡
-                            nll_loss = -(policy_chosen_logps.sum() / chosen_mask_sums.sum().clamp(min=1.0))
+                            local_chosen_tokens = chosen_mask_sums.sum().float()
+                            if TrainerTools().parallel.parallel_train and torch.distributed.is_initialized():
+                                global_chosen_tokens = local_chosen_tokens.clone()
+                                dist.all_reduce(global_chosen_tokens, op=torch.distributed.ReduceOp.SUM)
+                                world_size = TrainerTools().parallel.world_size
+                                nll_loss = -(policy_chosen_logps.sum() * world_size / global_chosen_tokens.clamp(min=1.0))
+                            else:
+                                nll_loss = -(policy_chosen_logps.sum() / local_chosen_tokens.clamp(min=1.0))
+
                             ce_loss = nll_loss.detach()
 
                             # calc loss

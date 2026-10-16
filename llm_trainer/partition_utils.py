@@ -365,7 +365,7 @@ def _reset_zero3_state_machine(model: nn.Module) -> None:
         from .log import Logger
         Logger.std_log(f"WARN: _reset_zero3_state_machine encountered error: {e}")
 
-
+ChunkedLogProbFunction
 # 必选在maybe_gather_lm_head_ctx后面import
 from .loss import ChunkedLogProbFunction, ChunkedLMLoss
 

@@ -8,9 +8,9 @@
 提供多种解耦的生成服务实现：
 1. `SyncCentralGenerationService`: 中心化单卡集中同步生成，单点维护非切分副本，最大化节省显存。
 2. `ParallelGenerationService`: 分布式多卡并行生成，128MB 桶式底层广播极速同步，高吞吐并行采样。
-3. `MultiTurnRLGenerationService`: 多轮强化学习/Agent 环境交互生成服务，支持原生 In-Place 原地解包
-   与 Parallel 独立副本双模式，提供多线程环境并发、超时熔断、动态 Padding 与精准 generation_masks 梯度隔离。
-4. `ParallelMultiTurnRLGenerationService`: 专用的多卡并行多轮 RL 门面类，强化强类型检查与 API 对称性。
+3. `MultiTurnRLGenerationService`: 多轮强化学习/Agent 环境交互生成服务，统一支持原生 In-Place 原地解包
+   与 Parallel 独立推理副本双模式（传入 `model_config` 即可激活多卡独立副本与跨卡卸载，彻底杜绝 ZeRO-3 显存复合爆炸），
+   提供多线程环境并发、超时熔断、动态 Padding 与精准 generation_masks 梯度隔离。
 """
 
 from typing import Optional, Mapping, Tuple, Protocol, Dict, Any, List

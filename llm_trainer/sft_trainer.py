@@ -149,12 +149,13 @@ class SFTTrainer(BaseTrainer):
             labels,
             model: Optional[torch.nn.Module] = None,
             teacher_logits: Optional[torch.Tensor] = None,
-            kd_coef: float = 0.0
+            kd_coef: float = 0.0,
+            loss_denom: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if isinstance(result, dict) and "loss" in result:
             return result["loss"], result.get("ce_loss", result["loss"])
 
-        ce_loss = self.criterion(result['logits'], labels)
+        ce_loss = self.criterion(result['logits'], labels, loss_denom=loss_denom)
 
         if teacher_logits is None and self.sft_config.kd_config is not None and self.sft_config.kd_config.kd_coef > 0.0:
             teacher_logits, kd_coef = self._get_teacher_logits_and_kd_coef(inputs, attention_mask)
@@ -162,6 +163,6 @@ class SFTTrainer(BaseTrainer):
         if teacher_logits is None or kd_coef <= 0.0:
             return ce_loss, ce_loss
 
-        kd_loss = self.kd_loss(result['logits'], teacher_logits, labels)
+        kd_loss = self.kd_loss(result['logits'], teacher_logits, labels, loss_denom=loss_denom)
         total_loss = (1.0 - kd_coef) * ce_loss + kd_coef * kd_loss
         return total_loss, ce_loss

@@ -548,7 +548,7 @@ class PPOTrainer(BaseTrainer):
         batch_size = rewards.size(0)
         device = rewards.device
 
-        # 方案 1：跨轮单步桥接 GAE (Action-level Bridge GAE)
+        # 跨轮单步桥接 GAE (Action-level Bridge GAE)
         # 将环境反馈区间视为单步外部状态转移，避免在连续环境 token 上重复乘以 (gamma * lam)
         has_next_action = torch.zeros(batch_size, dtype=torch.bool, device=device)
         next_action_val = torch.zeros(batch_size, dtype=torch.float32, device=device)
@@ -915,6 +915,12 @@ class PPOTrainer(BaseTrainer):
                 (self.ppo_config.kl_beta == 0.0 or self.ref_model is None)
                 and (total_samples <= samples_per_accum_window)
         )
+        # 跨卡同步 can_skip_policy 布尔决策：只要任意一张卡需要执行 policy/ref 前向，所有卡必须一致进入 forward_type='both'，
+        # 防止多轮对话或样本数微小差异下 ZeRO-3 AllGather 通信队列错位死锁
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            skip_tensor = torch.tensor(1 if can_skip_policy else 0, dtype=torch.int32, device=device)
+            dist.all_reduce(skip_tensor, op=dist.ReduceOp.MIN)
+            can_skip_policy = bool(skip_tensor.item() == 1)
 
         eval_batch_size = self.rollout_eval_batch_size
         with torch.no_grad():

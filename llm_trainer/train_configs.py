@@ -399,7 +399,7 @@ class PPOConfig:
         value_clip_eps (`Optional[float]`): Critic 价值函数更新的裁剪阈值。若为 None 则默认使用 clip_eps。可设为更大值以适应不同 Reward 尺度，或设为 0 关闭价值裁剪。
         vf_coef (`float`): 总 Loss 中 Value Loss 的权重系数。
         kl_beta (`float`): 基于 KL 散度的初始惩罚奖励系数。
-        kl_estimator (`str`): 计算近似 KL 散度的方法，支持 "k1" (log ratio) 或 "k3" (严格近似)。
+        kl_estimator (`str`): 计算近似 KL 散度的方法，支持 "k1" (log ratio) 或 "k3" (Schulman 非负无偏估计器，默认 "k3")。
         value_loss_type (`str`): Value 损失函数类型，支持 "mse" (标准 0.5 * MSE) 或 "huber" (Smooth L1 Loss)。默认 "mse"。
         huber_delta (`float`): Value 损失函数中 Smooth L1 (Huber Loss) 的平滑阈值 beta。
         missing_eos_penalty (`Optional[float]`): 针对模型未能正常生成 EOS (结束符) 的硬性奖励惩罚值。
@@ -421,7 +421,7 @@ class PPOConfig:
     value_clip_eps: Optional[float] = None
     vf_coef: float = 0.1
     kl_beta: float = 0.02
-    kl_estimator: str = 'k1'
+    kl_estimator: str = 'k3'
     value_loss_type: str = 'mse'
     huber_delta: float = 1.0
     missing_eos_penalty: Optional[float] = None
@@ -456,7 +456,9 @@ class GRPOConfig:
         vespo_lambda_neg (`float`): VESPO 特定参数。
         dr_grpo_max_completion_len (`Optional[int]`): Dr. GRPO 算法使用的固定常数长度归一化因子。若为 None，自动使用当前 rollout 的 max_new_tokens，确保不退化为动态平均的 BNPO。
         scale_rewards (`Optional[bool]`): 是否在组内 Advantage 计算中除以标准差 (std)。若为 None，在 loss_type == 'dr_grpo' 时默认设为 False（符合 Dr. GRPO 算法规范），其他模式下默认设为 True。
+        use_bias_correction_kl (`bool`): 是否对 KL 散度惩罚项乘以重要性采样比率 (coef_1) 进行偏置修正（消除多 Epoch 或 Off-policy 下采样自旧策略造成的 KL 梯度偏移）。默认设为 True。
         token_level_loss_norm (`str`): Token 级损失归一化策略（适用于 'dapo', 'bnpo', 'cispo', 'vespo' 等）。可选 'global'（默认：按全局累积 Batch 的 Token 总量归一化，消除因 micro-batch 划分造成的长度梯度权重偏差）或 'micro_batch'（仅在当前单个 micro-batch 内部归一化）。
+        multi_turn_advantage_mode (`str`): 多轮对话模式下接收 2D 稠密 PRM 过程奖励时的优势分配模式。可选 'sequence' (默认：将 2D 奖励求和折叠为 1D 轨迹标量，整条轨迹所有 Token 共享全局标量优势) 或 'token' (细粒度 Token-level PRM 时序因果信用分配)。
         gamma (`float`): 多轮 Agent 强化学习的时间折扣衰减因子，默认 1.0 (纯因果 Reward-to-Go)。
         missing_eos_penalty (`Optional[float]`): 针对模型未能正常生成 EOS (结束符) 的硬性奖励惩罚值。
         generate_config (`GenerateConfig`): Rollout 时的采样与生成策略 (RL 默认 top_p=1.0 保证采样与求值无偏)。
@@ -482,10 +484,19 @@ class GRPOConfig:
     vespo_lambda_neg: float = 2.0
     dr_grpo_max_completion_len: Optional[int] = None
     scale_rewards: Optional[bool] = None
+    use_bias_correction_kl: bool = True
     token_level_loss_norm: str = 'global'
+    multi_turn_advantage_mode: str = 'sequence'
     gamma: float = 1.0
     missing_eos_penalty: Optional[float] = None
     generate_config: GenerateConfig = field(default_factory=lambda: GenerateConfig(top_p=1.0))
+
+    def __post_init__(self):
+        if self.loss_type == "cispo":
+            # CISPO 中 loss_clip_eps_high 代表重要性采样比率的绝对上界 (ScaleRL 论文推荐值为 5.0)
+            # 若沿用传统相对偏移默认值 0.28 或未设置，自动校准为 5.0
+            if self.loss_clip_eps_high is None or self.loss_clip_eps_high <= 1.0:
+                self.loss_clip_eps_high = 5.0
 
 
 @dataclass(kw_only=True)

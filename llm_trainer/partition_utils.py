@@ -3,7 +3,6 @@ import itertools
 import functools
 import types
 from contextlib import contextmanager, nullcontext
-from packaging import version
 
 import torch
 from torch import nn
@@ -306,20 +305,30 @@ def _remove_hooks(model: nn.Module) -> None:
 
 def _get_zero3_param_offload(model: nn.Module):
     """
-    获取 DeepSpeed ZeRO-3 的参数协调器宿主对象 (兼容含 optimizer 的训练引擎与 optimizer=None 的 ref_model 引擎)。
+    获取 DeepSpeed ZeRO-3 的参数协调器宿主对象 (兼容含 optimizer 的训练引擎、外层 Optimizer Wrapper 以及 optimizer=None 的 ref_model 引擎)。
     """
-    import deepspeed
-    if not isinstance(model, deepspeed.DeepSpeedEngine) or model.zero_optimization_stage() != 3:
-        return None
+    try:
+        import deepspeed
+        if not isinstance(model, deepspeed.DeepSpeedEngine) or model.zero_optimization_stage() != 3:
+            return None
+    except ImportError:
+        if getattr(model, "zero_optimization_stage", lambda: 0)() != 3:
+            return None
 
     optimizer = getattr(model, "optimizer", None)
-    if optimizer is not None:
-        if hasattr(optimizer, "parameter_offload"):
-            return optimizer.parameter_offload
-        return optimizer
-
-    if hasattr(model, "parameter_offload") and model.parameter_offload is not None:
-        return model.parameter_offload
+    inner_optimizer = getattr(optimizer, "optimizer", None) if optimizer is not None else None
+    candidates = [
+        getattr(optimizer, "parameter_offload", None) if optimizer is not None else None,
+        getattr(inner_optimizer, "parameter_offload", None) if inner_optimizer is not None else None,
+        getattr(model, "parameter_offload", None),
+        optimizer,
+        inner_optimizer,
+    ]
+    for cand in candidates:
+        if cand is not None and (
+            hasattr(cand, "param_coordinator") or hasattr(cand, "partition_all_parameters")
+        ):
+            return cand
 
     return None
 
@@ -365,9 +374,35 @@ def _reset_zero3_state_machine(model: nn.Module) -> None:
         from .log import Logger
         Logger.std_log(f"WARN: _reset_zero3_state_machine encountered error: {e}")
 
-ChunkedLogProbFunction
-# 必选在maybe_gather_lm_head_ctx后面import
+
+# 必须在 maybe_gather_lm_head_ctx 后面 import
 from .loss import ChunkedLogProbFunction, ChunkedLMLoss
+
+
+def _check_tied_embeddings_zero3_warning(origin_model: nn.Module, unwrapped: nn.Module, func_name: str):
+    if not isinstance(TrainerTools().parallel, DsParallel):
+        return
+
+    if origin_model.zero_optimization_stage() != 3:
+        return
+
+    lm_head = getattr(unwrapped, "lm_head", None)
+    embed_tokens = getattr(unwrapped, "embed_tokens", None)
+    is_tied = False
+    if lm_head is not None and embed_tokens is not None:
+        if getattr(lm_head, "weight", None) is getattr(embed_tokens, "weight", None):
+            is_tied = True
+    if not is_tied and hasattr(unwrapped, "config") and getattr(unwrapped.config, "tie_word_embeddings", False):
+        is_tied = True
+
+    if is_tied:
+        from .log import Logger
+        Logger.std_log(
+            f"WARNING: [ZeRO-3 & Fused Head Conflict] Model has `tie_word_embeddings=True` (lm_head.weight is embed_tokens.weight) "
+            f"while DeepSpeed ZeRO-3 is enabled. `{func_name}` manually gathers and partitions lm_head.weight during "
+            f"fused computation, which can conflict with DeepSpeed Parameter Coordinator's lifecycle tracking for embed_tokens. "
+            f"If encountering ZeRO-3 partition state mismatch, assertions or hang, consider untying embeddings or disabling fused head."
+        )
 
 
 def add_fused_loss_head(model: nn.Module, chunk_size: int):
@@ -377,6 +412,7 @@ def add_fused_loss_head(model: nn.Module, chunk_size: int):
     """
     unwrapped = unwrap_model(model)
     unwrapped._fused_loss_chunk_size = chunk_size
+    _check_tied_embeddings_zero3_warning(model, unwrapped, "add_fused_loss_head")
     if getattr(unwrapped, "_has_fused_loss_head", False):
         return unwrapped
 
@@ -392,6 +428,7 @@ def add_fused_loss_head(model: nn.Module, chunk_size: int):
         labels: Optional[torch.Tensor] = None,
         teacher_logits: Optional[torch.Tensor] = None,
         kd_coef: float = 0.0,
+        loss_denom: Optional[torch.Tensor] = None,
         return_logits: bool = True,
         output_hidden_states: bool = False,
         **kwargs
@@ -417,6 +454,7 @@ def add_fused_loss_head(model: nn.Module, chunk_size: int):
             lm_head_bias=getattr(lm_head, "bias", None),
             teacher_logits=teacher_logits,
             kd_coef=kd_coef,
+            loss_denom=loss_denom,
         )
 
         fused_outputs = dict(outputs)
@@ -431,7 +469,7 @@ def add_fused_loss_head(model: nn.Module, chunk_size: int):
     return unwrapped
 
 
-def add_fused_log_prob_head(model: nn.Module, chunk_size: int):
+def add_fused_log_prob_head(model: nn.Module, chunk_size: int, vocab_chunk_size: Optional[int] = None):
     """
     在模型被 DeepSpeed Engine 包装之前对 model.forward 进行 Monkey-Patch，
     实现主干前向与分块 LogProbs (ChunkedLogProbFunction) 计算的闭环封装。
@@ -440,6 +478,8 @@ def add_fused_log_prob_head(model: nn.Module, chunk_size: int):
     """
     unwrapped = unwrap_model(model)
     unwrapped._fused_log_prob_chunk_size = chunk_size
+    unwrapped._fused_log_prob_vocab_chunk_size = vocab_chunk_size
+    _check_tied_embeddings_zero3_warning(model, unwrapped, "add_fused_log_prob_head")
     if getattr(unwrapped, "_has_fused_log_prob_head", False):
         return unwrapped
 
@@ -461,6 +501,7 @@ def add_fused_log_prob_head(model: nn.Module, chunk_size: int):
     ):
         use_fused = fused_log_probs or fused_lm_head
         curr_chunk_size = getattr(self, "_fused_log_prob_chunk_size", chunk_size)
+        curr_vocab_chunk_size = getattr(self, "_fused_log_prob_vocab_chunk_size", vocab_chunk_size)
         if not use_fused or (labels is None and completion_ids is None):
             if labels is not None:
                 kwargs["labels"] = labels
@@ -496,9 +537,12 @@ def add_fused_log_prob_head(model: nn.Module, chunk_size: int):
                         labels[:, -comp_len:] = labels[:, -comp_len:].masked_fill(att_mask[:, -comp_len:] == 0, -100)
             else:
                 raise ValueError("input_ids must be provided to compute completion log_probs")
-        elif labels is not None and completion_mask is not None and comp_len is not None:
+        elif labels is not None and comp_len is not None:
             labels = labels.clone()
-            labels[:, -comp_len:] = labels[:, -comp_len:].masked_fill(~completion_mask.bool(), -100)
+            # 必须同步屏蔽 Prompt 区域，防止外部传入完整 labels 时 Prompt 区域误参与 ChunkedLogProb 计算
+            labels[:, :-comp_len] = -100
+            if completion_mask is not None:
+                labels[:, -comp_len:] = labels[:, -comp_len:].masked_fill(~completion_mask.bool(), -100)
 
         assert labels is not None, "labels must be provided or derivable in fused log_probs mode"
 
@@ -519,7 +563,8 @@ def add_fused_log_prob_head(model: nn.Module, chunk_size: int):
                 shift_labels[mask],
                 curr_chunk_size,
                 -100,
-                temperature
+                temperature,
+                curr_vocab_chunk_size,
             )
 
         # 即使当前 rank 的 mask 全为 False (per_token_logps 形状为 [0])，也必须保持 full_log_probs 连接到

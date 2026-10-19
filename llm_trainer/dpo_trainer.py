@@ -209,10 +209,17 @@ class DPOTrainer(BaseTrainer):
                     batch = skip_batches + batch
 
                     try:
-                        chosen_inputs: torch.Tensor = batch_data['chosen_inputs'].to(TrainerTools().parallel.device)
+                        raw_chosen_inputs = batch_data['chosen_inputs']
+                        raw_rejected_inputs = batch_data['rejected_inputs']
+                        has_padding = batch_data.get('has_padding', None)
+                        if has_padding is None:
+                            pad_id = TrainerTools().tokenizer.pad
+                            has_padding = bool(((raw_chosen_inputs == pad_id).any() or (raw_rejected_inputs == pad_id).any()).item())
+
+                        chosen_inputs: torch.Tensor = raw_chosen_inputs.to(TrainerTools().parallel.device)
                         chosen_labels: torch.Tensor = batch_data['chosen_labels'].to(TrainerTools().parallel.device)
 
-                        rejected_inputs: torch.Tensor = batch_data['rejected_inputs'].to(TrainerTools().parallel.device)
+                        rejected_inputs: torch.Tensor = raw_rejected_inputs.to(TrainerTools().parallel.device)
                         rejected_labels: torch.Tensor = batch_data['rejected_labels'].to(TrainerTools().parallel.device)
 
                         chosen_attention_masks: torch.Tensor = self._calc_attention_mask(chosen_inputs)
@@ -234,7 +241,8 @@ class DPOTrainer(BaseTrainer):
                                             attention_mask=concat_attention_masks,
                                             labels=concat_labels if use_fused else None,
                                             fused_log_probs=use_fused,
-                                            return_logits=not use_fused
+                                            return_logits=not use_fused,
+                                            has_padding=has_padding,
                                         )
                                         ref_data = ref_outputs['log_probs'] if use_fused else ref_outputs['logits']
                                         ref_logprobs_sums, ref_logprobs_means, _ = self._logprobs(ref_data, concat_labels, is_logprobs=use_fused)
@@ -255,7 +263,8 @@ class DPOTrainer(BaseTrainer):
                                 attention_mask=concat_attention_masks,
                                 labels=concat_labels if use_fused else None,
                                 fused_log_probs=use_fused,
-                                return_logits=not use_fused
+                                return_logits=not use_fused,
+                                has_padding=has_padding,
                             )
                             policy_data = policy_outputs['log_probs'] if use_fused else policy_outputs['logits']
                             policy_logprobs_sums, policy_logprobs_means, policy_mask_sums = self._logprobs(policy_data, concat_labels, is_logprobs=use_fused)
@@ -273,15 +282,24 @@ class DPOTrainer(BaseTrainer):
 
                             # 采用标准 Token-level 交叉熵损失 (Token-level NLL)，避免“均值的均值”导致长短样本 token 梯度失衡
                             local_chosen_tokens = chosen_mask_sums.sum().float()
+                            local_chosen_logps_sum = policy_chosen_logps.sum()
+
+                            # 记录未受分布式 world_size 缩放干扰的真实单卡 Token 平均交叉熵，用于指标监控与困惑度 (PPL) 计算
+                            ce_loss = (
+                                -(local_chosen_logps_sum / local_chosen_tokens.clamp(min=1.0)).detach()
+                                if local_chosen_tokens > 0
+                                else torch.tensor(0.0, device=policy_chosen_logps.device)
+                            )
+
                             if TrainerTools().parallel.parallel_train and torch.distributed.is_initialized():
                                 global_chosen_tokens = local_chosen_tokens.clone()
                                 dist.all_reduce(global_chosen_tokens, op=torch.distributed.ReduceOp.SUM)
                                 world_size = TrainerTools().parallel.world_size
-                                nll_loss = -(policy_chosen_logps.sum() * world_size / global_chosen_tokens.clamp(min=1.0))
+                                # 梯度回传使用带 world_size 缩放的 NLL，抵消 DDP / DeepSpeed 反向传播时对多卡梯度的 1/world_size 平均，
+                                # 确保各 Rank 反向传播的累计梯度等价于全局 Token 归一化
+                                nll_loss = -(local_chosen_logps_sum * world_size / global_chosen_tokens.clamp(min=1.0))
                             else:
-                                nll_loss = -(policy_chosen_logps.sum() / local_chosen_tokens.clamp(min=1.0))
-
-                            ce_loss = nll_loss.detach()
+                                nll_loss = -(local_chosen_logps_sum / local_chosen_tokens.clamp(min=1.0))
 
                             # calc loss
                             loss = self.criterion(

@@ -312,10 +312,10 @@ def batch_repeat_image_tok(
     for i, t in enumerate(new_tokens_list):
         pad_size = max_len - t.size(0)
         if pad_size > 0:
-            # 保持右侧或左侧一致填充
-            padded_tokens.append(F.pad(t, (0, pad_size), value=pad_id))
+            # 自回归生成要求左侧填充 (Left-Padding)，保证序列末尾对齐与 KV Cache / logits[:, -1, :] 采样正确
+            padded_tokens.append(F.pad(t, (pad_size, 0), value=pad_id))
             if has_mask:
-                padded_masks.append(F.pad(new_masks_list[i], (0, pad_size), value=0))
+                padded_masks.append(F.pad(new_masks_list[i], (pad_size, 0), value=0))
         else:
             padded_tokens.append(t)
             if has_mask:
@@ -331,14 +331,18 @@ def batch_repeat_image_tok(
 
 def pretrain_collate_fn(batch_data):
     # [[x,x,x], [y,y,y]]
-    inputs = pad_sequence(batch_data, batch_first=True, padding_value=TrainerTools().tokenizer.pad)
+    pad_id = TrainerTools().tokenizer.pad
+    inputs = pad_sequence(batch_data, batch_first=True, padding_value=pad_id)
     # crossEntropy默认的ignore_index是-100
     labels = pad_sequence(batch_data, batch_first=True, padding_value=-100)
+    # 在 CPU 侧提前判定当前 Batch 是否包含 Padding，避免在模型 forward 中对 GPU 张量调用 bool(attention_mask.all()) 触发同步阻塞
+    has_padding = bool((inputs == pad_id).any().item())
 
     # inputs, labels
     return {
         'inputs': inputs,
-        'labels': labels
+        'labels': labels,
+        'has_padding': has_padding
     }
 
 
@@ -366,10 +370,12 @@ def get_sft_collate_fn(mask_prompt: bool):
             batch_train_data.append(item['inputs'])
             image_tags.append(item.get('image_tag'))
 
+        pad_id = TrainerTools().tokenizer.pad
         # [[x,x,x], [y,y,y]]
-        inputs = pad_sequence(batch_train_data, batch_first=True, padding_value=TrainerTools().tokenizer.pad)
+        inputs = pad_sequence(batch_train_data, batch_first=True, padding_value=pad_id)
         # crossEntropy默认的ignore_index是-100
         labels = pad_sequence(batch_train_data, batch_first=True, padding_value=-100)
+        has_padding = bool((inputs == pad_id).any().item())
 
         if mask_prompt:
             labels = _mask_prompt(labels)
@@ -377,7 +383,8 @@ def get_sft_collate_fn(mask_prompt: bool):
         return {
             'inputs': inputs,
             'labels': labels,
-            'image_tags': image_tags
+            'image_tags': image_tags,
+            'has_padding': has_padding
         }
 
     return sft_collate_fn
@@ -395,13 +402,14 @@ def get_dpo_collate_fn(mask_prompt: bool):
         for key in ['chosen', 'rejected']:
             max_len = max(max(len(item[key]) for item in batch_data), max_len)
 
+        pad_id = TrainerTools().tokenizer.pad
         for item in batch_data:
             chosen_sequence = item['chosen']
-            chosen_inputs.append(chosen_sequence + [TrainerTools().tokenizer.pad] * (max_len - len(chosen_sequence)))
+            chosen_inputs.append(chosen_sequence + [pad_id] * (max_len - len(chosen_sequence)))
             chosen_labels.append(chosen_sequence + [-100] * (max_len - len(chosen_sequence)))
 
             rejected_sequence = item['rejected']
-            rejected_inputs.append(rejected_sequence + [TrainerTools().tokenizer.pad] * (max_len - len(rejected_sequence)))
+            rejected_inputs.append(rejected_sequence + [pad_id] * (max_len - len(rejected_sequence)))
             rejected_labels.append(rejected_sequence + [-100] * (max_len - len(rejected_sequence)))
 
         chosen_inputs = torch.tensor(chosen_inputs).long()
@@ -414,11 +422,14 @@ def get_dpo_collate_fn(mask_prompt: bool):
         if mask_prompt:
             rejected_labels = _mask_dpo_prompt(rejected_labels)
 
+        has_padding = bool(((chosen_inputs == pad_id).any() or (rejected_inputs == pad_id).any()).item())
+
         return {
             'chosen_inputs': chosen_inputs,
             'chosen_labels': chosen_labels,
             'rejected_inputs': rejected_inputs,
-            'rejected_labels': rejected_labels
+            'rejected_labels': rejected_labels,
+            'has_padding': has_padding
         }
 
     return dpo_collate_fn

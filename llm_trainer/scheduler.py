@@ -57,7 +57,8 @@ class WarmupCosineAnnealingLRScheduler(LRScheduler):
         self.param_group_indices = param_group_indices
 
         self._group_max_lrs = []
-        for g in self._optimizer.param_groups:
+        primary_groups = self._get_primary_param_groups()
+        for g in primary_groups:
             g_max = g.get('max_lr')
             if g_max is None:
                 params = g.get('params', [])
@@ -84,7 +85,25 @@ class WarmupCosineAnnealingLRScheduler(LRScheduler):
         else:
             self.logger = None
 
-        self._apply_lr(self._initial_lr)
+        # 由于训练循环中 optimizer.step() 先于 lr_scheduler.step() 执行，
+        # 初始化时直接设置第 1 个优化步应使用的学习率（当 warmup_iters > 0 时为 initial_lr + 1 * lr_increment，而非 0.0）
+        self._update_lr()
+
+    def _get_all_param_groups_lists(self) -> List[list]:
+        groups_lists = []
+        outer_groups = getattr(self._optimizer, 'param_groups', None)
+        if outer_groups is not None:
+            groups_lists.append(outer_groups)
+        inner_opt = getattr(self._optimizer, 'optimizer', None)
+        if inner_opt is not None:
+            inner_groups = getattr(inner_opt, 'param_groups', None)
+            if inner_groups is not None and inner_groups is not outer_groups:
+                groups_lists.append(inner_groups)
+        return groups_lists
+
+    def _get_primary_param_groups(self) -> list:
+        groups_lists = self._get_all_param_groups_lists()
+        return groups_lists[0] if groups_lists else []
 
     @property
     def cur_steps(self):
@@ -102,23 +121,26 @@ class WarmupCosineAnnealingLRScheduler(LRScheduler):
         self._current_lr = lr
         ratio = lr / max(self._max_lr, 1e-12)
 
-        if self.param_group_indices is None:
-            target_groups = self._optimizer.param_groups
-            target_max_lrs = self._group_max_lrs
-        else:
-            target_groups = [self._optimizer.param_groups[i] for i in self.param_group_indices]
-            target_max_lrs = [self._group_max_lrs[i] for i in self.param_group_indices]
+        for param_groups in self._get_all_param_groups_lists():
+            if self.param_group_indices is None:
+                target_groups = param_groups
+                target_max_lrs = self._group_max_lrs
+            else:
+                target_groups = [param_groups[i] for i in self.param_group_indices if i < len(param_groups)]
+                target_max_lrs = [self._group_max_lrs[i] for i in self.param_group_indices if i < len(self._group_max_lrs)]
 
-        for param_group, base_max_lr in zip(target_groups, target_max_lrs):
-            param_group['lr'] = base_max_lr * ratio
+            for param_group, base_max_lr in zip(target_groups, target_max_lrs):
+                param_group['lr'] = base_max_lr * ratio
 
         if self.logger:
             self.logger.log(f"step: {self.cur_steps}, lr: {lr}", log_to_console=False)
 
     def _update_lr(self):
-        # 1. Warmup 阶段优先判断
-        if self._steps <= self._warmup_iters:
-            lr = self._initial_lr + self._steps * self._lr_increment
+        # 1. Warmup 阶段优先判断：_steps 表示已完成的优化步数，因此下一步 (第 _steps + 1 步) 的预热进度为 (_steps + 1)
+        if self._steps < self._warmup_iters:
+            lr = self._initial_lr + (self._steps + 1) * self._lr_increment
+        elif self._steps == 0 and self._warmup_iters == 0:
+            lr = self._initial_lr
         # 2. 未配置余弦退火周期或周期 <= 0 时保持 max_lr
         elif not self._cosine_annealing_period or self._cosine_annealing_period <= 0:
             lr = self._max_lr

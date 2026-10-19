@@ -196,6 +196,7 @@ class GRPOTrainer(BaseTrainer):
             vespo_lambda_pos=self.grpo_config.vespo_lambda_pos,
             vespo_k_neg=self.grpo_config.vespo_k_neg,
             vespo_lambda_neg=self.grpo_config.vespo_lambda_neg,
+            use_bias_correction_kl=self.grpo_config.use_bias_correction_kl,
         )
 
         return grpo_criterion
@@ -307,7 +308,7 @@ class GRPOTrainer(BaseTrainer):
 
             # 当组内有效样本 < 2 或标准差极小时，不进行 std 缩放
             is_valid = (valid_counts >= 2) & (group_stds > 1e-6)
-            norm_adv = (rewards_by_group - group_means) / (group_stds + 1e-4)
+            norm_adv = (rewards_by_group - group_means) / (group_stds + 1e-8)
             advantages = torch.where(is_valid, norm_adv, torch.zeros_like(rewards_by_group))
         else:
             advantages = rewards_by_group - group_means
@@ -323,109 +324,27 @@ class GRPOTrainer(BaseTrainer):
             gamma: float = 1.0
     ) -> torch.Tensor:
         """
-        针对多轮交互 Agent 的因果时序信用分配 (Causal Reward-to-Go + Action-level Bridge Discount)。
+        针对多轮交互 Agent 的轨迹级整体评估。
 
-        - 轮内 Token: 属于同一次模型输出，共享本轮及未来的折现回报，轮内不额外衰减；
-        - 跨轮跃迁: 越过环境 Feedback 区间时乘以跨轮折扣 gamma；
-        - 组内对齐: 基于同 Prompt 组且在同一交互轮次内对齐计算基线均值与标准差，彻底消除跨轮时序负偏移偏差。
+        - 轨迹级评估: 每个候选样本在整条多轮轨迹结束时给出一个全局评分 R_i (若为 2D 稠密奖励则累加属于 Action 的有效增量)；
+        - 组内相对标准化: 基于同 Prompt 组计算均值与标准差，消除尺度与幸存者偏差；
+        - 共享优势: 整条轨迹的所有有效 Action Token 共享该标准化优势，彻底解决多轮 Return-to-Go 量纲与时间视界失配问题。
         """
-        batch_size, seq_len = rewards_tensor.shape
-        group_size = self.grpo_config.group_size
-        device = rewards_tensor.device
-
-        # 1. 识别每个 Token 所属的 Action 交互轮次 (Turn ID)
-        # Action 区间为 loss_mask == True 的连续段，每个连续段对应一次模型生成的交互轮次
-        is_turn_start = loss_mask & torch.cat(
-            [loss_mask.new_ones(batch_size, 1), ~loss_mask[:, :-1]],
-            dim=1
-        )
-        turn_ids = torch.cumsum(is_turn_start.long(), dim=1)  # [batch_size, seq_len]
-        max_turns = turn_ids.max().item()
-
-        # 若全序列无任何有效生成 Token，直接返回全零
-        if max_turns == 0:
-            return torch.zeros_like(rewards_tensor)
-
-        # 2. 统计各样本在每个交互轮次所获得的有效奖励 (Turn Rewards)
-        # 屏蔽非生成位置（Feedback / Pad）的噪声
-        masked_rewards = torch.where(
-            loss_mask,
-            rewards_tensor.float(),
-            torch.zeros_like(rewards_tensor, dtype=torch.float32)
-        )
-        valid_turn_ids = torch.where(loss_mask, turn_ids, torch.zeros_like(turn_ids))
-
-        turn_rewards = torch.zeros(batch_size, max_turns + 1, device=device, dtype=torch.float32)
-        turn_rewards.scatter_add_(dim=1, index=valid_turn_ids, src=masked_rewards)
-
-        # 标记各样本在每个交互轮次是否实际存在模型 Action（解决异构轮次下的虚假 0 统计偏差）
-        turn_active = torch.zeros(batch_size, max_turns + 1, dtype=torch.bool, device=device)
-        turn_active.scatter_(dim=1, index=valid_turn_ids, value=True)
-        turn_active = turn_active[:, 1:]  # [batch_size, max_turns]
-
-        # 3. 按因果时序反向累积计算各轮次的未来折现回报 (Turn-level Return-to-Go)
-        # G_{i, k} = R_{i, k} + gamma * G_{i, k+1}
-        turn_returns = torch.zeros(batch_size, max_turns + 1, device=device, dtype=torch.float32)
-        running_return = torch.zeros(batch_size, device=device, dtype=torch.float32)
-        for k in range(max_turns, 0, -1):
-            running_return = torch.where(
-                turn_active[:, k - 1],
-                turn_rewards[:, k] + gamma * running_return,
-                running_return
+        if rewards_tensor.dim() == 2:
+            masked_rewards = torch.where(
+                loss_mask,
+                rewards_tensor.float(),
+                torch.zeros_like(rewards_tensor, dtype=torch.float32)
             )
-            turn_returns[:, k] = running_return
-
-        # 4. 组内对齐基线：仅在当前轮次实际活跃且非 NaN 的有效候选间计算基线，若活跃候选 < 2 则回退到已终止样本的末轮回报
-        returns_by_group = turn_returns[:, 1:].view(-1, group_size, max_turns)
-        active_by_group = turn_active.view(-1, group_size, max_turns)
-
-        # 提取各候选最后一个活跃轮次的回报（而非第 1 轮总回报），消除跨轮折扣尺度失配
-        turn_idx_range = torch.arange(max_turns, device=device).view(1, 1, max_turns)
-        last_active_turn = torch.where(active_by_group, turn_idx_range, torch.tensor(0, device=device)).max(dim=-1,
-                                                                                                            keepdim=True).values
-        terminal_returns = returns_by_group.gather(dim=-1, index=last_active_turn)
-
-        active_non_nan = active_by_group & (~torch.isnan(returns_by_group))
-        active_counts = active_non_nan.sum(dim=1, keepdim=True)
-
-        # 当本轮活跃有效样本 >= 2 时仅对活跃样本求均值/方差；当 == 1 时引入已终止样本的末轮回报对比
-        fallback_returns = torch.where(active_by_group, returns_by_group, terminal_returns.expand_as(returns_by_group))
-        use_active_only = (active_counts >= 2).expand_as(returns_by_group)
-        baseline_mask = torch.where(use_active_only, active_non_nan, ~torch.isnan(fallback_returns))
-        baseline_vals = torch.where(baseline_mask, fallback_returns, torch.zeros_like(fallback_returns))
-
-        valid_counts = baseline_mask.float().sum(dim=1, keepdim=True)
-        group_means = baseline_vals.sum(dim=1, keepdim=True) / valid_counts.clamp(min=1.0)
-        diff = torch.where(baseline_mask, fallback_returns - group_means, torch.zeros_like(fallback_returns))
-        group_vars = (diff ** 2).sum(dim=1, keepdim=True) / (valid_counts - 1.0).clamp(min=1.0)
-        group_stds = torch.sqrt(group_vars)
-
-        scale_rewards = self.grpo_config.scale_rewards
-        if scale_rewards is None:
-            scale_rewards = (self.grpo_config.loss_type != "dr_grpo")
-
-        if scale_rewards:
-            is_valid = (valid_counts >= 2) & (group_stds > 1e-6) & active_non_nan
-            norm_adv = (returns_by_group - group_means) / (group_stds + 1e-4)
-            turn_adv = torch.where(is_valid, norm_adv, torch.zeros_like(returns_by_group))
+            trajectory_rewards = masked_rewards.sum(dim=-1)
+        elif rewards_tensor.dim() == 1:
+            trajectory_rewards = rewards_tensor.float()
         else:
-            turn_adv = torch.where(
-                (valid_counts >= 2) & active_non_nan,
-                returns_by_group - group_means,
-                torch.zeros_like(returns_by_group)
-            )
+            raise ValueError(f"Unsupported rewards_tensor dim: {rewards_tensor.dim()}, expected 1 or 2.")
 
-        # 5. 将各轮次标准化优势值精确广播映射回对应 Action Token
-        turn_adv = turn_adv.view(batch_size, max_turns)
-        turn_adv_padded = torch.cat(
-            [torch.zeros(batch_size, 1, device=device, dtype=turn_adv.dtype), turn_adv],
-            dim=1
-        )
+        # 标准组内相对优势计算，返回 [batch_size, 1] 标量优势
+        return self._compute_group_relative_advantages(trajectory_rewards)
 
-        advantages = torch.gather(turn_adv_padded, dim=1, index=turn_ids)
-        advantages = torch.where(loss_mask, advantages, torch.zeros_like(advantages))
-        advantages = torch.nan_to_num(advantages, nan=0.0, posinf=0.0, neginf=0.0)
-        return advantages.to(dtype=rewards_tensor.dtype)
 
     def _compute_token_level_prm_advantages(
             self,
@@ -434,13 +353,13 @@ class GRPOTrainer(BaseTrainer):
             gamma: float = 1.0
     ) -> torch.Tensor:
         """
-        针对单轮推理任务中 2D Token-level / Step-level PRM 过程奖励的细粒度因果时序信用分配。
+        针对单轮/多轮推理任务中 2D Token-level / Step-level PRM 过程奖励的细粒度因果时序信用分配。
 
         1. 沿时序从后向前反向累积计算各 Token 的因果未来折现回报 (Reward-to-Go):
            G_{i, t} = r_{i, t} + gamma * G_{i, t+1}
         2. 按同 Prompt 组在各时步活跃 Token 之间进行组内归一化：
-           - 多候选活跃 (active_counts >= 2): 同步活跃候选内部标准化；
-           - 单候选活跃 (active_counts == 1): 借调整体全轨迹相对优势；
+           - 处于活跃状态的候选根据其 Reward-to-Go 进行组内标准化；
+           - 已提前终止的候选在后续时步因果未来回报自然为 0.0，避免末步单 Token 奖励拉低基线导致长序列获得虚假正优势。
         3. 保留 Token-level 细粒度优势分布，彻底解决 PRM 奖励被粗暴求和退化为标量 ORM 的缺陷。
         """
         batch_size, seq_len = rewards_tensor.shape
@@ -462,60 +381,42 @@ class GRPOTrainer(BaseTrainer):
             running_r2g = torch.where(is_act, masked_rewards[:, t] + gamma * running_r2g, running_r2g)
             r2g[:, t] = torch.where(is_act, running_r2g, torch.zeros_like(running_r2g))
 
-        # 2. 组内归一化（过滤 NaN，且严格保持因果性，禁止将 t=0 全轨迹回报泄露给末尾单候选 Token）
+        # 2. 组内归一化：针对因果未来时序回报计算组相对优势
         r2g_by_group = r2g.view(-1, group_size, seq_len)
         valid_mask_by_group = loss_mask.view(-1, group_size, seq_len) & (~torch.isnan(r2g_by_group))
-        mask_float = valid_mask_by_group.float()
-        active_counts = mask_float.sum(dim=1, keepdim=True)  # [num_groups, 1, seq_len]
 
-        safe_r2g = torch.where(valid_mask_by_group, r2g_by_group, torch.zeros_like(r2g_by_group))
-        group_means = safe_r2g.sum(dim=1, keepdim=True) / active_counts.clamp(min=1.0)
+        # 对于已提前终止的短序列，在其终止后的未来时间步，其因果未来折现回报自然为 0.0。
+        # 严禁错误地使用末步单 Token 奖励 (r_L) 作为常数填充拉低基准，导致劣质长序列尾部获得虚假正优势。
+        fallback_r2g = torch.where(valid_mask_by_group, r2g_by_group, torch.zeros_like(r2g_by_group))
+        has_any_valid = valid_mask_by_group.any(dim=-1, keepdim=True)
+        baseline_mask = (~torch.isnan(fallback_r2g)) & has_any_valid
+        valid_counts = baseline_mask.float().sum(dim=1, keepdim=True)
+
+        safe_r2g = torch.where(baseline_mask, fallback_r2g, torch.zeros_like(fallback_r2g))
+        group_means = safe_r2g.sum(dim=1, keepdim=True) / valid_counts.clamp(min=1.0)
         diff_sq = torch.where(
-            valid_mask_by_group,
+            baseline_mask,
             (safe_r2g - group_means) ** 2,
             torch.zeros_like(safe_r2g)
         )
-        group_vars = diff_sq.sum(dim=1, keepdim=True) / (active_counts - 1.0).clamp(min=1.0)
+        group_vars = diff_sq.sum(dim=1, keepdim=True) / (valid_counts - 1.0).clamp(min=1.0)
         group_stds = torch.sqrt(group_vars)
-
-        # 提取各候选在最后一个有效 Token 处的末步回报（用于 active_counts == 1 时因果对比，不泄露 t=0 历史奖励）
-        seq_indices = torch.arange(seq_len, device=device).unsqueeze(0)
-        last_valid_idx = torch.where(loss_mask, seq_indices, torch.tensor(0, device=device)).max(dim=1,
-                                                                                                 keepdim=True).values
-        terminal_returns = r2g.gather(dim=1, index=last_valid_idx).view(-1, group_size, 1)
-        term_valid = ~torch.isnan(terminal_returns)
-        term_counts = term_valid.float().sum(dim=1, keepdim=True)
-        safe_term = torch.where(term_valid, terminal_returns, torch.zeros_like(terminal_returns))
-        term_means = safe_term.sum(dim=1, keepdim=True) / term_counts.clamp(min=1.0)
-        term_diff_sq = torch.where(term_valid, (safe_term - term_means) ** 2, torch.zeros_like(safe_term))
-        term_stds = torch.sqrt(term_diff_sq.sum(dim=1, keepdim=True) / (term_counts - 1.0).clamp(min=1.0))
 
         scale_rewards = self.grpo_config.scale_rewards
         if scale_rewards is None:
             scale_rewards = (self.grpo_config.loss_type != "dr_grpo")
 
         if scale_rewards:
-            valid_multi = (active_counts >= 2) & (group_stds > 1e-6) & valid_mask_by_group
-            norm_adv_multi = (safe_r2g - group_means) / (group_stds + 1e-4)
-            adv_multi = torch.where(valid_multi, norm_adv_multi, torch.zeros_like(safe_r2g))
-
-            valid_single = (active_counts == 1) & (term_counts >= 2) & (term_stds > 1e-6) & valid_mask_by_group
-            norm_adv_single = (safe_r2g - term_means) / (term_stds + 1e-4)
-            adv_single = torch.where(valid_single, norm_adv_single, torch.zeros_like(safe_r2g))
-
-            advantages = torch.where(active_counts >= 2, adv_multi, adv_single)
+            # 仅对当前有效生成 Token 计算非零优势
+            is_valid = (valid_counts >= 2) & (group_stds > 1e-6) & valid_mask_by_group
+            norm_adv = (r2g_by_group - group_means) / (group_stds + 1e-8)
+            advantages = torch.where(is_valid, norm_adv, torch.zeros_like(r2g_by_group))
         else:
-            adv_multi = torch.where(
-                (active_counts >= 2) & valid_mask_by_group,
-                safe_r2g - group_means,
-                torch.zeros_like(safe_r2g)
+            advantages = torch.where(
+                (valid_counts >= 2) & valid_mask_by_group,
+                r2g_by_group - group_means,
+                torch.zeros_like(r2g_by_group)
             )
-            adv_single = torch.where(
-                (active_counts == 1) & (term_counts >= 2) & valid_mask_by_group,
-                safe_r2g - term_means,
-                torch.zeros_like(safe_r2g)
-            )
-            advantages = torch.where(active_counts >= 2, adv_multi, adv_single)
 
         advantages = advantages.view(batch_size, seq_len)
         advantages = torch.where(loss_mask, advantages, torch.zeros_like(advantages))
@@ -721,6 +622,11 @@ class GRPOTrainer(BaseTrainer):
         accum_steps = self.gradient_accumulation_steps
         samples_per_accum_window = self.grpo_config.grpo_batch_size * accum_steps
         can_skip_rollout_forward = (total_samples <= samples_per_accum_window)
+        # 跨卡同步 can_skip_rollout_forward 布尔决策，防止多卡样本数不一致时 ZeRO-3 AllGather 死锁
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            skip_tensor = torch.tensor(1 if can_skip_rollout_forward else 0, dtype=torch.int32, device=device)
+            dist.all_reduce(skip_tensor, op=dist.ReduceOp.MIN)
+            can_skip_rollout_forward = bool(skip_tensor.item() == 1)
 
         eval_batch_size = self.rollout_eval_batch_size
         with torch.no_grad():
@@ -793,7 +699,7 @@ class GRPOTrainer(BaseTrainer):
             # 单轮模式：只要 completion 中包含 eos_token_id 即视为正常结束
             has_eos = torch.any(completion_ids == eos_token_id, dim=1)
 
-        if getattr(self.grpo_config, 'missing_eos_penalty', None) is not None:
+        if self.grpo_config.missing_eos_penalty is not None:
             penalty = self.grpo_config.missing_eos_penalty
             if rewards_tensor.dim() == 2:
                 missing_eos_mask = (~has_eos) & valid_indices_mask
@@ -810,15 +716,13 @@ class GRPOTrainer(BaseTrainer):
 
         if is_multi_turn:
             if rewards_tensor.dim() == 1:
-                # 多轮 RL 模式下接收 1D 轨迹标量奖励：精准注入到各样本最后一个有效 Action Token 上，
-                # 随后通过 _compute_multi_turn_advantages 沿历史轮次反向折现传递 (Reward-to-Go)，
-                # 彻底消除多轮 1D 奖励退化为单轮标量处理的旁路缺陷
-                dense_rewards = torch.zeros_like(completion_ids, dtype=torch.float32)
-                if valid_indices_mask.any():
-                    valid_batch = batch_range[valid_indices_mask]
-                    valid_last = last_token_indices[valid_indices_mask]
-                    dense_rewards[valid_batch, valid_last] = rewards_tensor[valid_indices_mask]
+                # 多轮 RL 模式下接收 1D 轨迹标量奖励 R_i
                 rewards = rewards_tensor
+                advantages = self._compute_multi_turn_advantages(
+                    rewards_tensor=rewards,
+                    loss_mask=loss_mask,
+                    gamma=self.grpo_config.gamma
+                )
             else:
                 assert rewards_tensor.shape == completion_ids.shape, (
                     f"2D dense reward shape {rewards_tensor.shape} must match completion_ids shape {completion_ids.shape}"
@@ -829,16 +733,25 @@ class GRPOTrainer(BaseTrainer):
                     loss_mask,
                     context_desc="GRPO"
                 )
-                dense_rewards = rewards_tensor
-                masked_rewards = torch.where(loss_mask, dense_rewards.float(), torch.zeros_like(dense_rewards, dtype=torch.float32))
+                masked_rewards = torch.where(loss_mask, rewards_tensor.float(), torch.zeros_like(rewards_tensor, dtype=torch.float32))
                 rewards = masked_rewards.sum(dim=-1)
 
-            # 多轮因果时序信用分配 (Reward-to-Go + Action-level Bridge Discount)
-            advantages = self._compute_multi_turn_advantages(
-                rewards_tensor=dense_rewards,
-                loss_mask=loss_mask,
-                gamma=getattr(self.grpo_config, 'gamma', 1.0)
-            )
+                if self.grpo_config.multi_turn_advantage_mode == 'sequence':
+                    # 针对多轮交互 Agent 的轨迹级整体评估
+                    # 每个候选样本在整条多轮轨迹结束时给出一个全局评分 R_i，同 Prompt 组内对齐计算标准化优势，
+                    # 属于该样本的所有有效 Action Token 共享这一全局标量优势，彻底消除跨轮时序量纲失配与幸存者偏差
+                    advantages = self._compute_multi_turn_advantages(
+                        rewards_tensor=rewards,
+                        loss_mask=loss_mask,
+                        gamma=self.grpo_config.gamma
+                    )
+                else:
+                    # 针对多轮交互中 2D Dense PRM 过程奖励的细粒度 Token/Step-level 时序因果信用分配
+                    advantages = self._compute_token_level_prm_advantages(
+                        rewards_tensor=rewards_tensor,
+                        loss_mask=loss_mask,
+                        gamma=self.grpo_config.gamma
+                    )
         elif rewards_tensor.dim() == 2:
             assert rewards_tensor.shape == completion_ids.shape, (
                 f"2D dense reward shape {rewards_tensor.shape} must match completion_ids shape {completion_ids.shape}"
@@ -850,7 +763,7 @@ class GRPOTrainer(BaseTrainer):
             advantages = self._compute_token_level_prm_advantages(
                 rewards_tensor=dense_rewards,
                 loss_mask=loss_mask,
-                gamma=getattr(self.grpo_config, 'gamma', 1.0)
+                gamma=self.grpo_config.gamma
             )
         elif rewards_tensor.dim() == 1:
             # 单轮模式 1D 标量轨迹奖励：标准组内相对优势计算
@@ -928,19 +841,21 @@ class GRPOTrainer(BaseTrainer):
 
             if use_global_token_norm:
                 local_window_tokens = torch.zeros(num_accum_windows, device=device, dtype=torch.float32)
+                window_divisors = torch.ones(num_accum_windows, device=device, dtype=torch.float32)
+                world_size = TrainerTools().parallel.world_size
                 for w in range(num_accum_windows):
                     w_start = w * samples_per_accum_window
                     w_end = min(w_start + samples_per_accum_window, total_samples)
                     w_indices = indices[w_start:w_end]
                     local_window_tokens[w] = loss_mask[w_indices].sum().float()
+                    w_accum_steps = max(math.ceil((w_end - w_start) / grpo_batch_size), 1)
+                    window_divisors[w] = max(float(world_size * w_accum_steps), 1.0)
 
                 if TrainerTools().parallel.parallel_train and dist.is_initialized():
                     dist.all_reduce(local_window_tokens, op=dist.ReduceOp.SUM)
 
-                # 先 clamp(min=1.0) 保证总 Token 非零，然后再除以 effective_divisor
-                world_size = TrainerTools().parallel.world_size
-                effective_divisor = max(float(world_size * accum_steps), 1.0)
-                window_norm_factors = local_window_tokens.clamp(min=1.0) / effective_divisor
+                # 先 clamp(min=1.0) 保证总 Token 非零，然后再除以各窗口实际的 effective_divisor
+                window_norm_factors = local_window_tokens.clamp(min=1.0) / window_divisors
             else:
                 window_norm_factors = None
 
@@ -965,7 +880,6 @@ class GRPOTrainer(BaseTrainer):
                 if self.grpo_config.loss_type == "dr_grpo":
                     completion_len_for_loss = (
                             self.grpo_config.dr_grpo_max_completion_len
-                            or rollout_data.get('max_new_tokens')
                             or self.grpo_config.generate_config.max_seq_len
                     )
                 else:

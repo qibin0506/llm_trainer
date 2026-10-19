@@ -611,7 +611,8 @@ class BaseTrainer:
             labels: torch.Tensor,
             model: Optional[torch.nn.Module] = None,
             teacher_logits: Optional[torch.Tensor] = None,
-            kd_coef: float = 0.0
+            kd_coef: float = 0.0,
+            loss_denom: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]: ...
 
     def _get_teacher_logits_and_kd_coef(
@@ -625,7 +626,9 @@ class BaseTrainer:
             inputs: torch.Tensor,
             attention_mask: Optional[torch.Tensor],
             pixel_values: Optional[torch.Tensor],
-            labels: torch.Tensor
+            labels: torch.Tensor,
+            loss_denom: Optional[torch.Tensor] = None,
+            has_padding: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         teacher_logits, kd_coef = self._get_teacher_logits_and_kd_coef(inputs, attention_mask)
         if getattr(self, "chunked_cross_entropy_size", None) is not None:
@@ -637,7 +640,9 @@ class BaseTrainer:
                 fused_loss=True,
                 teacher_logits=teacher_logits,
                 kd_coef=kd_coef,
-                return_logits=False
+                loss_denom=loss_denom,
+                return_logits=False,
+                has_padding=has_padding,
             )
             loss = result["loss"]
             ce_loss = result.get("ce_loss", loss)
@@ -646,7 +651,8 @@ class BaseTrainer:
                 inputs,
                 attention_mask=attention_mask,
                 pixel_values=pixel_values,
-                return_logits=self.return_logits
+                return_logits=self.return_logits,
+                has_padding=has_padding,
             )
             loss, ce_loss = self._calc_loss(
                 inputs,
@@ -655,7 +661,8 @@ class BaseTrainer:
                 labels,
                 model=model,
                 teacher_logits=teacher_logits,
-                kd_coef=kd_coef
+                kd_coef=kd_coef,
+                loss_denom=loss_denom,
             )
 
         del teacher_logits
@@ -938,105 +945,146 @@ class BaseTrainer:
                 if skip_batches > 0:
                     data_iterator = islice(data_iterator, skip_batches, None)
 
-                for batch, batch_data in enumerate(data_iterator):
-                    if self.resume_rng_state is not None:
-                        restore_rng_state_dict(self.resume_rng_state)
-                        self.resume_rng_state = None
+                current_batch_idx = skip_batches
+                vocab_size = self.train_config.model_config.vocab_size
 
-                    batch = skip_batches + batch
+                while current_batch_idx < batch_count_per_file:
+                    window_end = min(
+                        (current_batch_idx // self.gradient_accumulation_steps + 1) * self.gradient_accumulation_steps,
+                        batch_count_per_file
+                    )
+                    window_size = window_end - current_batch_idx
+                    window_batches = list(islice(data_iterator, window_size))
+                    if not window_batches:
+                        break
 
-                    inputs = batch_data['inputs']
-                    labels = batch_data['labels']
+                    actual_accum_steps = len(window_batches)
 
-                    try:
-                        inputs, labels = inputs.to(TrainerTools().parallel.device), labels.to(TrainerTools().parallel.device)
-                        attention_mask = self._calc_attention_mask(inputs)
-                        pixel_values = self._get_pixel_values(batch_data)
+                    # 在累积窗口级别统计全局有效 Token 总数，消除同一累积窗口内不同 micro-batch 间因有效长度差异造成的梯度权重偏置
+                    local_window_valid_tokens = 0
+                    for b_data in window_batches:
+                        b_labels = b_data['labels']
+                        shift_b_labels = b_labels[..., 1:]
+                        valid_mask = (shift_b_labels != -100) & (shift_b_labels >= 0) & (shift_b_labels < vocab_size)
+                        local_window_valid_tokens += int(valid_mask.sum().item())
 
-                        with autocast(TrainerTools().parallel.device_type):
-                            total_loss_unscaled, ce_loss, aux_loss = self._step_forward_and_loss(
-                                self.train_model,
-                                inputs,
-                                attention_mask,
-                                pixel_values,
-                                labels
-                            )
+                    window_valid_tokens = torch.tensor(
+                        float(local_window_valid_tokens),
+                        dtype=torch.float32,
+                        device=TrainerTools().parallel.device
+                    )
+                    world_size = 1
+                    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+                        world_size = dist.get_world_size()
+                        dist.all_reduce(window_valid_tokens, op=dist.ReduceOp.SUM)
 
-                        window_start = (batch // self.gradient_accumulation_steps) * self.gradient_accumulation_steps
-                        actual_accum_steps = min(self.gradient_accumulation_steps, batch_count_per_file - window_start)
+                    # 由于后续 backward 及 _avg_loss 均会除以 actual_accum_steps 并在 world_size 张卡间求平均，
+                    # 此处将单 micro-batch 的归一化分母设为 window_valid_tokens / (world_size * actual_accum_steps)
+                    loss_denom = window_valid_tokens.clamp(min=1.0) / float(world_size * actual_accum_steps)
 
-                        # 每个文件的最后一个 batch 作为累积边界强制提交梯度，确保每个文件起点 batches_accumulated 恒为 0，
-                        is_last_step = (batch == batch_count_per_file - 1)
+                    for step_in_window, batch_data in enumerate(window_batches):
+                        if self.resume_rng_state is not None:
+                            restore_rng_state_dict(self.resume_rng_state)
+                            self.resume_rng_state = None
 
-                        need_update_step = self._need_update_step(batches_accumulated, is_last_step)
-                        if self.is_ds:
-                            if actual_accum_steps < self.gradient_accumulation_steps:
-                                scale_factor = self.gradient_accumulation_steps / actual_accum_steps
-                                self._backward_loss(total_loss_unscaled * scale_factor, actual_accum_steps)
-                            else:
-                                self._backward_loss(total_loss_unscaled, self.gradient_accumulation_steps)
-                        else:
-                            self._backward_loss(total_loss_unscaled, actual_accum_steps)
+                        batch = current_batch_idx + step_in_window
 
-                        loss_accumulation += total_loss_unscaled.detach().item()
-                        aux_loss_accumulation += aux_loss.detach().item()
-                        ce_loss_accumulation += ce_loss.detach().item()
-                        batches_accumulated += 1
+                        inputs = batch_data['inputs']
+                        labels = batch_data['labels']
+                        has_padding = batch_data.get('has_padding', None)
+                        if has_padding is None:
+                            has_padding = bool((inputs == TrainerTools().tokenizer.pad).any().item())
 
-                        if need_update_step:
-                            self._update_step(is_last_step=is_last_step)
-                            global_steps_since_last_save += 1
-                            global_steps_since_last_eval += 1
+                        try:
+                            inputs, labels = inputs.to(TrainerTools().parallel.device), labels.to(TrainerTools().parallel.device)
+                            attention_mask = self._calc_attention_mask(inputs)
+                            pixel_values = self._get_pixel_values(batch_data)
 
-                            avg_loss, avg_aux_loss, avg_ce_loss = self._avg_loss(
-                                losses=[
-                                    loss_accumulation,
-                                    aux_loss_accumulation,
-                                    ce_loss_accumulation
-                                ],
-                                batches_accumulated=batches_accumulated
-                            )
-
-                            try:
-                                perplexity = math.exp(avg_ce_loss) if avg_ce_loss < 20 else float('inf')
-                            except OverflowError:
-                                perplexity = float('inf')
-
-                            self._log(
-                                keys={
-                                    'epoch': epoch,
-                                    'file': f'{file_idx + 1}/{file_count}',
-                                    'batch': f'{batch + 1}/{batch_count_per_file}'
-                                },
-                                values={
-                                    'loss/total': avg_loss,
-                                    'loss/moe_aux': avg_aux_loss,
-                                    'metrics/ppl': round(perplexity, 4) if avg_ce_loss > 0 else float('inf')
-                                }
-                            )
-
-                            # reset to default
-                            loss_accumulation = 0.0
-                            aux_loss_accumulation = 0.0
-                            ce_loss_accumulation = 0.0
-                            batches_accumulated = 0
-
-                            if 0 < self.train_config.save_interval <= global_steps_since_last_save:
-                                save_checkpoint(model=self.train_model, optimizer=self.optimizer)
-                                save_steps(
-                                    epoch=epoch,
-                                    file_idx=file_idx,
-                                    batch_idx=batch + 1,
-                                    lr_scheduler=self.lr_scheduler,
-                                    dataloader_rng_state=dataloader_rng_state
+                            with autocast(TrainerTools().parallel.device_type):
+                                total_loss_unscaled, ce_loss, aux_loss = self._step_forward_and_loss(
+                                    self.train_model,
+                                    inputs,
+                                    attention_mask,
+                                    pixel_values,
+                                    labels,
+                                    loss_denom=loss_denom,
+                                    has_padding=has_padding,
                                 )
-                                global_steps_since_last_save = 0
 
-                            if 0 < self.train_config.eval_interval <= global_steps_since_last_eval:
-                                self._on_batch_end(tag=f'epoch:{epoch}/batch:{batch}')
-                                global_steps_since_last_eval = 0
-                    except Exception as e:
-                        self._on_exception(e, epoch, batch)
+                            # 每个文件的最后一个 batch 作为累积边界强制提交梯度，确保每个文件起点 batches_accumulated 恒为 0，
+                            is_last_step = (batch == batch_count_per_file - 1)
+
+                            need_update_step = self._need_update_step(batches_accumulated, is_last_step)
+                            if self.is_ds:
+                                if actual_accum_steps < self.gradient_accumulation_steps:
+                                    scale_factor = self.gradient_accumulation_steps / actual_accum_steps
+                                    self._backward_loss(total_loss_unscaled * scale_factor, actual_accum_steps)
+                                else:
+                                    self._backward_loss(total_loss_unscaled, self.gradient_accumulation_steps)
+                            else:
+                                self._backward_loss(total_loss_unscaled, actual_accum_steps)
+
+                            loss_accumulation += total_loss_unscaled.detach().item()
+                            aux_loss_accumulation += aux_loss.detach().item()
+                            ce_loss_accumulation += ce_loss.detach().item()
+                            batches_accumulated += 1
+
+                            if need_update_step:
+                                self._update_step(is_last_step=is_last_step)
+                                global_steps_since_last_save += 1
+                                global_steps_since_last_eval += 1
+
+                                avg_loss, avg_aux_loss, avg_ce_loss = self._avg_loss(
+                                    losses=[
+                                        loss_accumulation,
+                                        aux_loss_accumulation,
+                                        ce_loss_accumulation
+                                    ],
+                                    batches_accumulated=batches_accumulated
+                                )
+
+                                try:
+                                    perplexity = math.exp(avg_ce_loss) if avg_ce_loss < 20 else float('inf')
+                                except OverflowError:
+                                    perplexity = float('inf')
+
+                                self._log(
+                                    keys={
+                                        'epoch': epoch,
+                                        'file': f'{file_idx + 1}/{file_count}',
+                                        'batch': f'{batch + 1}/{batch_count_per_file}'
+                                    },
+                                    values={
+                                        'loss/total': avg_loss,
+                                        'loss/moe_aux': avg_aux_loss,
+                                        'metrics/ppl': round(perplexity, 4) if avg_ce_loss > 0 else float('inf')
+                                    }
+                                )
+
+                                # reset to default
+                                loss_accumulation = 0.0
+                                aux_loss_accumulation = 0.0
+                                ce_loss_accumulation = 0.0
+                                batches_accumulated = 0
+
+                                if 0 < self.train_config.save_interval <= global_steps_since_last_save:
+                                    save_checkpoint(model=self.train_model, optimizer=self.optimizer)
+                                    save_steps(
+                                        epoch=epoch,
+                                        file_idx=file_idx,
+                                        batch_idx=batch + 1,
+                                        lr_scheduler=self.lr_scheduler,
+                                        dataloader_rng_state=dataloader_rng_state
+                                    )
+                                    global_steps_since_last_save = 0
+
+                                if 0 < self.train_config.eval_interval <= global_steps_since_last_eval:
+                                    self._on_batch_end(tag=f'epoch:{epoch}/batch:{batch}')
+                                    global_steps_since_last_eval = 0
+                        except Exception as e:
+                            self._on_exception(e, epoch, batch)
+
+                    current_batch_idx += actual_accum_steps
 
                 if self.resume_rng_state is not None:
                     restore_rng_state_dict(self.resume_rng_state)
@@ -1048,6 +1096,7 @@ class BaseTrainer:
                     del dataset
                     del data_iterator
                     del dataloader_rng_state
+                    del window_batches
                     del batch_data
                     del inputs
                     del labels

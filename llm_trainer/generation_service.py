@@ -588,78 +588,105 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
             gen_model = getattr(unwrapped_model, 'policy_model', unwrapped_model)
             was_training = unwrapped_model.training
             unwrapped_model.eval()
+            try:
+                for turn in range(self.max_turns):
+                    for i in range(batch_size):
+                        if not loop_dones[i]:
+                            actual_len = (current_prompts[i] != pad_token_id).sum().item()
+                            if actual_len >= generate_config.max_seq_len or len(trajectories[i]) >= max_completion_budget:
+                                loop_dones[i] = True
 
-            for turn in range(self.max_turns):
-                for i in range(batch_size):
-                    if not loop_dones[i]:
-                        actual_len = (current_prompts[i] != pad_token_id).sum().item()
-                        if actual_len >= generate_config.max_seq_len or len(trajectories[i]) >= max_completion_budget:
-                            loop_dones[i] = True
+                    local_all_done = torch.tensor(1 if all(loop_dones) else 0, device=device)
+                    if TrainerTools().parallel.world_size > 1:
+                        dist.all_reduce(local_all_done, op=dist.ReduceOp.SUM)
 
-                local_all_done = torch.tensor(1 if all(loop_dones) else 0, device=device)
-                if TrainerTools().parallel.world_size > 1:
-                    dist.all_reduce(local_all_done, op=dist.ReduceOp.SUM)
+                    if local_all_done.item() == TrainerTools().parallel.world_size:
+                        break
 
-                if local_all_done.item() == TrainerTools().parallel.world_size:
-                    break
+                    active_indices = [i for i, d in enumerate(loop_dones) if not d]
 
-                active_indices = [i for i, d in enumerate(loop_dones) if not d]
+                    if not active_indices:
+                        active_prompts = torch.tensor([[pad_token_id]], dtype=torch.long, device=device)
+                        attention_mask = torch.ones((1, 1), dtype=torch.long, device=device)
+                        local_remaining_max_tokens = 1
+                        active_pixel_values = None
+                        cur_prompt_len = 1
+                    else:
+                        active_prompts = current_prompts[active_indices]
+                        non_pad_mask = (active_prompts != pad_token_id).any(dim=0)
 
-                if not active_indices:
-                    active_prompts = torch.tensor([[pad_token_id]], dtype=torch.long, device=device)
-                    attention_mask = torch.ones((1, 1), dtype=torch.long, device=device)
-                    local_remaining_max_tokens = 1
-                    active_pixel_values = None
-                    cur_prompt_len = 1
-                else:
-                    active_prompts = current_prompts[active_indices]
-                    non_pad_mask = (active_prompts != pad_token_id).any(dim=0)
+                        first_valid_idx = non_pad_mask.nonzero(as_tuple=True)[0]
+                        if len(first_valid_idx) > 0:
+                            active_prompts = active_prompts[:, first_valid_idx[0]:]
 
-                    first_valid_idx = non_pad_mask.nonzero(as_tuple=True)[0]
-                    if len(first_valid_idx) > 0:
-                        active_prompts = active_prompts[:, first_valid_idx[0]:]
+                        cur_prompt_len = active_prompts.shape[1]
+                        active_pixel_values = None
+                        if pixel_values is not None:
+                            if pixel_values.shape[0] == batch_size:
+                                active_pixel_values = pixel_values[active_indices]
+                            else:
+                                active_pixel_values = pixel_values
 
-                    cur_prompt_len = active_prompts.shape[1]
-                    active_pixel_values = None
-                    if pixel_values is not None:
-                        if pixel_values.shape[0] == batch_size:
-                            active_pixel_values = pixel_values[active_indices]
-                        else:
-                            active_pixel_values = pixel_values
+                        attention_mask = (active_prompts != pad_token_id).long()
 
-                    attention_mask = (active_prompts != pad_token_id).long()
+                        if (attention_mask == 0).all():
+                            attention_mask[:, -1] = 1
 
-                    if (attention_mask == 0).all():
-                        attention_mask[:, -1] = 1
+                        # 计算活跃样本的最大剩余预算，避免生成步数超出序列预算限制
+                        max_active_budget = max(
+                            (max(max_completion_budget - len(trajectories[i]), 1) for i in active_indices),
+                            default=1
+                        )
+                        local_remaining_max_tokens = min(
+                            max(generate_config.max_seq_len - cur_prompt_len, 1),
+                            max_active_budget
+                        )
 
-                    # 计算活跃样本的最大剩余预算，避免生成步数超出序列预算限制
-                    max_active_budget = max(
-                        (max(max_completion_budget - len(trajectories[i]), 1) for i in active_indices),
-                        default=1
-                    )
-                    local_remaining_max_tokens = min(
-                        max(generate_config.max_seq_len - cur_prompt_len, 1),
-                        max_active_budget
-                    )
+                    # 直接使用本地剩余容量限制，避免多卡 all_reduce MAX 导致 prompt 较长的 rank 超出 max_seq_len
+                    remaining_max_tokens = local_remaining_max_tokens
 
-                # 直接使用本地剩余容量限制，避免多卡 all_reduce MAX 导致 prompt 较长的 rank 超出 max_seq_len
-                remaining_max_tokens = local_remaining_max_tokens
+                    actual_chunk_size = generate_config.chunked_generate_size or active_prompts.shape[0]
 
-                actual_chunk_size = generate_config.chunked_generate_size or active_prompts.shape[0]
+                    if 0 < actual_chunk_size < active_prompts.shape[0]:
+                        all_outputs = []
+                        for chunk_start in range(0, active_prompts.shape[0], actual_chunk_size):
+                            chunk_prompts = active_prompts[chunk_start: chunk_start + actual_chunk_size]
+                            chunk_mask = attention_mask[chunk_start: chunk_start + actual_chunk_size]
+                            chunk_pixel_values = None
+                            if active_pixel_values is not None:
+                                chunk_pixel_values = active_pixel_values[chunk_start: chunk_start + actual_chunk_size]
 
-                if 0 < actual_chunk_size < active_prompts.shape[0]:
-                    all_outputs = []
-                    for chunk_start in range(0, active_prompts.shape[0], actual_chunk_size):
-                        chunk_prompts = active_prompts[chunk_start: chunk_start + actual_chunk_size]
-                        chunk_mask = attention_mask[chunk_start: chunk_start + actual_chunk_size]
-                        chunk_pixel_values = None
-                        if active_pixel_values is not None:
-                            chunk_pixel_values = active_pixel_values[chunk_start: chunk_start + actual_chunk_size]
+                            chunk_out, _ = batch_generate(
+                                model=gen_model,
+                                tokens=chunk_prompts,
+                                attention_mask=chunk_mask,
+                                max_new_tokens=remaining_max_tokens,
+                                temperature=generate_config.temperature,
+                                top_p=generate_config.top_p,
+                                top_k=generate_config.top_k,
+                                repetition_penalty=generate_config.repetition_penalty,
+                                exclude_penalty_tokens=generate_config.exclude_penalty_tokens,
+                                suppress_tokens=generate_config.suppress_tokens,
+                                device=device,
+                                pixel_values=chunk_pixel_values,
+                                tokens_per_image=tokens_per_image,
+                                auto_prefix_cache=generate_config.auto_prefix_cache,
+                                return_logits=False
+                            )
+                            all_outputs.append(chunk_out)
 
-                        chunk_out, _ = batch_generate(
+                        max_out_len = max(o.shape[1] for o in all_outputs)
+                        padded_outputs = []
+                        for o in all_outputs:
+                            if o.shape[1] < max_out_len:
+                                o = torch.nn.functional.pad(o, (0, max_out_len - o.shape[1]), value=pad_token_id)
+                            padded_outputs.append(o)
+                        outputs = torch.cat(padded_outputs, dim=0)
+                    else:
+                        outputs, _ = batch_generate(
                             model=gen_model,
-                            tokens=chunk_prompts,
-                            attention_mask=chunk_mask,
+                            tokens=active_prompts,
+                            attention_mask=attention_mask,
                             max_new_tokens=remaining_max_tokens,
                             temperature=generate_config.temperature,
                             top_p=generate_config.top_p,
@@ -668,187 +695,160 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
                             exclude_penalty_tokens=generate_config.exclude_penalty_tokens,
                             suppress_tokens=generate_config.suppress_tokens,
                             device=device,
-                            pixel_values=chunk_pixel_values,
+                            pixel_values=active_pixel_values,
                             tokens_per_image=tokens_per_image,
                             auto_prefix_cache=generate_config.auto_prefix_cache,
                             return_logits=False
                         )
-                        all_outputs.append(chunk_out)
 
-                    max_out_len = max(o.shape[1] for o in all_outputs)
-                    padded_outputs = []
-                    for o in all_outputs:
-                        if o.shape[1] < max_out_len:
-                            o = torch.nn.functional.pad(o, (0, max_out_len - o.shape[1]), value=pad_token_id)
-                        padded_outputs.append(o)
-                    outputs = torch.cat(padded_outputs, dim=0)
-                else:
-                    outputs, _ = batch_generate(
-                        model=gen_model,
-                        tokens=active_prompts,
-                        attention_mask=attention_mask,
-                        max_new_tokens=remaining_max_tokens,
-                        temperature=generate_config.temperature,
-                        top_p=generate_config.top_p,
-                        top_k=generate_config.top_k,
-                        repetition_penalty=generate_config.repetition_penalty,
-                        exclude_penalty_tokens=generate_config.exclude_penalty_tokens,
-                        suppress_tokens=generate_config.suppress_tokens,
-                        device=device,
-                        pixel_values=active_pixel_values,
-                        tokens_per_image=tokens_per_image,
-                        auto_prefix_cache=generate_config.auto_prefix_cache,
-                        return_logits=False
-                    )
+                    empty_cache()
 
-                empty_cache()
+                    next_prompts_list = [None] * batch_size
+                    batch_budget_exhausted = [False] * batch_size
+                    tasks = []
 
-                next_prompts_list = [None] * batch_size
-                batch_budget_exhausted = [False] * batch_size
-                tasks = []
+                    if active_indices:
+                        for i in range(batch_size):
+                            if loop_dones[i]:
+                                next_prompts_list[i] = self._safe_left_unpad(current_prompts[i], pad_token_id)
 
-                if active_indices:
-                    for i in range(batch_size):
-                        if loop_dones[i]:
-                            next_prompts_list[i] = self._safe_left_unpad(current_prompts[i], pad_token_id)
+                        for local_idx, global_idx in enumerate(active_indices):
+                            if loop_dones[global_idx]:
+                                continue
 
-                    for local_idx, global_idx in enumerate(active_indices):
-                        if loop_dones[global_idx]:
+                            new_tokens = outputs[local_idx, cur_prompt_len:]
+                            valid_new_tokens = new_tokens[new_tokens != pad_token_id].tolist()
+
+                            rem_budget = max(max_completion_budget - len(trajectories[global_idx]), 0)
+                            if len(valid_new_tokens) >= rem_budget:
+                                valid_new_tokens = valid_new_tokens[:rem_budget]
+                                batch_budget_exhausted[global_idx] = True
+
+                            generated_text = tokenizer.decode(valid_new_tokens)
+                            history_tokens = list(trajectories[global_idx])
+
+                            trajectories[global_idx].extend(valid_new_tokens)
+                            generation_masks[global_idx].extend([True] * len(valid_new_tokens))
+
+                            tasks.append((global_idx, valid_new_tokens, initial_prompts[global_idx], history_tokens, generated_text))
+
+                    results_dict = {}
+                    if tasks:
+                        workers = self.max_workers if (self.max_workers and self.max_workers > 0) else min(32, max(1, len(tasks)))
+                        executor = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+                        try:
+                            future_to_idx = {
+                                executor.submit(self._call_env_step, idx, p_ids, hist_toks, text): (idx, toks)
+                                for (idx, toks, p_ids, hist_toks, text) in tasks
+                            }
+
+                            if self.env_timeout is not None and self.env_timeout > 0:
+                                done, not_done = concurrent.futures.wait(
+                                    future_to_idx.keys(),
+                                    timeout=self.env_timeout
+                                )
+
+                                for future in done:
+                                    idx, valid_new_tokens = future_to_idx[future]
+                                    try:
+                                        is_done, feedback = future.result()
+                                        is_exception = False
+                                    except Exception as e:
+                                        is_done, feedback = False, f"Error: {str(e)}"
+                                        is_exception = True
+                                    results_dict[idx] = (is_done, feedback, valid_new_tokens, is_exception)
+
+                                for future in not_done:
+                                    idx, valid_new_tokens = future_to_idx[future]
+                                    future.cancel()
+                                    is_done, feedback = False, f"TimeoutError: Environment step exceeded timeout of {self.env_timeout}s"
+                                    is_exception = True
+                                    results_dict[idx] = (is_done, feedback, valid_new_tokens, is_exception)
+                            else:
+                                for future in concurrent.futures.as_completed(future_to_idx):
+                                    idx, valid_new_tokens = future_to_idx[future]
+                                    try:
+                                        is_done, feedback = future.result()
+                                        is_exception = False
+                                    except Exception as e:
+                                        is_done, feedback = False, f"Error: {str(e)}"
+                                        is_exception = True
+                                    results_dict[idx] = (is_done, feedback, valid_new_tokens, is_exception)
+                        finally:
+                            try:
+                                executor.shutdown(wait=False, cancel_futures=True)
+                            except TypeError:
+                                executor.shutdown(wait=False)
+
+                    for idx, (is_done, feedback, valid_new_tokens, is_exception) in results_dict.items():
+                        last_feedbacks[idx] = feedback
+                        if len(valid_new_tokens) == 0:
+                            is_exception = True
+
+                        if is_exception:
+                            consecutive_errors[idx] += 1
+                        else:
+                            consecutive_errors[idx] = 0
+
+                        if is_done:
+                            terminals[idx] = True
+                            loop_dones[idx] = True
+                        elif batch_budget_exhausted[idx] or consecutive_errors[idx] >= self.max_consecutive_errors:
+                            loop_dones[idx] = True
+
+                        # 若样本已经结束交互（任务完成/连续异常/达到上限）或已是最后一轮，无需追加尾部 feedback 也无需构造下一轮 prompt
+                        if loop_dones[idx] or turn == self.max_turns - 1:
+                            loop_dones[idx] = True
+                            next_prompts_list[idx] = torch.tensor([pad_token_id], dtype=torch.long, device=device)
                             continue
 
-                        new_tokens = outputs[local_idx, cur_prompt_len:]
-                        valid_new_tokens = new_tokens[new_tokens != pad_token_id].tolist()
+                        unpadded_prompt = self._safe_left_unpad(current_prompts[idx], pad_token_id)
 
-                        rem_budget = max(max_completion_budget - len(trajectories[global_idx]), 0)
-                        if len(valid_new_tokens) >= rem_budget:
-                            valid_new_tokens = valid_new_tokens[:rem_budget]
-                            batch_budget_exhausted[global_idx] = True
-
-                        generated_text = tokenizer.decode(valid_new_tokens)
-                        history_tokens = list(trajectories[global_idx])
-
-                        trajectories[global_idx].extend(valid_new_tokens)
-                        generation_masks[global_idx].extend([True] * len(valid_new_tokens))
-
-                        tasks.append((global_idx, valid_new_tokens, initial_prompts[global_idx], history_tokens, generated_text))
-
-                results_dict = {}
-                if tasks:
-                    workers = self.max_workers if (self.max_workers and self.max_workers > 0) else min(32, max(1, len(tasks)))
-                    executor = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
-                    try:
-                        future_to_idx = {
-                            executor.submit(self._call_env_step, idx, p_ids, hist_toks, text): (idx, toks)
-                            for (idx, toks, p_ids, hist_toks, text) in tasks
-                        }
-
-                        if self.env_timeout is not None and self.env_timeout > 0:
-                            done, not_done = concurrent.futures.wait(
-                                future_to_idx.keys(),
-                                timeout=self.env_timeout
-                            )
-
-                            for future in done:
-                                idx, valid_new_tokens = future_to_idx[future]
-                                try:
-                                    is_done, feedback = future.result()
-                                    is_exception = False
-                                except Exception as e:
-                                    is_done, feedback = False, f"Error: {str(e)}"
-                                    is_exception = True
-                                results_dict[idx] = (is_done, feedback, valid_new_tokens, is_exception)
-
-                            for future in not_done:
-                                idx, valid_new_tokens = future_to_idx[future]
-                                future.cancel()
-                                is_done, feedback = False, f"TimeoutError: Environment step exceeded timeout of {self.env_timeout}s"
-                                is_exception = True
-                                results_dict[idx] = (is_done, feedback, valid_new_tokens, is_exception)
-                        else:
-                            for future in concurrent.futures.as_completed(future_to_idx):
-                                idx, valid_new_tokens = future_to_idx[future]
-                                try:
-                                    is_done, feedback = future.result()
-                                    is_exception = False
-                                except Exception as e:
-                                    is_done, feedback = False, f"Error: {str(e)}"
-                                    is_exception = True
-                                results_dict[idx] = (is_done, feedback, valid_new_tokens, is_exception)
-                    finally:
                         try:
-                            executor.shutdown(wait=False, cancel_futures=True)
-                        except TypeError:
-                            executor.shutdown(wait=False)
+                            feedback_text = self.format_feedback(feedback)
+                            feedback_tokens = tokenizer.encode(feedback_text)
+                        except Exception as e:
+                            feedback_text = f"\nError formatting feedback: {str(e)}\n"
+                            feedback_tokens = tokenizer.encode(feedback_text)
 
-                for idx, (is_done, feedback, valid_new_tokens, is_exception) in results_dict.items():
-                    last_feedbacks[idx] = feedback
-                    if len(valid_new_tokens) == 0:
-                        is_exception = True
+                        remaining_capacity = max_completion_budget - len(trajectories[idx])
+                        next_prompt_len = unpadded_prompt.size(0) + len(valid_new_tokens) + len(feedback_tokens)
 
-                    if is_exception:
-                        consecutive_errors[idx] += 1
-                    else:
-                        consecutive_errors[idx] = 0
+                        # 若追加环境反馈后将耗尽完成预算或达到最大序列长度，
+                        # 说明模型在下一轮已无法继续生成任何动作 Token，此时不应将该段悬空 feedback
+                        # 塞入 trajectories 尾部（避免污染 completion_ids 长度并导致 PPO GAE Bootstrap 对齐错位），
+                        # 直接终止该样本。
+                        if remaining_capacity <= 0 or len(feedback_tokens) >= remaining_capacity or next_prompt_len >= generate_config.max_seq_len:
+                            loop_dones[idx] = True
+                            next_prompts_list[idx] = torch.tensor([pad_token_id], dtype=torch.long, device=device)
+                            continue
 
-                    if is_done:
-                        terminals[idx] = True
-                        loop_dones[idx] = True
-                    elif batch_budget_exhausted[idx] or consecutive_errors[idx] >= self.max_consecutive_errors:
-                        loop_dones[idx] = True
+                        if feedback_tokens:
+                            trajectories[idx].extend(feedback_tokens)
+                            generation_masks[idx].extend([False] * len(feedback_tokens))
 
-                    # 若样本已经结束交互（任务完成/连续异常/达到上限）或已是最后一轮，无需追加尾部 feedback 也无需构造下一轮 prompt
-                    if loop_dones[idx] or turn == self.max_turns - 1:
-                        loop_dones[idx] = True
-                        next_prompts_list[idx] = torch.tensor([pad_token_id], dtype=torch.long, device=device)
-                        continue
+                        next_prompt = torch.cat([
+                            unpadded_prompt,
+                            torch.tensor(valid_new_tokens + feedback_tokens, dtype=torch.long, device=device)
+                        ])
+                        next_prompts_list[idx] = next_prompt
 
-                    unpadded_prompt = self._safe_left_unpad(current_prompts[idx], pad_token_id)
+                    if not all(loop_dones) and active_indices:
+                        valid_prompts = []
+                        for p in next_prompts_list:
+                            if p is None or p.numel() == 0:
+                                valid_prompts.append(torch.tensor([pad_token_id], dtype=torch.long, device=device))
+                            else:
+                                valid_prompts.append(p)
 
-                    try:
-                        feedback_text = self.format_feedback(feedback)
-                        feedback_tokens = tokenizer.encode(feedback_text)
-                    except Exception as e:
-                        feedback_text = f"\nError formatting feedback: {str(e)}\n"
-                        feedback_tokens = tokenizer.encode(feedback_text)
-
-                    remaining_capacity = max_completion_budget - len(trajectories[idx])
-                    if remaining_capacity <= 0:
-                        loop_dones[idx] = True
-                        feedback_tokens = []
-                    else:
-                        feedback_tokens = feedback_tokens[:remaining_capacity]
-
-                    if feedback_tokens:
-                        trajectories[idx].extend(feedback_tokens)
-                        generation_masks[idx].extend([False] * len(feedback_tokens))
-
-                    next_prompt = torch.cat([
-                        unpadded_prompt,
-                        torch.tensor(valid_new_tokens + feedback_tokens, dtype=torch.long, device=device)
-                    ])
-                    if next_prompt.size(0) > generate_config.max_seq_len:
-                        next_prompt = next_prompt[:generate_config.max_seq_len]
-                    next_prompts_list[idx] = next_prompt
-
-                    if len(trajectories[idx]) >= max_completion_budget or next_prompt.size(0) >= generate_config.max_seq_len:
-                        loop_dones[idx] = True
-
-                if not all(loop_dones) and active_indices:
-                    valid_prompts = []
-                    for p in next_prompts_list:
-                        if p is None or p.numel() == 0:
-                            valid_prompts.append(torch.tensor([pad_token_id], dtype=torch.long, device=device))
-                        else:
-                            valid_prompts.append(p)
-
-                    reversed_prompts = [p.flip(dims=(0,)) for p in valid_prompts]
-                    padded_reversed = torch.nn.utils.rnn.pad_sequence(
-                        reversed_prompts, batch_first=True, padding_value=pad_token_id
-                    )
-                    current_prompts = padded_reversed.flip(dims=(1,))
-
-            if was_training:
-                unwrapped_model.train()
+                        reversed_prompts = [p.flip(dims=(0,)) for p in valid_prompts]
+                        padded_reversed = torch.nn.utils.rnn.pad_sequence(
+                            reversed_prompts, batch_first=True, padding_value=pad_token_id
+                        )
+                        current_prompts = padded_reversed.flip(dims=(1,))
+            finally:
+                if was_training:
+                    unwrapped_model.train()
 
         return {
             'completions': trajectories,

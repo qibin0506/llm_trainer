@@ -4,6 +4,7 @@ import math
 import torch
 from torch import nn
 import torch.nn.functional as F
+import torch.distributed as dist
 from .partition_utils import maybe_gather_lm_head_ctx
 from .utils import log_softmax
 
@@ -13,6 +14,18 @@ def _get_compute_dtype(hidden: torch.Tensor) -> torch.dtype:
     if torch.is_autocast_enabled(device_type):
         return torch.get_autocast_dtype(device_type)
     return hidden.dtype
+
+
+def _get_global_valid_token_denom(local_n_valid: torch.Tensor) -> torch.Tensor:
+    """
+    计算跨卡平均有效 Token 数作为归一化分母，消除多卡之间因有效回答长度不均或单卡全 -100 导致的梯度偏置与稀释。
+    """
+    denom = local_n_valid.to(dtype=torch.float32)
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        global_n_valid = denom.clone()
+        dist.all_reduce(global_n_valid, op=dist.ReduceOp.SUM)
+        return global_n_valid.clamp(min=1.0) / float(dist.get_world_size())
+    return denom.clamp(min=1.0)
 
 
 def _addmm_fp32(acc: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> None:
@@ -33,7 +46,7 @@ class ChunkedCrossEntropyFunction(torch.autograd.Function):
     1. 前向：由外部调用模块（如 ChunkedLMLoss）统一包裹 maybe_gather_lm_head_ctx 保护 .apply() 调用，
        算子内部直接执行分块 GEMM，累加标量损失，不保存任何中间 Logits，规避多层嵌套破坏 ZeRO-3 状态机。
     2. 反向：在 backward 内部统一进入一次 maybe_gather_lm_head_ctx，保证分块重算与 GEMM 累积期间权重处于 AVAILABLE 状态且全卡对齐。
-    3. 显式记录 compute_dtype 并全程采用 FP32 累加 grad_hidden 与 grad_weight
+    3. 显式记录 compute_dtype 并全程采用 FP32 累加 grad_hidden 与 grad_weight，无任何 .item()/.any() GPU-CPU 同步阻塞。
     """
     @staticmethod
     def forward(
@@ -46,6 +59,7 @@ class ChunkedCrossEntropyFunction(torch.autograd.Function):
             chunk_size: int,
             ignore_index: int,
             kd_coef: float,
+            loss_denom: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         ctx.set_materialize_grads(False)
         ctx.chunk_size = chunk_size
@@ -66,46 +80,46 @@ class ChunkedCrossEntropyFunction(torch.autograd.Function):
             t_logits_flat = teacher_logits
 
         vocab_size = weight.ds_shape[0] if hasattr(weight, "ds_shape") else weight.shape[0]
+        n_tokens = hidden_flat.size(0)
         valid_mask = (labels_flat != ignore_index) & (labels_flat >= 0) & (labels_flat < vocab_size)
-        is_all_valid = bool(valid_mask.all().item()) if valid_mask.numel() > 0 else True
-
-        if is_all_valid:
-            valid_indices = None
-            n_valid = hidden_flat.size(0)
-            hidden_valid = hidden_flat
-            labels_valid = labels_flat
+        if loss_denom is not None:
+            denom = loss_denom.to(device=hidden.device, dtype=torch.float32).clamp(min=1e-8)
         else:
-            valid_indices = torch.nonzero(valid_mask).squeeze(-1)
-            n_valid = valid_indices.numel()
-            hidden_valid = hidden_flat[valid_indices]
-            labels_valid = labels_flat[valid_indices]
+            local_n_valid = valid_mask.sum()
+            denom = _get_global_valid_token_denom(local_n_valid)
 
         total_loss_sum = torch.zeros((), dtype=torch.float32, device=hidden.device)
         ce_loss_sum = torch.zeros((), dtype=torch.float32, device=hidden.device)
 
-        if n_valid > 0:
+        if n_tokens > 0:
             w_compute = weight.to(compute_dtype)
             b_float = bias.float() if bias is not None else None
 
-            for start in range(0, n_valid, chunk_size):
-                end = min(start + chunk_size, n_valid)
-                h_c = hidden_valid[start:end].to(compute_dtype)
-                lbl_c = labels_valid[start:end]
+            for start in range(0, n_tokens, chunk_size):
+                end = min(start + chunk_size, n_tokens)
+                h_c = hidden_flat[start:end].to(compute_dtype)
+                lbl_c = labels_flat[start:end]
+                valid_c = valid_mask[start:end]
+                safe_lbl_c = torch.where(valid_c, lbl_c, torch.full_like(lbl_c, ignore_index))
 
                 logits_c = (h_c @ w_compute.t()).float()
                 if b_float is not None:
                     logits_c = logits_c + b_float
 
                 log_p_c = F.log_softmax(logits_c, dim=-1)
-                chunk_ce = F.nll_loss(log_p_c, lbl_c, ignore_index=ignore_index, reduction="sum")
+                chunk_ce = F.nll_loss(log_p_c, safe_lbl_c, ignore_index=ignore_index, reduction="sum")
                 ce_loss_sum = ce_loss_sum + chunk_ce
 
                 if has_teacher:
-                    t_slice = t_logits_flat[start:end] if is_all_valid else t_logits_flat[valid_indices[start:end]]
-                    t_logits_c = t_slice.to(device=hidden.device, dtype=torch.float32)
+                    t_logits_c = t_logits_flat[start:end].to(device=hidden.device, dtype=torch.float32)
                     t_probs_c = F.softmax(t_logits_c, dim=-1)
                     safe_log_p = torch.clamp(log_p_c, min=-100.0)
-                    prod = torch.where(t_probs_c > 0, t_probs_c * safe_log_p, torch.zeros_like(safe_log_p))
+                    valid_c_2d = valid_c.unsqueeze(-1)
+                    prod = torch.where(
+                        (t_probs_c > 0) & valid_c_2d,
+                        t_probs_c * safe_log_p,
+                        torch.zeros_like(safe_log_p),
+                    )
                     chunk_kd = -prod.sum()
                     chunk_total = (1.0 - kd_coef) * chunk_ce + kd_coef * chunk_kd
                 else:
@@ -114,55 +128,19 @@ class ChunkedCrossEntropyFunction(torch.autograd.Function):
                 total_loss_sum = total_loss_sum + chunk_total
 
         t_logits_cpu = None
-        offload_event = None
-        if has_teacher and n_valid > 0:
-            t_logits_valid = (t_logits_flat if is_all_valid else t_logits_flat[valid_indices]).contiguous()
-            if t_logits_valid.is_cuda:
-                pin_success = False
-                if torch.cuda.is_available():
-                    try:
-                        t_logits_cpu = torch.empty(
-                            t_logits_valid.shape,
-                            dtype=t_logits_valid.dtype,
-                            device="cpu",
-                            pin_memory=True,
-                        )
-                        pin_success = True
-                    except Exception:
-                        t_logits_cpu = torch.empty(
-                            t_logits_valid.shape,
-                            dtype=t_logits_valid.dtype,
-                            device="cpu",
-                            pin_memory=False,
-                        )
-                else:
-                    t_logits_cpu = torch.empty(
-                        t_logits_valid.shape,
-                        dtype=t_logits_valid.dtype,
-                        device="cpu",
-                    )
-                t_logits_cpu.copy_(t_logits_valid, non_blocking=pin_success)
-                if pin_success:
-                    current_stream = torch.cuda.current_stream(t_logits_valid.device)
-                    t_logits_valid.record_stream(current_stream)
-                    offload_event = torch.cuda.Event()
-                    offload_event.record(current_stream)
-                del t_logits_valid
-            else:
-                t_logits_cpu = t_logits_valid
+        if has_teacher and n_tokens > 0:
+            # 直接使用常规 CPU 内存卸载，避免每步动态调用 pin_memory=True 触发高昂的 cudaHostAlloc 同步阻塞
+            t_logits_cpu = t_logits_flat.detach().to(device="cpu", non_blocking=False)
 
-        denom = max(n_valid, 1)
         total_loss = total_loss_sum / denom
         ce_loss = (ce_loss_sum / denom).detach()
 
         del t_logits_flat
 
-        ctx.is_all_valid = is_all_valid
-        ctx.save_for_backward(hidden_valid, weight, bias, labels_valid, valid_indices)
-
+        ctx.save_for_backward(hidden_flat, weight, bias, labels_flat, denom)
         ctx.teacher_logits_cpu = t_logits_cpu
-        ctx.offload_event = offload_event
-        ctx.n_valid = n_valid
+        ctx.n_tokens = n_tokens
+        ctx.vocab_size = vocab_size
         ctx.orig_h_shape = orig_h_shape
         ctx.hidden_dtype = hidden.dtype
         ctx.mark_non_differentiable(ce_loss)
@@ -170,14 +148,14 @@ class ChunkedCrossEntropyFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_total_loss: Optional[torch.Tensor], grad_ce_loss: Optional[torch.Tensor] = None):
-        hidden_valid, weight, bias, labels_valid, valid_indices = ctx.saved_tensors
+        hidden_flat, weight, bias, labels_flat, denom = ctx.saved_tensors
         t_logits_cpu = getattr(ctx, "teacher_logits_cpu", None)
-        offload_event = getattr(ctx, "offload_event", None)
-        n_valid = ctx.n_valid
-        orig_h_shape = getattr(ctx, "orig_h_shape", hidden_valid.shape)
-        hidden_dtype = getattr(ctx, "hidden_dtype", hidden_valid.dtype)
+        n_tokens = ctx.n_tokens
+        vocab_size = ctx.vocab_size
+        ignore_index = ctx.ignore_index
+        orig_h_shape = getattr(ctx, "orig_h_shape", hidden_flat.shape)
+        hidden_dtype = getattr(ctx, "hidden_dtype", hidden_flat.dtype)
         compute_dtype = getattr(ctx, "compute_dtype", hidden_dtype)
-        is_all_valid = getattr(ctx, "is_all_valid", False)
 
         needs_h_grad = ctx.needs_input_grad[0]
         needs_w_grad = ctx.needs_input_grad[1]
@@ -188,89 +166,83 @@ class ChunkedCrossEntropyFunction(torch.autograd.Function):
         has_teacher = (t_logits_cpu is not None) and (kd_coef > 0.0)
 
         with maybe_gather_lm_head_ctx(weight, bias):
-            grad_hidden = torch.zeros(orig_h_shape, dtype=torch.float32, device=hidden_valid.device) if needs_h_grad else None
+            grad_hidden = torch.zeros(orig_h_shape, dtype=torch.float32, device=hidden_flat.device) if needs_h_grad else None
             grad_hidden_flat = grad_hidden.view(-1, orig_h_shape[-1]) if grad_hidden is not None else None
             grad_weight = torch.zeros(weight.shape, dtype=torch.float32, device=weight.device) if needs_w_grad else None
             grad_bias = torch.zeros(bias.shape, dtype=torch.float32, device=bias.device) if needs_b_grad else None
 
-            if grad_total_loss is not None and n_valid > 0:
+            if grad_total_loss is not None and n_tokens > 0:
                 g_out = grad_total_loss.float()
-                scale = g_out / max(n_valid, 1)
-
-                if has_teacher:
-                    if offload_event is not None:
-                        if hidden_valid.is_cuda:
-                            torch.cuda.current_stream(hidden_valid.device).wait_event(offload_event)
-                        offload_event.synchronize()
-                    elif hidden_valid.is_cuda and torch.cuda.is_available():
-                        torch.cuda.current_stream(hidden_valid.device).synchronize()
+                base_scale = g_out / denom
 
                 w_compute = weight.to(compute_dtype)
                 b_float = bias.float() if bias is not None else None
 
-                for start in range(0, n_valid, chunk_size):
-                    end = min(start + chunk_size, n_valid)
-                    h_c = hidden_valid[start:end].to(compute_dtype)
-                    lbl_c = labels_valid[start:end]
+                for start in range(0, n_tokens, chunk_size):
+                    end = min(start + chunk_size, n_tokens)
+                    h_c = hidden_flat[start:end].to(compute_dtype)
+                    lbl_c = labels_flat[start:end]
+                    valid_c = (lbl_c != ignore_index) & (lbl_c >= 0) & (lbl_c < vocab_size)
+                    safe_lbl_c = lbl_c.clamp(min=0, max=vocab_size - 1)
+                    scale_c = torch.where(valid_c, base_scale, torch.zeros_like(base_scale)).unsqueeze(-1)
 
                     logits_c = (h_c @ w_compute.t()).float()
                     if b_float is not None:
                         logits_c = logits_c + b_float
 
-                    d_logits = F.softmax(logits_c, dim=-1)
-
                     if has_teacher:
-                        t_logits_c = t_logits_cpu[start:end].to(hidden_valid.device, non_blocking=False).float()
+                        log_p_c = F.log_softmax(logits_c, dim=-1)
+                        d_logits = torch.exp(log_p_c)
+                        t_logits_c = t_logits_cpu[start:end].to(hidden_flat.device, non_blocking=False).float()
                         t_probs_c = F.softmax(t_logits_c, dim=-1)
-                        d_logits.sub_(t_probs_c.mul_(kd_coef))
-                        d_logits.scatter_add_(
-                            dim=1,
-                            index=lbl_c.unsqueeze(1),
-                            src=torch.full((lbl_c.shape[0], 1), -(1.0 - kd_coef), dtype=d_logits.dtype, device=d_logits.device),
-                        )
+                        del t_logits_c
+
+                        active_mask = (t_probs_c > 0) & (log_p_c >= -100.0)
+                        masked_t_probs = torch.where(active_mask, t_probs_c, torch.zeros_like(t_probs_c))
+                        t_sum = masked_t_probs.sum(dim=-1, keepdim=True)
+                        d_logits.mul_((1.0 - kd_coef) + kd_coef * t_sum)
+                        if kd_coef < 1.0:
+                            d_logits.scatter_add_(
+                                dim=1,
+                                index=safe_lbl_c.unsqueeze(1),
+                                src=torch.full((safe_lbl_c.shape[0], 1), -(1.0 - kd_coef), dtype=d_logits.dtype, device=d_logits.device),
+                            )
+                        d_logits.sub_(masked_t_probs.mul_(kd_coef))
                     else:
+                        d_logits = F.softmax(logits_c, dim=-1)
                         d_logits.scatter_add_(
                             dim=1,
-                            index=lbl_c.unsqueeze(1),
-                            src=torch.full((lbl_c.shape[0], 1), -1.0, dtype=d_logits.dtype, device=d_logits.device),
+                            index=safe_lbl_c.unsqueeze(1),
+                            src=torch.full((safe_lbl_c.shape[0], 1), -1.0, dtype=d_logits.dtype, device=d_logits.device),
                         )
 
-                    d_logits.mul_(scale)
+                    d_logits.mul_(scale_c)
                     if needs_b_grad:
                         grad_bias.add_(d_logits.sum(dim=0))
 
                     d_logits_c = d_logits.to(compute_dtype)
                     if needs_h_grad:
-                        if is_all_valid:
-                            # 连续切片返回 View，可直接原地 FP32 累加
-                            _addmm_fp32(grad_hidden_flat[start:end], d_logits_c, w_compute)
-                        else:
-                            idx_c = valid_indices[start:end]
-                            grad_h_c = torch.zeros((end - start, orig_h_shape[-1]), dtype=torch.float32, device=hidden_valid.device)
-                            _addmm_fp32(grad_h_c, d_logits_c, w_compute)
-                            grad_hidden_flat[idx_c] = grad_h_c
+                        _addmm_fp32(grad_hidden_flat[start:end], d_logits_c, w_compute)
                     if needs_w_grad:
                         _addmm_fp32(grad_weight, d_logits_c.t(), h_c)
 
         if hasattr(ctx, "teacher_logits_cpu"):
             del ctx.teacher_logits_cpu
-        if hasattr(ctx, "offload_event"):
-            del ctx.offload_event
 
         return (
             grad_hidden.to(hidden_dtype) if grad_hidden is not None else None,
             grad_weight.to(weight.dtype) if grad_weight is not None else None,
             grad_bias.to(bias.dtype) if grad_bias is not None else None,
-            None, None, None, None, None
+            None, None, None, None, None, None
         )
 
 
 class ChunkedLogProbFunction(torch.autograd.Function):
     """
     分块计算目标 token 的 log_probs，彻底避免物化 [B, S, V] 全量 Logits。
-    - 统一捕获 compute_dtype 并在前反向中对齐矩阵乘精度；
-    - 反向传播中 grad_hidden 与 grad_weight 均采用 FP32 缓冲区配合 _addmm_fp32 累加；
-    - 区分连续切片视图 (is_all_valid=True) 与花式索引拷贝 (is_all_valid=False)，杜绝花式索引导致梯度丢失。
+    - 统一捕获 compute_dtype 并在循环外一次性转换 weight，避免每个分块重复转换主权重；
+    - 反向传播中 grad_hidden 与 grad_weight 均采用 FP32 缓冲区配合 _addmm_fp32 原地累加；
+    - 全程使用纯张量掩码替代 .item() / .any() / nonzero()，消除所有 GPU-CPU 同步阻塞。
     """
     @staticmethod
     def forward(
@@ -282,7 +254,7 @@ class ChunkedLogProbFunction(torch.autograd.Function):
             chunk_size: int = 256,
             ignore_index: int = -100,
             temperature: float = 1.0,
-            vocab_chunk_size: Optional[int] = 32768,
+            vocab_chunk_size: Optional[int] = None,
     ) -> torch.Tensor:
         ctx.set_materialize_grads(False)
         ctx.chunk_size = chunk_size
@@ -300,36 +272,26 @@ class ChunkedLogProbFunction(torch.autograd.Function):
             hidden_flat = hidden
             targets_flat = targets
 
+        n_tokens = targets_flat.numel()
         log_probs_flat = torch.zeros(targets_flat.shape, dtype=torch.float32, device=hidden.device)
+        lse_flat = torch.zeros(targets_flat.shape, dtype=torch.float32, device=hidden.device)
 
         vocab_size = weight.ds_shape[0] if hasattr(weight, "ds_shape") else weight.size(0)
-        valid_mask = (targets_flat != ignore_index) & (targets_flat >= 0) & (targets_flat < vocab_size)
-        is_all_valid = bool(valid_mask.all().item()) if valid_mask.numel() > 0 else True
-
-        if is_all_valid:
-            valid_indices = None
-            n_valid = targets_flat.numel()
-        else:
-            valid_indices = torch.nonzero(valid_mask).squeeze(-1)
-            n_valid = valid_indices.numel()
-
         v_chunk_size = vocab_chunk_size if (vocab_chunk_size is not None and 0 < vocab_chunk_size < vocab_size) else vocab_size
         ctx.v_chunk_size = v_chunk_size
         ctx.vocab_size = vocab_size
-        ctx.is_all_valid = is_all_valid
-
-        lse_flat = torch.zeros(targets_flat.shape, dtype=torch.float32, device=hidden.device)
 
         inv_t = 1.0 / ctx.temperature
-        if n_valid > 0:
+        if n_tokens > 0:
             b_float = bias.float() if bias is not None else None
-            w_compute_full = weight.to(compute_dtype) if v_chunk_size == vocab_size else None
+            w_compute_full = weight.to(compute_dtype)
 
-            for start in range(0, n_valid, chunk_size):
-                end = min(start + chunk_size, n_valid)
-                idx_c = slice(start, end) if is_all_valid else valid_indices[start:end]
-                h_c = hidden_flat[idx_c].to(compute_dtype)
-                tgt_c = targets_flat[idx_c]
+            for start in range(0, n_tokens, chunk_size):
+                end = min(start + chunk_size, n_tokens)
+                h_c = hidden_flat[start:end].to(compute_dtype)
+                tgt_c = targets_flat[start:end]
+                valid_c = (tgt_c != ignore_index) & (tgt_c >= 0) & (tgt_c < vocab_size)
+                safe_tgt_c = tgt_c.clamp(min=0, max=vocab_size - 1)
 
                 if v_chunk_size == vocab_size:
                     logits_c = (h_c @ w_compute_full.t()).float()
@@ -338,9 +300,9 @@ class ChunkedLogProbFunction(torch.autograd.Function):
                     if ctx.temperature != 1.0:
                         logits_c = logits_c * inv_t
 
-                    chunk_log_probs = log_softmax(logits_c, tgt_c)
-                    log_probs_flat[idx_c] = chunk_log_probs
-                    lse_flat[idx_c] = torch.logsumexp(logits_c, dim=-1)
+                    chunk_log_probs = log_softmax(logits_c, safe_tgt_c)
+                    log_probs_flat[start:end] = torch.where(valid_c, chunk_log_probs, torch.zeros_like(chunk_log_probs))
+                    lse_flat[start:end] = torch.logsumexp(logits_c, dim=-1)
                 else:
                     m = torch.full((h_c.size(0),), float("-inf"), dtype=torch.float32, device=hidden.device)
                     s = torch.zeros((h_c.size(0),), dtype=torch.float32, device=hidden.device)
@@ -348,17 +310,17 @@ class ChunkedLogProbFunction(torch.autograd.Function):
 
                     for v_start in range(0, vocab_size, v_chunk_size):
                         v_end = min(v_start + v_chunk_size, vocab_size)
-                        w_v = weight[v_start:v_end].to(compute_dtype)
+                        w_v = w_compute_full[v_start:v_end]
                         logits_v = (h_c @ w_v.t()).float()
                         if b_float is not None:
                             logits_v = logits_v + b_float[v_start:v_end]
                         if ctx.temperature != 1.0:
                             logits_v = logits_v * inv_t
 
-                        in_chunk = (tgt_c >= v_start) & (tgt_c < v_end)
-                        if in_chunk.any():
-                            local_tgt = tgt_c[in_chunk] - v_start
-                            target_logits[in_chunk] = logits_v[in_chunk, local_tgt]
+                        in_chunk = (safe_tgt_c >= v_start) & (safe_tgt_c < v_end)
+                        local_tgt = (safe_tgt_c - v_start).clamp(min=0, max=(v_end - v_start - 1)).unsqueeze(-1)
+                        gathered_logits = logits_v.gather(-1, local_tgt).squeeze(-1)
+                        target_logits = torch.where(in_chunk, gathered_logits, target_logits)
 
                         chunk_max = logits_v.max(dim=-1).values
                         new_m = torch.maximum(m, chunk_max)
@@ -369,23 +331,24 @@ class ChunkedLogProbFunction(torch.autograd.Function):
 
                     lse_c = m + torch.log(s)
                     safe_lse_c = torch.where(torch.isinf(lse_c), torch.zeros_like(lse_c), lse_c)
-                    log_probs_flat[idx_c] = target_logits - safe_lse_c
-                    lse_flat[idx_c] = lse_c
+                    chunk_log_probs = target_logits - safe_lse_c
+                    log_probs_flat[start:end] = torch.where(valid_c, chunk_log_probs, torch.zeros_like(chunk_log_probs))
+                    lse_flat[start:end] = lse_c
 
-        ctx.save_for_backward(hidden, weight, bias, targets, valid_indices, lse_flat)
+        ctx.save_for_backward(hidden_flat, weight, bias, targets_flat, lse_flat)
 
-        ctx.n_valid = n_valid
+        ctx.n_tokens = n_tokens
         ctx.orig_h_shape = orig_h_shape
         ctx.orig_targets_shape = orig_targets_shape
         return log_probs_flat.view(orig_targets_shape)
 
     @staticmethod
     def backward(ctx, grad_log_probs: Optional[torch.Tensor]):
-        hidden, weight, bias, targets, valid_indices, lse_flat = ctx.saved_tensors
-        n_valid = ctx.n_valid
-        orig_h_shape = getattr(ctx, "orig_h_shape", hidden.shape)
-        compute_dtype = getattr(ctx, "compute_dtype", hidden.dtype)
-        is_all_valid = getattr(ctx, "is_all_valid", False)
+        hidden_flat, weight, bias, targets_flat, lse_flat = ctx.saved_tensors
+        n_tokens = ctx.n_tokens
+        ignore_index = ctx.ignore_index
+        orig_h_shape = getattr(ctx, "orig_h_shape", hidden_flat.shape)
+        compute_dtype = getattr(ctx, "compute_dtype", hidden_flat.dtype)
         temperature = ctx.temperature
         inv_t = 1.0 / temperature
         v_chunk_size = ctx.v_chunk_size
@@ -397,32 +360,28 @@ class ChunkedLogProbFunction(torch.autograd.Function):
 
         chunk_size = ctx.chunk_size
 
-        hidden_flat = hidden.reshape(-1, hidden.shape[-1]) if hidden.dim() == 3 else hidden
-        targets_flat = targets.reshape(-1) if targets.dim() > 1 else targets
-
         with maybe_gather_lm_head_ctx(weight, bias):
-            grad_hidden = torch.zeros(orig_h_shape, dtype=torch.float32, device=hidden.device) if needs_h_grad else None
-            grad_hidden_flat = grad_hidden.view(-1, hidden.shape[-1]) if grad_hidden is not None else None
+            grad_hidden = torch.zeros(orig_h_shape, dtype=torch.float32, device=hidden_flat.device) if needs_h_grad else None
+            grad_hidden_flat = grad_hidden.view(-1, hidden_flat.shape[-1]) if grad_hidden is not None else None
             grad_weight = torch.zeros(weight.shape, dtype=torch.float32, device=weight.device) if needs_w_grad else None
             grad_bias = torch.zeros(bias.shape, dtype=torch.float32, device=bias.device) if needs_b_grad else None
 
-            if grad_log_probs is not None and n_valid > 0:
+            if grad_log_probs is not None and n_tokens > 0:
                 g_in = grad_log_probs.float()
                 g_in_flat = g_in.reshape(-1) if g_in.dim() > 1 else g_in
                 b_float = bias.float() if bias is not None else None
-                w_compute_full = weight.to(compute_dtype) if v_chunk_size == vocab_size else None
+                w_compute_full = weight.to(compute_dtype)
 
-                for start in range(0, n_valid, chunk_size):
-                    end = min(start + chunk_size, n_valid)
-                    idx_c = slice(start, end) if is_all_valid else valid_indices[start:end]
-                    g_c = g_in_flat[idx_c]
+                for start in range(0, n_tokens, chunk_size):
+                    end = min(start + chunk_size, n_tokens)
+                    g_c = g_in_flat[start:end]
+                    h_c = hidden_flat[start:end].to(compute_dtype)
+                    tgt_c = targets_flat[start:end]
+                    lse_c = lse_flat[start:end]
 
-                    if not g_c.any():
-                        continue
-
-                    h_c = hidden_flat[idx_c].to(compute_dtype)
-                    tgt_c = targets_flat[idx_c]
-                    lse_c = lse_flat[idx_c]
+                    valid_c = (tgt_c != ignore_index) & (tgt_c >= 0) & (tgt_c < vocab_size)
+                    safe_tgt_c = tgt_c.clamp(min=0, max=vocab_size - 1)
+                    scale_c = torch.where(valid_c, g_c * inv_t, torch.zeros_like(g_c)).unsqueeze(-1)
 
                     if v_chunk_size == vocab_size:
                         logits_c = (h_c @ w_compute_full.t()).float()
@@ -434,49 +393,41 @@ class ChunkedLogProbFunction(torch.autograd.Function):
                         d_logits = F.softmax(logits_c, dim=-1).neg_()
                         d_logits.scatter_add_(
                             dim=1,
-                            index=tgt_c.unsqueeze(1),
-                            src=torch.ones((tgt_c.shape[0], 1), dtype=d_logits.dtype, device=d_logits.device),
+                            index=safe_tgt_c.unsqueeze(1),
+                            src=torch.ones((safe_tgt_c.shape[0], 1), dtype=d_logits.dtype, device=d_logits.device),
                         )
-                        d_logits.mul_(g_c.unsqueeze(-1) * inv_t)
+                        d_logits.mul_(scale_c)
 
                         if needs_b_grad:
                             grad_bias.add_(d_logits.sum(dim=0))
 
                         d_logits_c = d_logits.to(compute_dtype)
                         if needs_h_grad:
-                            if is_all_valid:
-                                # slice(start, end) 返回视图 View，直接原地累加到 grad_hidden_flat
-                                _addmm_fp32(grad_hidden_flat[start:end], d_logits_c, w_compute_full)
-                            else:
-                                # 花式索引返回 Copy，必须先累加到临时张量再通过 __setitem__ 写回
-                                grad_h_c = torch.zeros((h_c.size(0), h_c.size(1)), dtype=torch.float32, device=hidden.device)
-                                _addmm_fp32(grad_h_c, d_logits_c, w_compute_full)
-                                grad_hidden_flat[idx_c] = grad_h_c
+                            _addmm_fp32(grad_hidden_flat[start:end], d_logits_c, w_compute_full)
                         if needs_w_grad:
                             _addmm_fp32(grad_weight, d_logits_c.t(), h_c)
                     else:
-                        grad_h_accum = (
-                            grad_hidden_flat[start:end]
-                            if (needs_h_grad and is_all_valid)
-                            else (torch.zeros((h_c.size(0), h_c.size(1)), dtype=torch.float32, device=hidden.device) if needs_h_grad else None)
-                        )
+                        grad_h_accum = grad_hidden_flat[start:end] if needs_h_grad else None
+                        safe_lse_c = torch.where(torch.isinf(lse_c), torch.zeros_like(lse_c), lse_c)
+
                         for v_start in range(0, vocab_size, v_chunk_size):
                             v_end = min(v_start + v_chunk_size, vocab_size)
-                            w_v = weight[v_start:v_end].to(compute_dtype)
+                            w_v = w_compute_full[v_start:v_end]
                             logits_v = (h_c @ w_v.t()).float()
                             if b_float is not None:
                                 logits_v = logits_v + b_float[v_start:v_end]
                             if temperature != 1.0:
                                 logits_v = logits_v * inv_t
 
-                            safe_lse_c = torch.where(torch.isinf(lse_c), torch.zeros_like(lse_c), lse_c)
                             d_logits_v = torch.exp(logits_v - safe_lse_c.unsqueeze(-1)).neg_()
-                            in_chunk = (tgt_c >= v_start) & (tgt_c < v_end)
-                            if in_chunk.any():
-                                in_chunk_indices = torch.nonzero(in_chunk).squeeze(-1)
-                                local_tgt = tgt_c[in_chunk_indices] - v_start
-                                d_logits_v[in_chunk_indices, local_tgt] += 1.0
-                            d_logits_v.mul_(g_c.unsqueeze(-1) * inv_t)
+                            in_chunk = (safe_tgt_c >= v_start) & (safe_tgt_c < v_end) & valid_c
+                            local_tgt = (safe_tgt_c - v_start).clamp(min=0, max=(v_end - v_start - 1)).unsqueeze(1)
+                            d_logits_v.scatter_add_(
+                                dim=1,
+                                index=local_tgt,
+                                src=in_chunk.unsqueeze(1).to(d_logits_v.dtype),
+                            )
+                            d_logits_v.mul_(scale_c)
 
                             if needs_b_grad:
                                 grad_bias[v_start:v_end].add_(d_logits_v.sum(dim=0))
@@ -487,11 +438,8 @@ class ChunkedLogProbFunction(torch.autograd.Function):
                             if needs_w_grad:
                                 _addmm_fp32(grad_weight[v_start:v_end], d_logits_v_c.t(), h_c)
 
-                        if needs_h_grad and not is_all_valid:
-                            grad_hidden_flat[idx_c] = grad_h_accum
-
         return (
-            grad_hidden.to(hidden.dtype) if grad_hidden is not None else None,
+            grad_hidden.to(hidden_flat.dtype) if grad_hidden is not None else None,
             grad_weight.to(weight.dtype) if grad_weight is not None else None,
             grad_bias.to(bias.dtype) if grad_bias is not None else None,
             None, None, None, None, None
@@ -506,29 +454,24 @@ def chunked_log_probs(
         chunk_size: int = 256,
         ignore_index: int = -100,
         temperature: float = 1.0,
-        vocab_chunk_size: Optional[int] = 32768,
+        vocab_chunk_size: Optional[int] = None,
 ) -> torch.Tensor:
-    orig_shape = targets.shape
-    if hidden_states.dim() == 3:
-        hidden = hidden_states.reshape(-1, hidden_states.size(-1))
-        flat_targets = targets.reshape(-1)
-    else:
-        hidden = hidden_states
-        flat_targets = targets
+    vocab_size = lm_head_weight.ds_shape[0] if hasattr(lm_head_weight, "ds_shape") else lm_head_weight.size(0)
+    mask = (targets != ignore_index) & (targets >= 0) & (targets < vocab_size)
 
     with maybe_gather_lm_head_ctx(lm_head_weight, lm_head_bias):
-        flat_log_probs = ChunkedLogProbFunction.apply(
-            hidden,
+        valid_log_probs = ChunkedLogProbFunction.apply(
+            hidden_states[mask],
             lm_head_weight,
             lm_head_bias,
-            flat_targets,
+            targets[mask],
             chunk_size,
             ignore_index,
             temperature,
             vocab_chunk_size,
         )
 
-    return flat_log_probs.view(orig_shape)
+    return valid_log_probs.new_zeros(targets.shape).masked_scatter(mask, valid_log_probs)
 
 
 class ChunkedLMLoss(nn.Module):
@@ -549,6 +492,7 @@ class ChunkedLMLoss(nn.Module):
             lm_head_bias: Optional[torch.Tensor] = None,
             teacher_logits: Optional[torch.Tensor] = None,
             kd_coef: float = 0.0,
+            loss_denom: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         has_teacher = (teacher_logits is not None and kd_coef > 0.0)
         if hidden_states.dim() == 3:
@@ -560,49 +504,35 @@ class ChunkedLMLoss(nn.Module):
                 hidden = hidden_states
                 shift_labels = labels
                 shift_teacher_logits = teacher_logits if has_teacher else None
-
-            if not has_teacher:
-                # add_fused_lm_head：在进入 Function.apply 前先用 mask 过滤有效 Token，
-                # 避免对包含大量 -100 (Prompt/Pad) 的 [B, S-1, H] 做全量 reshape 拷贝
-                vocab_size = lm_head_weight.ds_shape[0] if hasattr(lm_head_weight, "ds_shape") else lm_head_weight.size(0)
-                mask = (shift_labels != self.ignore_index) & (shift_labels >= 0) & (shift_labels < vocab_size)
-                hidden_filtered = hidden[mask]
-                labels_filtered = shift_labels[mask]
-                with maybe_gather_lm_head_ctx(lm_head_weight, lm_head_bias):
-                    total_loss, ce_loss = ChunkedCrossEntropyFunction.apply(
-                        hidden_filtered,
-                        lm_head_weight,
-                        lm_head_bias,
-                        labels_filtered,
-                        None,
-                        self.chunk_size,
-                        self.ignore_index,
-                        0.0
-                    )
-                # 若当前 rank 全为 -100 (mask.any() == False)，保持 total_loss 与主干 hidden 连通
-                if not mask.any():
-                    total_loss = total_loss + (hidden.sum() * 0.0).to(total_loss.dtype)
-                return total_loss, ce_loss
-
-            hidden = hidden.reshape(-1, hidden.size(-1))
-            shift_labels = shift_labels.reshape(-1)
-            shift_teacher_logits = shift_teacher_logits.reshape(-1, shift_teacher_logits.size(-1)) if shift_teacher_logits is not None else None
         else:
             hidden = hidden_states
             shift_labels = labels
             shift_teacher_logits = teacher_logits if has_teacher else None
 
+        # 无论是否开启知识蒸馏 (has_teacher)，统一先通过布尔掩码过滤有效 Token，
+        # 避免对非连续切片 [B, S-1, V] 调用 .reshape() 触发全量显存深拷贝
+        vocab_size = lm_head_weight.ds_shape[0] if hasattr(lm_head_weight, "ds_shape") else lm_head_weight.size(0)
+        mask = (shift_labels != self.ignore_index) & (shift_labels >= 0) & (shift_labels < vocab_size)
+        hidden_filtered = hidden[mask]
+        labels_filtered = shift_labels[mask]
+        teacher_filtered = shift_teacher_logits[mask] if shift_teacher_logits is not None else None
+
         with maybe_gather_lm_head_ctx(lm_head_weight, lm_head_bias):
-            return ChunkedCrossEntropyFunction.apply(
-                hidden,
+            total_loss, ce_loss = ChunkedCrossEntropyFunction.apply(
+                hidden_filtered,
                 lm_head_weight,
                 lm_head_bias,
-                shift_labels,
-                shift_teacher_logits,
+                labels_filtered,
+                teacher_filtered,
                 self.chunk_size,
                 self.ignore_index,
-                kd_coef
+                kd_coef if has_teacher else 0.0,
+                loss_denom,
             )
+
+        # 始终保持 total_loss 与主干 hidden 的 Autograd 梯度图连通，防止全 -100 微批次下梯度断连
+        total_loss = total_loss + (hidden.sum() * 0.0).to(total_loss.dtype)
+        return total_loss, ce_loss
 
 
 class LMLoss(nn.Module):
@@ -616,56 +546,215 @@ class LMLoss(nn.Module):
         super().__init__()
         self.ignore_index = ignore_index
 
-    def forward(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        # logits shape (batch, seq_len, vocab_size)
-        # labels shape (batch, seq_len)
-
-        # shift_logits = logits[..., :-1, :].contiguous()
-        # shift_labels = labels[..., 1:].contiguous()
-        # logits = shift_logits.reshape(-1, logits.shape[-1])
-        # targets = shift_labels.reshape(-1)
-
+    def forward(
+            self,
+            logits: torch.Tensor,
+            labels: torch.Tensor,
+            loss_denom: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         shift_labels = F.pad(labels[..., 1:], (0, 1), value=self.ignore_index)
         logits = logits.reshape(-1, logits.shape[-1])
         targets = shift_labels.reshape(-1)
-        valid_mask = targets != self.ignore_index
-        if not valid_mask.any():
-            return (logits.float() * 0.0).sum()
+        vocab_size = logits.shape[-1]
+        valid_mask = (targets != self.ignore_index) & (targets >= 0) & (targets < vocab_size)
+        safe_targets = torch.where(valid_mask, targets, torch.full_like(targets, self.ignore_index))
+        if loss_denom is not None:
+            denom = loss_denom.to(device=logits.device, dtype=torch.float32).clamp(min=1e-8)
+        else:
+            denom = _get_global_valid_token_denom(valid_mask.sum())
 
-        ce_loss = F.cross_entropy(
+        ce_loss_sum = F.cross_entropy(
             logits,
-            targets,
+            safe_targets,
             ignore_index=self.ignore_index,
+            reduction="sum",
         )
+        return ce_loss_sum / denom + (logits.sum() * 0.0).to(ce_loss_sum.dtype)
 
-        return ce_loss
+
+class ChunkedKDLossFunction(torch.autograd.Function):
+    """
+    分块计算知识蒸馏损失 (Knowledge Distillation Loss)，避免在 [B, S, V] 全量张量上同时物化
+    teacher_probs、logprobs、safe_logprobs、prod_probs 多份 FP32 巨型张量（如 152K 词表下瞬间占用 30+ GB 显存），
+    同时省去对非连续切片 [..., :-1, :] 调用 .contiguous() 带来的全量显存深拷贝。
+    """
+    @staticmethod
+    def forward(
+            ctx,
+            logits: torch.Tensor,
+            teacher_logits: torch.Tensor,
+            labels: torch.Tensor,
+            ignore_index: int = -100,
+            chunk_size: int = 512,
+            loss_denom: Optional[torch.Tensor] = None,
+            shift_labels: bool = True,
+    ) -> torch.Tensor:
+        ctx.set_materialize_grads(False)
+        ctx.ignore_index = ignore_index
+        ctx.chunk_size = chunk_size
+        ctx.shift_labels = shift_labels
+
+        if shift_labels:
+            if logits.dim() == 3:
+                shift_logits = logits[:, :-1, :]
+                shift_teacher = teacher_logits[:, :-1, :]
+                shift_labels_t = labels[:, 1:]
+            elif logits.dim() == 2:
+                # 2D 未切片单序列 [S, V] 与 [S]：执行时序错位切片 [:-1, :] 与 [1:]
+                shift_logits = logits[:-1, :].unsqueeze(0)
+                shift_teacher = teacher_logits[:-1, :].unsqueeze(0)
+                shift_labels_t = labels[1:].unsqueeze(0)
+            else:
+                raise ValueError(f"ChunkedKDLossFunction only supports 2D or 3D logits, got {logits.dim()}D")
+        else:
+            if logits.dim() == 3:
+                shift_logits = logits
+                shift_teacher = teacher_logits
+                shift_labels_t = labels
+            elif logits.dim() == 2:
+                shift_logits = logits.unsqueeze(0)
+                shift_teacher = teacher_logits.unsqueeze(0)
+                shift_labels_t = labels.unsqueeze(0)
+            else:
+                raise ValueError(f"ChunkedKDLossFunction only supports 2D or 3D logits, got {logits.dim()}D")
+
+        vocab_size = shift_logits.size(-1)
+        valid_mask = (shift_labels_t != ignore_index) & (shift_labels_t >= 0) & (shift_labels_t < vocab_size)
+        if loss_denom is not None:
+            denom = loss_denom.to(device=logits.device, dtype=torch.float32).clamp(min=1e-8)
+        else:
+            denom = _get_global_valid_token_denom(valid_mask.sum())
+
+        loss_sum = torch.zeros((), dtype=torch.float32, device=logits.device)
+        batch_size, seq_len, _ = shift_logits.shape
+
+        if batch_size > 0 and seq_len > 0:
+            for b in range(batch_size):
+                for start in range(0, seq_len, chunk_size):
+                    end = min(start + chunk_size, seq_len)
+                    valid_c = valid_mask[b, start:end].unsqueeze(-1)
+                    l_c = shift_logits[b, start:end, :].float()
+                    t_c = shift_teacher[b, start:end, :].to(device=logits.device, dtype=torch.float32)
+
+                    t_probs_c = F.softmax(t_c, dim=-1)
+                    log_p_c = F.log_softmax(l_c, dim=-1)
+                    safe_log_p = torch.clamp(log_p_c, min=-100.0)
+                    prod = torch.where(
+                        (t_probs_c > 0) & valid_c,
+                        t_probs_c * safe_log_p,
+                        torch.zeros_like(safe_log_p),
+                    )
+                    loss_sum = loss_sum - prod.sum()
+
+        ctx.save_for_backward(logits, teacher_logits, labels, denom)
+        return loss_sum / denom
+
+    @staticmethod
+    def backward(ctx, grad_output: Optional[torch.Tensor]):
+        logits, teacher_logits, labels, denom = ctx.saved_tensors
+        ignore_index = ctx.ignore_index
+        chunk_size = ctx.chunk_size
+        shift_labels = ctx.shift_labels
+
+        needs_l_grad = ctx.needs_input_grad[0]
+        needs_t_grad = ctx.needs_input_grad[1]
+        grad_logits = torch.zeros_like(logits) if needs_l_grad else None
+        grad_teacher = torch.zeros_like(teacher_logits) if needs_t_grad else None
+
+        if grad_output is not None and (needs_l_grad or needs_t_grad):
+            if shift_labels:
+                if logits.dim() == 3:
+                    shift_logits = logits[:, :-1, :]
+                    shift_teacher = teacher_logits[:, :-1, :]
+                    shift_labels_t = labels[:, 1:]
+                    grad_shift_l = grad_logits[:, :-1, :] if grad_logits is not None else None
+                    grad_shift_t = grad_teacher[:, :-1, :] if grad_teacher is not None else None
+                else:
+                    shift_logits = logits[:-1, :].unsqueeze(0)
+                    shift_teacher = teacher_logits[:-1, :].unsqueeze(0)
+                    shift_labels_t = labels[1:].unsqueeze(0)
+                    grad_shift_l = grad_logits[:-1, :].unsqueeze(0) if grad_logits is not None else None
+                    grad_shift_t = grad_teacher[:-1, :].unsqueeze(0) if grad_teacher is not None else None
+            else:
+                if logits.dim() == 3:
+                    shift_logits = logits
+                    shift_teacher = teacher_logits
+                    shift_labels_t = labels
+                    grad_shift_l = grad_logits if grad_logits is not None else None
+                    grad_shift_t = grad_teacher if grad_teacher is not None else None
+                else:
+                    shift_logits = logits.unsqueeze(0)
+                    shift_teacher = teacher_logits.unsqueeze(0)
+                    shift_labels_t = labels.unsqueeze(0)
+                    grad_shift_l = grad_logits.unsqueeze(0) if grad_logits is not None else None
+                    grad_shift_t = grad_teacher.unsqueeze(0) if grad_teacher is not None else None
+
+            vocab_size = shift_logits.size(-1)
+            batch_size, seq_len, _ = shift_logits.shape
+            base_scale = grad_output.float() / denom
+
+            if batch_size > 0 and seq_len > 0:
+                for b in range(batch_size):
+                    for start in range(0, seq_len, chunk_size):
+                        end = min(start + chunk_size, seq_len)
+                        lbl_c = shift_labels_t[b, start:end]
+                        valid_c = (lbl_c != ignore_index) & (lbl_c >= 0) & (lbl_c < vocab_size)
+                        scale_c = torch.where(valid_c, base_scale, torch.zeros_like(base_scale)).unsqueeze(-1)
+
+                        l_c = shift_logits[b, start:end, :].float()
+                        t_c = shift_teacher[b, start:end, :].to(device=logits.device, dtype=torch.float32)
+
+                        t_probs_c = F.softmax(t_c, dim=-1)
+                        log_p_c = F.log_softmax(l_c, dim=-1)
+                        p_s_c = torch.exp(log_p_c)
+
+                        active_mask = (t_probs_c > 0) & (log_p_c >= -100.0)
+                        t_probs_eff = torch.where(active_mask, t_probs_c, torch.zeros_like(t_probs_c))
+
+                        if grad_shift_l is not None:
+                            t_sum = t_probs_eff.sum(dim=-1, keepdim=True)
+                            d_l_c = (p_s_c * t_sum - t_probs_eff) * scale_c
+                            grad_shift_l[b, start:end, :].copy_(d_l_c.to(logits.dtype))
+
+                        if grad_shift_t is not None:
+                            safe_log_p = torch.where(t_probs_c > 0, torch.clamp(log_p_c, min=-100.0), torch.zeros_like(log_p_c))
+                            expected_log_p = (t_probs_c * safe_log_p).sum(dim=-1, keepdim=True)
+                            d_t_c = -t_probs_c * (safe_log_p - expected_log_p) * scale_c
+                            grad_shift_t[b, start:end, :].copy_(d_t_c.to(teacher_logits.dtype))
+
+        return grad_logits, grad_teacher, None, None, None, None, None
 
 
 class KDLoss(nn.Module):
     """
     Language Model Knowledge Distillation Loss
     """
-    def __init__(self, ignore_index: int = -100):
+    def __init__(self, ignore_index: int = -100, chunk_size: int = 512, shift_labels: bool = True):
         super().__init__()
         self.ignore_index = ignore_index
+        self.chunk_size = chunk_size
+        self.shift_labels = shift_labels
 
-    def forward(self, logits: torch.Tensor, teacher_logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        logits = logits[..., :-1, :].contiguous()
-        teacher_logits = teacher_logits[..., :-1, :].contiguous()
-        labels = labels[..., 1:].contiguous()
-
-        teacher_probs = F.softmax(teacher_logits, dim=-1, dtype=torch.float32)
-
-        logprobs = F.log_softmax(logits, dim=-1, dtype=torch.float32)
-        safe_logprobs = torch.clamp(logprobs, min=-100.0)
-        prod_probs = torch.where(teacher_probs > 0, teacher_probs * safe_logprobs, torch.zeros_like(safe_logprobs))
-
-        x = torch.sum(prod_probs, dim=-1).view(-1)
-        mask = (labels != self.ignore_index).float().view(-1)
-        safe_x = torch.where(mask > 0, x, torch.zeros_like(x))
-        distil_loss = -torch.sum(safe_x) / torch.sum(mask).clamp(min=1.0)
-
-        return distil_loss
+    def forward(
+            self,
+            logits: torch.Tensor,
+            teacher_logits: torch.Tensor,
+            labels: torch.Tensor,
+            loss_denom: Optional[torch.Tensor] = None,
+            shift_labels: Optional[bool] = None,
+    ) -> torch.Tensor:
+        if shift_labels is None:
+            shift_labels = self.shift_labels
+        distil_loss = ChunkedKDLossFunction.apply(
+            logits,
+            teacher_logits,
+            labels,
+            self.ignore_index,
+            self.chunk_size,
+            loss_denom,
+            shift_labels,
+        )
+        return distil_loss + (logits.sum() * 0.0).to(torch.float32)
 
 
 def log1mexp(x: torch.Tensor) -> torch.Tensor:
@@ -695,6 +784,18 @@ class DPOLoss(nn.Module):
         self.loss_type = loss_type
         self.simpo_gamma = simpo_gamma
 
+    @staticmethod
+    def _masked_mean(
+            losses: torch.Tensor,
+            chosen_lengths: Optional[torch.Tensor],
+            reject_lengths: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if chosen_lengths is not None and reject_lengths is not None:
+            valid_pair = (chosen_lengths > 0) & (reject_lengths > 0)
+            valid_losses = torch.where(valid_pair, losses, torch.zeros_like(losses))
+            return valid_losses.sum() / valid_pair.float().sum().clamp(min=1.0) + 0.0 * losses.sum()
+        return losses.mean()
+
     def forward(
             self,
             policy_chosen_logps: torch.Tensor,
@@ -717,11 +818,7 @@ class DPOLoss(nn.Module):
 
             log_odds_ratio = log_odds_chosen - log_odds_rejected
             losses = self.beta * -F.logsigmoid(log_odds_ratio)
-            if chosen_lengths is not None and reject_lengths is not None:
-                valid_pair = (chosen_lengths > 0) & (reject_lengths > 0)
-                losses = torch.where(valid_pair, losses, torch.zeros_like(losses))
-                return losses.sum() / valid_pair.float().sum().clamp(min=1.0)
-            return losses.mean()
+            return self._masked_mean(losses, chosen_lengths, reject_lengths)
 
         if self.loss_type == 'simpo':
             # SimPO: Simple Preference Optimization
@@ -731,7 +828,7 @@ class DPOLoss(nn.Module):
                 -F.logsigmoid(self.beta * logits) * (1.0 - self.label_smoothing)
                 - F.logsigmoid(-self.beta * logits) * self.label_smoothing
             )
-            return losses.mean()
+            return self._masked_mean(losses, chosen_lengths, reject_lengths)
 
         policy_chosen_logps = policy_chosen_logps.float()
         policy_reject_logps = policy_reject_logps.float()
@@ -766,12 +863,7 @@ class DPOLoss(nn.Module):
                     - F.logsigmoid(-self.beta * logits) * self.label_smoothing
             )
 
-        loss = losses.mean()
-
-        # chosen_rewards = self.beta * (policy_chosen_probs - ref_chosen_probs).detach()
-        # rejected_rewards = self.beta * (policy_reject_probs - ref_reject_probs).detach()
-
-        return loss
+        return self._masked_mean(losses, chosen_lengths, reject_lengths)
 
 
 class PPOLoss(nn.Module):
@@ -807,7 +899,7 @@ class PPOLoss(nn.Module):
         if self.value_loss_type == 'huber':
             # F.smooth_l1_loss 内部在 |x - y| < beta 二次区间已包含 0.5 系数
             return F.smooth_l1_loss(pred_values, target_returns, reduction='none', beta=self.huber_delta)
-        # 标准 PPO / TRL 的 MSE Value Loss: 0.5 * (V - R)^2，与 Huber 二次区间的 0.5 系数严格对齐
+        # 标准 MSE Value Loss: 0.5 * (V - R)^2，与 Huber 二次区间的 0.5 系数严格对齐
         return 0.5 * ((pred_values - target_returns) ** 2)
 
     def forward(
@@ -906,12 +998,21 @@ class GRPOLoss(nn.Module):
             vespo_lambda_pos: float = 3.0,
             vespo_k_neg: float = 3.0,
             vespo_lambda_neg: float = 2.0,
+            use_bias_correction_kl: bool = True,
     ):
         super().__init__()
 
         self.beta = beta
         self.clip_eps_low = clip_eps_low
-        self.clip_eps_high = clip_eps_high if clip_eps_high is not None else clip_eps_low
+        if loss_type == "cispo":
+            # CISPO 中 clip_eps_high 代表重要性采样比率的绝对截断上界 (ScaleRL 推荐值为 5.0)
+            # 若未显式传入或沿用了传统 GRPO 默认的相对偏移量 (<= 1.0)，自动重设为 5.0
+            if clip_eps_high is None or clip_eps_high <= 1.0:
+                self.clip_eps_high = 5.0
+            else:
+                self.clip_eps_high = clip_eps_high
+        else:
+            self.clip_eps_high = clip_eps_high if clip_eps_high is not None else clip_eps_low
         self.delta = delta
         self.importance_sampling_level = importance_sampling_level
         self.loss_type = loss_type
@@ -922,6 +1023,7 @@ class GRPOLoss(nn.Module):
         self.vespo_lambda_pos = vespo_lambda_pos
         self.vespo_k_neg = vespo_k_neg
         self.vespo_lambda_neg = vespo_lambda_neg
+        self.use_bias_correction_kl = use_bias_correction_kl
 
     @staticmethod
     @torch.no_grad()
@@ -992,11 +1094,6 @@ class GRPOLoss(nn.Module):
         if advantages.dim() == 1:
             advantages = advantages.unsqueeze(-1)
 
-        if self.beta != 0.0 and ref_log_probs is not None:
-            per_token_kl = torch.exp(ref_log_probs - log_probs) - (ref_log_probs - log_probs) - 1
-        else:
-            per_token_kl = None
-
         log_ratio = log_probs - old_log_probs
         if self.importance_sampling_level == "sequence":
             log_importance_weights = (log_ratio * completion_mask).sum(-1, keepdim=True) / completion_mask.sum(-1, keepdim=True).clamp(min=1.0)
@@ -1005,6 +1102,13 @@ class GRPOLoss(nn.Module):
 
         raw_coef = torch.exp(log_importance_weights)
         coef_1 = raw_coef
+
+        if self.beta != 0.0 and ref_log_probs is not None:
+            per_token_kl = torch.exp(ref_log_probs - log_probs) - (ref_log_probs - log_probs) - 1
+            if self.use_bias_correction_kl:
+                per_token_kl = per_token_kl * coef_1.detach()
+        else:
+            per_token_kl = None
 
         if self.loss_type == "cispo":
             clamped_ratios = torch.clamp(coef_1, max=self.clip_eps_high).detach()
@@ -1069,6 +1173,8 @@ class GRPOLoss(nn.Module):
                     ((advantages > 0) & (raw_coef > 1 + self.clip_eps_high)) |
                     ((advantages < 0) & (raw_coef < 1 - self.clip_eps_low))
                 )
+                if self.delta is not None:
+                    is_clipped = is_clipped | ((advantages != 0) & (raw_coef > self.delta))
             elif self.loss_type == "cispo":
                 is_clipped = (raw_coef > self.clip_eps_high) & (advantages > 0)
             else:

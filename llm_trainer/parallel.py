@@ -1,4 +1,5 @@
 import os
+import atexit
 from typing import Optional, Tuple
 from abc import ABC, abstractmethod
 
@@ -44,6 +45,9 @@ class Parallel(ABC):
         self._setup_hardware()
         if self._use_parallel and init_process_group and not dist.is_initialized():
             dist.init_process_group(backend=self.dist_backend)
+
+        if self._use_parallel:
+            atexit.register(self._cleanup_process_group)
 
         Logger.std_log(
             f'backend={self.dist_backend}, global_rank={self.global_rank}, '
@@ -99,10 +103,16 @@ class Parallel(ABC):
 
     def on_epoch_end(self, epoch): ...
 
-    def destroy(self):
+    def _cleanup_process_group(self):
         if self._use_parallel and dist.is_initialized():
             try:
                 dist.destroy_process_group()
+            except Exception: ...
+
+    def destroy(self):
+        if self._use_parallel and dist.is_initialized():
+            try:
+                dist.barrier()
             except Exception: ...
 
     @property
@@ -132,7 +142,7 @@ class Parallel(ABC):
         return 1
 
     def wait(self, msg=None):
-        if self.world_size == 1:
+        if self.world_size == 1 or not dist.is_initialized():
             return
 
         msg = f' for {msg}' if msg else ''

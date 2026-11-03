@@ -26,13 +26,13 @@ class Logger:
     @staticmethod
     def std_log(msg: str):
         log_content = Logger._build_log(msg)
-        print(log_content)
+        print(log_content, flush=True)
 
     def log(self, msg: str, log_to_console = True):
         log_content = Logger._build_log(msg)
 
         if log_to_console:
-            print(log_content)
+            print(log_content, flush=True)
 
         if self._open_file():
             self.log_file.write(f'{log_content}\n')

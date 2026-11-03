@@ -383,7 +383,12 @@ def _check_tied_embeddings_zero3_warning(origin_model: nn.Module, unwrapped: nn.
     if not isinstance(TrainerTools().parallel, DsParallel):
         return
 
-    if origin_model.zero_optimization_stage() != 3:
+    if hasattr(origin_model, "zero_optimization_stage"):
+        is_zero3 = (origin_model.zero_optimization_stage() == 3)
+    else:
+        is_zero3 = any(hasattr(p, "ds_id") for p in unwrapped.parameters())
+
+    if not is_zero3:
         return
 
     lm_head = getattr(unwrapped, "lm_head", None)

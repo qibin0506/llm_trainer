@@ -10,7 +10,7 @@ from .parallel import DsParallel
 from .scheduler import LRScheduler
 from .tools import TrainerTools
 
-_DEFAULT_MODEL_NAME = "model.pth"
+_DEFAULT_MODEL_NAME = "model.pt"
 _DEFAULT_STEPS_NAME = 'steps.pt'
 
 
@@ -59,9 +59,12 @@ def save_checkpoint(
         extra_module: Optional[nn.Module] = None,
         checkpoint_path: Optional[str] = None
 ):
+    if os.environ.get("SAVE_CHECKPOINT", "1") == "0":
+        return
+
     if isinstance(TrainerTools().parallel, DsParallel):
-        from .ds_checkpoint import save_ds_checkpoint
-        save_ds_checkpoint(
+        from .ds_checkpoint import _save_ds_checkpoint
+        _save_ds_checkpoint(
             model,
             extra_module=extra_module,
             checkpoint_path=checkpoint_path
@@ -93,8 +96,8 @@ def load_checkpoint(
         checkpoint_path: Optional[str] = None
 ):
     if isinstance(TrainerTools().parallel, DsParallel):
-        from .ds_checkpoint import load_ds_checkpoint
-        load_ds_checkpoint(
+        from .ds_checkpoint import _load_ds_checkpoint
+        _load_ds_checkpoint(
             model,
             load_module_only=load_module_only,
             extra_module=extra_module,
@@ -127,6 +130,8 @@ def save_steps(
     dataloader_rng_state: Optional[torch.Tensor] = None,
     checkpoint_path: Optional[str] = None
 ):
+    if os.environ.get("SAVE_CHECKPOINT", "1") == "0":
+        return
     local_rng_state = get_rng_state_dict()
     world_size = TrainerTools().parallel.world_size
 

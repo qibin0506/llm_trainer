@@ -21,7 +21,7 @@ load_state_dict_from_zero_checkpoint	从 ZeRO 检查点加载模型和优化器�
 convert_zero_checkpoint_to_fp32_state_dict	将 ZeRO 检查点转换为独立的 FP32 状态字典文件	否	是	创建可移植的 FP32 权重文件，用于部署、分享等
 """
 
-def save_ds_checkpoint(
+def _save_ds_checkpoint(
         model: nn.Module,
         extra_module: Optional[nn.Module] = None,
         checkpoint_path: Optional[str] = None
@@ -55,7 +55,7 @@ def save_ds_checkpoint(
     TrainerTools().parallel.wait('remove old ds checkpoint')
 
 
-def load_ds_checkpoint(
+def _load_ds_checkpoint(
         model: nn.Module,
         load_module_only: bool = False,
         extra_module: Optional[nn.Module] = None,

@@ -34,7 +34,16 @@ class TrainerTools:
             Logger.std_log(f'word_size={self.parallel.world_size}, use_amp={self.use_amp}')
 
     def _new_parallel(self):
-        parallel_type = os.environ.get('PARALLEL_TYPE', 'none')
+        parallel_type = os.environ.get('PARALLEL_TYPE')
+        if parallel_type not in _PARALLEL_TYPES:
+            is_distributed = any(k in os.environ for k in ('RANK', 'LOCAL_RANK', 'WORLD_SIZE'))
+            try:
+                import deepspeed
+                has_ds = True
+            except ImportError:
+                has_ds = False
+            parallel_type = 'ds' if (is_distributed and has_ds) else 'none'
+
         Logger.std_log(f'parallel_type={parallel_type}')
         return _PARALLEL_TYPES[parallel_type]()
 

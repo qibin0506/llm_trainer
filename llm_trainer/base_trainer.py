@@ -18,7 +18,7 @@ from .tools import TrainerTools
 from .partition_utils import unwrap_model_for_generation
 from .generate_utils import generate
 from .log import Logger, _get_log_dir
-from .train_configs import TrainConfig, GenerationService
+from .train_configs import TrainConfig, GenerationService, OptimConfig
 from .scheduler import LRScheduler, WarmupCosineAnnealingLRScheduler, NoneLRScheduler
 from .checkpoint import (
     load_checkpoint,
@@ -141,7 +141,8 @@ class BaseTrainer:
             self,
             model: torch.nn.Module,
             weights_path: str,
-            prefixes: Optional[List[str]] = None
+            prefixes: Optional[List[str]] = None,
+            exclude_prefixes: Optional[List[str]] = None
     ):
         max_elements_per_chunk = int(os.environ.get('LOAD_WEIGHTS_MAX_ELEMENTS_PER_CHUNK', 100_000_000))
 
@@ -196,7 +197,15 @@ class BaseTrainer:
                 for k, v in state_dict.items():
                     for prefix in prefixes:
                         mapped_state_dict[prefix + k] = v
+                        if prefix and k.startswith(prefix):
+                            mapped_state_dict[k[len(prefix):]] = v
                 state_dict = mapped_state_dict
+
+            if exclude_prefixes:
+                state_dict = {
+                    k: v for k, v in state_dict.items()
+                    if not any(k.startswith(ex) for ex in exclude_prefixes)
+                }
 
             valid_keys = []
             if TrainerTools().parallel.is_main_process:
@@ -357,10 +366,13 @@ class BaseTrainer:
                     0.015 if optim_config.optim_type == 'lion' else 0.01)
             )
 
-    def _get_optim_cls(self):
+    def _get_optim_cls(self, optim_config: Optional[OptimConfig] = None):
+        if optim_config is None:
+            optim_config = self.train_config.optim_config
+
         optimizer = None
 
-        if (self.train_config.optim_config.auto_optimize_optimizer
+        if (optim_config.auto_optimize_optimizer
                 and self.is_ds
                 and self.parallel_kwargs
         ):
@@ -369,7 +381,7 @@ class BaseTrainer:
                     and 'offload_optimizer' in self.parallel_kwargs['zero_optimization']
                     and self.parallel_kwargs['zero_optimization']['offload_optimizer']['device'] == 'cpu'):
                 if torch.cuda.is_available():
-                    if self.train_config.optim_config.optim_type == 'lion':
+                    if optim_config.optim_type == 'lion':
                         if version.parse(importlib.metadata.version("deepspeed")) >= version.parse('0.17.6'):
                             optimizer = deepspeed.ops.lion.DeepSpeedCPULion
                         else:
@@ -381,13 +393,13 @@ class BaseTrainer:
                         optimizer = deepspeed.ops.adam.DeepSpeedCPUAdam
             else:
                 if torch.cuda.is_available():
-                    if self.train_config.optim_config.optim_type == 'lion':
+                    if optim_config.optim_type == 'lion':
                         optimizer = deepspeed.ops.lion.FusedLion
                     else:
                         optimizer = deepspeed.ops.adam.FusedAdam
 
         if not optimizer:
-            if self.train_config.optim_config.optim_type == 'lion':
+            if optim_config.optim_type == 'lion':
                 try:
                     import lion_pytorch
                 except ImportError:

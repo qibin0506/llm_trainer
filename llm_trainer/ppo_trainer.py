@@ -17,7 +17,6 @@ from .loss import PPOLoss
 from .tools import TrainerTools
 from .generate_utils import batch_generate
 from .log import Logger
-from .parallel import DsParallel
 from .train_configs import TrainConfig, RewardFun, GenerationService
 from .utils import (
     autocast,
@@ -56,6 +55,7 @@ class ValueHead(nn.Linear):
 class ValueModel(nn.Module):
     def __init__(self, base_model: Union[LlmModel, VlmModel]):
         super().__init__()
+        self.is_gradient_checkpointing = False
         self.base_model = base_model
 
         # 冻结 base_model.lm_head：ValueModel 仅利用 hidden_states 通过 value_head 输出标量，
@@ -69,6 +69,14 @@ class ValueModel(nn.Module):
                     p.requires_grad = False
 
         self.value_head = ValueHead(base_model.config.hidden_size, 1, bias=True)
+
+    def gradient_checkpointing_enable(self, checkpoint_func=None):
+        self.is_gradient_checkpointing = True
+        self.base_model.gradient_checkpointing_enable(checkpoint_func)
+
+    def gradient_checkpointing_disable(self):
+        self.is_gradient_checkpointing = False
+        self.base_model.gradient_checkpointing_disable()
 
     def forward(self, *args, **kwargs) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         base_kwargs = {k: v for k, v in kwargs.items() if k not in ('return_logits', 'logits_to_keep', 'fused_lm_head', 'fused_loss', 'fused_log_probs', 'completion_ids', 'completion_mask', 'temperature')}
@@ -200,14 +208,15 @@ class PPOTrainer(BaseTrainer):
             self._load_external_weights(
                 train_model,
                 self.train_config.init_weights_path,
-                prefixes=['policy_model.', 'value_model.base_model.']
+                prefixes=['policy_model.', 'value_model.base_model.', '']
             )
 
         if self.ppo_config.value_model_weights_path is not None:
             self._load_external_weights(
-                train_model,
+                train_model.value_model,
                 self.ppo_config.value_model_weights_path,
-                prefixes=['value_model.', 'value_model.base_model.']
+                prefixes=['', 'base_model.', 'value_model.'],
+                exclude_prefixes=['policy_model.']
             )
 
         optimizer = self._config_optim(train_model, initial_lr)
@@ -228,7 +237,7 @@ class PPOTrainer(BaseTrainer):
     def _config_optim(self, model, initial_lr):
         policy_config = self.train_config.optim_config
         value_config = self.ppo_config.value_optim_config if self.ppo_config.value_optim_config else policy_config
-        optim_cls = self._get_optim_cls()
+        optim_cls = self._get_optim_cls(policy_config)
         policy_data = self._build_optimizer_param_groups(model.policy_model, policy_config, name_prefix="policy")
         value_data = self._build_optimizer_param_groups(model.value_model, value_config, name_prefix="value")
         is_muon = (policy_config.optim_type == 'muon' or value_config.optim_type == 'muon')
@@ -432,6 +441,28 @@ class PPOTrainer(BaseTrainer):
 
         return CompositeLRScheduler(schedulers)
 
+    def _init_frozen_model(self, weights_path: Optional[str] = None) -> nn.Module:
+        parallel_kwargs = self._init_ref_model_args(self.train_config.model_config)
+        with self._new_model_context(parallel_kwargs):
+            model = self._new_model(self.train_config)
+
+        model.eval()
+        for param in model.parameters():
+            param.requires_grad = False
+
+        if weights_path:
+            self._load_external_weights(model, weights_path)
+        self._check_add_fused_head(model)
+
+        model, _ = TrainerTools().parallel.process(
+            model=model,
+            optimizer=None,
+            kwargs=parallel_kwargs,
+            save_instance=False
+        )
+
+        return model
+
     def _init_ref_model(self):
         if self.ppo_config.kl_beta == 0.0:
             return None
@@ -443,25 +474,7 @@ class PPOTrainer(BaseTrainer):
                 "Please configure `ref_model_weights_path` in PPOConfig to prevent using randomly initialized weights in distributed training."
             )
 
-        parallel_kwargs = self._init_ref_model_args(self.train_config.model_config)
-        with self._new_model_context(parallel_kwargs):
-            ref_model = self._new_model(self.train_config)
-
-        ref_model.eval()
-        for param in ref_model.parameters():
-            param.requires_grad = False
-
-        self._load_external_weights(ref_model, self.ppo_config.ref_model_weights_path)
-        self._check_add_fused_head(ref_model)
-
-        ref_model, _ = TrainerTools().parallel.process(
-            model=ref_model,
-            optimizer=None,
-            kwargs=parallel_kwargs,
-            save_instance=False
-        )
-
-        return ref_model
+        return self._init_frozen_model(self.ppo_config.ref_model_weights_path)
 
     def _new_model(self, train_config: TrainConfig):
         model = super()._new_model(train_config)
@@ -707,6 +720,12 @@ class PPOTrainer(BaseTrainer):
 
         return torch.cat(all_log_probs, dim=0)
 
+    def _get_rollout_model_for_generation(self):
+        return self.train_model
+
+    def _get_rollout_generation_model(self, unwrapped_model):
+        return unwrapped_model.policy_model
+
     def _sample_rollout_completions(self, batch_data: List[dict]) -> dict:
         device = TrainerTools().parallel.device
         pad_token_id = TrainerTools().tokenizer.pad
@@ -740,9 +759,10 @@ class PPOTrainer(BaseTrainer):
         padded_gen_masks = []
 
         with torch.no_grad():
+            rollout_model = self._get_rollout_model_for_generation()
             if self.generation_service is not None:
                 service_output = self.generation_service(
-                    self.train_model, padded_prompt_ids, self.ppo_config.generate_config,
+                    rollout_model, padded_prompt_ids, self.ppo_config.generate_config,
                     'ppo', None, None
                 )
 
@@ -804,9 +824,11 @@ class PPOTrainer(BaseTrainer):
 
                 TrainerTools().parallel.wait('rollout')
             else:
-                with unwrap_model_for_generation(self.train_model) as unwrapped_model:
+                with unwrap_model_for_generation(rollout_model) as unwrapped_model:
+                    orig_training = unwrapped_model.training
                     unwrapped_model.eval()
                     try:
+                        generation_model = self._get_rollout_generation_model(unwrapped_model)
                         gen_chunk_size = self.ppo_config.generate_config.chunked_generate_size
                         if gen_chunk_size is None or gen_chunk_size <= 0:
                             gen_chunk_size = padded_prompt_ids.size(0)
@@ -817,7 +839,7 @@ class PPOTrainer(BaseTrainer):
                             chunk_prompts = padded_prompt_ids[start_idx: start_idx + gen_chunk_size]
                             chunk_masks = prompt_masks[start_idx: start_idx + gen_chunk_size]
                             chunk_out, _ = batch_generate(
-                                model=unwrapped_model.policy_model,
+                                model=generation_model,
                                 tokens=chunk_prompts,
                                 attention_mask=chunk_masks,
                                 max_new_tokens=max_new_tokens,
@@ -864,7 +886,10 @@ class PPOTrainer(BaseTrainer):
 
                         TrainerTools().parallel.wait('rollout')
                     finally:
-                        unwrapped_model.train()
+                        if orig_training:
+                            unwrapped_model.train()
+                        else:
+                            unwrapped_model.eval()
                 dones = torch.any(completion_ids == eos_token_id, dim=1)
 
         return {
@@ -879,6 +904,50 @@ class PPOTrainer(BaseTrainer):
             'external_gen_mask': external_gen_mask,
             'padded_gen_masks': padded_gen_masks,
         }
+
+    def _evaluate_rollout_model(
+            self,
+            full_ids: torch.Tensor,
+            full_attention_mask: torch.Tensor,
+            completion_ids: torch.Tensor,
+            loss_mask: torch.Tensor,
+            can_skip_policy: bool
+    ) -> Tuple[Optional[torch.Tensor], torch.Tensor, Optional[torch.Tensor]]:
+        eval_batch_size = self.rollout_eval_batch_size
+        if can_skip_policy:
+            old_log_probs, value_output = self._compute_log_probs_and_values(
+                self.train_model,
+                full_ids,
+                full_attention_mask,
+                completion_ids,
+                completion_mask=loss_mask,
+                batch_size=eval_batch_size,
+                forward_type='value'
+            )
+        else:
+            old_log_probs, value_output = self._compute_log_probs_and_values(
+                self.train_model,
+                full_ids,
+                full_attention_mask,
+                completion_ids,
+                completion_mask=loss_mask,
+                batch_size=eval_batch_size,
+                forward_type='both'
+            )
+
+        if self.ref_model is not None and not can_skip_policy:
+            ref_log_probs_completion = self._compute_ref_log_probs(
+                self.ref_model,
+                full_ids,
+                full_attention_mask,
+                completion_ids,
+                completion_mask=loss_mask,
+                batch_size=eval_batch_size
+            )
+        else:
+            ref_log_probs_completion = None
+
+        return old_log_probs, value_output, ref_log_probs_completion
 
     def _evaluate_rollout_data(self, sample_data: dict) -> dict:
         device = TrainerTools().parallel.device
@@ -922,41 +991,15 @@ class PPOTrainer(BaseTrainer):
             dist.all_reduce(skip_tensor, op=dist.ReduceOp.MIN)
             can_skip_policy = bool(skip_tensor.item() == 1)
 
-        eval_batch_size = self.rollout_eval_batch_size
         with torch.no_grad():
             with autocast(TrainerTools().parallel.device_type):
-                if can_skip_policy:
-                    old_log_probs, value_output = self._compute_log_probs_and_values(
-                        self.train_model,
-                        full_ids,
-                        full_attention_mask,
-                        completion_ids,
-                        completion_mask=loss_mask,
-                        batch_size=eval_batch_size,
-                        forward_type='value'
-                    )
-                else:
-                    old_log_probs, value_output = self._compute_log_probs_and_values(
-                        self.train_model,
-                        full_ids,
-                        full_attention_mask,
-                        completion_ids,
-                        completion_mask=loss_mask,
-                        batch_size=eval_batch_size,
-                        forward_type='both'
-                    )
-
-                if self.ref_model is not None and not can_skip_policy:
-                    ref_log_probs_completion = self._compute_ref_log_probs(
-                        self.ref_model,
-                        full_ids,
-                        full_attention_mask,
-                        completion_ids,
-                        completion_mask=loss_mask,
-                        batch_size=eval_batch_size
-                    )
-                else:
-                    ref_log_probs_completion = None
+                old_log_probs, value_output, ref_log_probs_completion = self._evaluate_rollout_model(
+                    full_ids=full_ids,
+                    full_attention_mask=full_attention_mask,
+                    completion_ids=completion_ids,
+                    loss_mask=loss_mask,
+                    can_skip_policy=can_skip_policy
+                )
 
             rewards = torch.zeros_like(completion_ids, dtype=torch.float32, device=device)
 
@@ -1315,6 +1358,68 @@ class PPOTrainer(BaseTrainer):
 
         return ppo_stats
 
+    def _learning_phase(self, rollout_data: dict) -> dict:
+        return self._ppo_learning_phase(rollout_data)
+
+    def _log_train_stats(
+            self,
+            train_stats: dict,
+            rollout_data: dict,
+            epoch: int,
+            file_idx: int,
+            file_count: int,
+            batch: int,
+            batch_count_per_file: int
+    ):
+        stats_tensor = torch.tensor([
+            train_stats['loss'],
+            train_stats['moe_aux_loss'],
+            train_stats['actor_loss'],
+            train_stats['value_loss'],
+            train_stats['approx_kl'],
+            rollout_data['ref_kl'].item(),
+            train_stats['clip_frac'],
+            train_stats['mean_nll'],
+            train_stats['value_mean'],
+            train_stats['return_mean'],
+            train_stats['value_error'],
+            rollout_data['env_rewards'].item(),
+            train_stats['completion_len'],
+        ], device=TrainerTools().parallel.device)
+
+        if TrainerTools().parallel.parallel_train:
+            if TrainerTools().parallel.device_type == 'mlu':
+                dist.all_reduce(stats_tensor, op=dist.ReduceOp.SUM)
+                stats_tensor.div_(TrainerTools().parallel.world_size)
+            else:
+                dist.all_reduce(stats_tensor, dist.ReduceOp.AVG)
+
+        self._log(
+            keys={
+                'epoch': epoch,
+                'file': f'{file_idx + 1}/{file_count}',
+                'batch': f'{batch + 1}/{batch_count_per_file}'
+            },
+            values={
+                'loss/total': stats_tensor[0].item(),
+                'loss/moe_aux': stats_tensor[1].item(),
+                'loss/actor': stats_tensor[2].item(),
+                'loss/value': stats_tensor[3].item(),
+                'rl/approx_kl': stats_tensor[4].item(),
+                'rl/ref_kl': stats_tensor[5].item(),
+                'rl/clip_frac': stats_tensor[6].item(),
+                'rl/mean_nll': stats_tensor[7].item(),
+                'value/mean': stats_tensor[8].item(),
+                'value/return': stats_tensor[9].item(),
+                'value/error': stats_tensor[10].item(),
+                'env/reward_total': stats_tensor[11].item(),
+                'env/completion_len': stats_tensor[12].item(),
+            }
+        )
+
+    def _should_stop_training(self) -> bool:
+        return False
+
     def train(self):
         global_steps_since_last_save = 0
         global_steps_since_last_eval = 0
@@ -1324,12 +1429,21 @@ class PPOTrainer(BaseTrainer):
         updates_per_rollout = self.ppo_config.ppo_epochs * updates_per_epoch
         global_steps_per_rollout = max(1, updates_per_rollout)
 
+        stop_training = False
+        current_epoch = self.resume_epoch
+        current_file_idx = self.resume_file_idx
+        current_batch_idx = self.resume_batch_idx
+
         for epoch in range(self.resume_epoch, self.train_config.n_epochs):
+            if stop_training:
+                break
             self.train_model.train()
             file_count = len(self.train_config.file_dataset)
             start_file_idx = self.resume_file_idx if epoch == self.resume_epoch else 0
 
             for file_idx in range(start_file_idx, file_count):
+                if stop_training:
+                    break
                 dataset, file_path = self._create_dataset(file_idx)
                 train_data_loader = TrainerTools().parallel.process_dataloader(
                     dataset=dataset,
@@ -1362,6 +1476,9 @@ class PPOTrainer(BaseTrainer):
                         self.resume_rng_state = None
 
                     batch = skip_batches + batch
+                    current_epoch = epoch
+                    current_file_idx = file_idx
+                    current_batch_idx = batch + 1
                     sample_data = None
                     sample_error = None
 
@@ -1409,54 +1526,18 @@ class PPOTrainer(BaseTrainer):
                     self._normalize_rollout_rewards(rollout_data)
 
                     try:
-                        ppo_stats = self._ppo_learning_phase(rollout_data)
+                        ppo_stats = self._learning_phase(rollout_data)
                         global_steps_since_last_save += global_steps_per_rollout
                         global_steps_since_last_eval += global_steps_per_rollout
 
-                        stats_tensor = torch.tensor([
-                            ppo_stats['loss'],
-                            ppo_stats['moe_aux_loss'],
-                            ppo_stats['actor_loss'],
-                            ppo_stats['value_loss'],
-                            ppo_stats['approx_kl'],
-                            rollout_data['ref_kl'].item(),
-                            ppo_stats['clip_frac'],
-                            ppo_stats['mean_nll'],
-                            ppo_stats['value_mean'],
-                            ppo_stats['return_mean'],
-                            ppo_stats['value_error'],
-                            rollout_data['env_rewards'].item(),
-                            ppo_stats['completion_len'],
-                        ], device=TrainerTools().parallel.device)
-
-                        if TrainerTools().parallel.parallel_train:
-                            if TrainerTools().parallel.device_type == 'mlu':
-                                dist.all_reduce(stats_tensor, op=dist.ReduceOp.SUM)
-                                stats_tensor.div_(TrainerTools().parallel.world_size)
-                            else:
-                                dist.all_reduce(stats_tensor, dist.ReduceOp.AVG)
-
-                        self._log(
-                            keys={
-                                'epoch': epoch,
-                                'file': f'{file_idx + 1}/{file_count}',
-                                'batch': f'{batch + 1}/{batch_count_per_file}'
-                            },
-                            values={
-                                'loss/total': stats_tensor[0].item(),
-                                'loss/moe_aux': stats_tensor[1].item(),
-                                'loss/actor': stats_tensor[2].item(),
-                                'loss/value': stats_tensor[3].item(),
-                                'rl/approx_kl': stats_tensor[4].item(),
-                                'rl/ref_kl': stats_tensor[5].item(),
-                                'rl/clip_frac': stats_tensor[6].item(),
-                                'rl/mean_nll': stats_tensor[7].item(),
-                                'value/mean': stats_tensor[8].item(),
-                                'value/return': stats_tensor[9].item(),
-                                'value/error': stats_tensor[10].item(),
-                                'env/reward_total': stats_tensor[11].item(),
-                                'env/completion_len': stats_tensor[12].item(),
-                            }
+                        self._log_train_stats(
+                            train_stats=ppo_stats,
+                            rollout_data=rollout_data,
+                            epoch=epoch,
+                            file_idx=file_idx,
+                            file_count=file_count,
+                            batch=batch,
+                            batch_count_per_file=batch_count_per_file
                         )
 
                         if 0 < self.train_config.save_interval <= global_steps_since_last_save:
@@ -1479,6 +1560,10 @@ class PPOTrainer(BaseTrainer):
                             global_steps_since_last_eval %= self.train_config.eval_interval
 
                         del rollout_data
+
+                        if self._should_stop_training():
+                            stop_training = True
+                            break
                     except Exception as e:
                         self._on_exception(e, epoch, batch)
 
@@ -1502,6 +1587,9 @@ class PPOTrainer(BaseTrainer):
                 gc.collect()
                 empty_cache()
 
+            if stop_training:
+                break
+
             # end epoch
             # reset resume state
             self.resume_file_idx = 0
@@ -1521,5 +1609,18 @@ class PPOTrainer(BaseTrainer):
 
             TrainerTools().parallel.on_epoch_end(epoch)
             self._on_epoch_end(tag=f'epoch:{epoch}')
+
+        if stop_training:
+            save_checkpoint(
+                model=self.train_model,
+                optimizer=self.optimizer,
+                extra_module=self.reward_normalizer
+            )
+            save_steps(
+                epoch=current_epoch,
+                file_idx=current_file_idx,
+                batch_idx=current_batch_idx,
+                lr_scheduler=self.lr_scheduler
+            )
 
         TrainerTools().parallel.destroy()

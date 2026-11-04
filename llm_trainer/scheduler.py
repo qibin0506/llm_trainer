@@ -202,23 +202,27 @@ class WarmupCosineAnnealingLRScheduler(LRScheduler):
 class NoneLRScheduler(LRScheduler):
     def __init__(self, initial_lr):
         self._current_lr = initial_lr
+        self._steps = 0
 
     @property
     def cur_steps(self):
-        return -1
+        return self._steps
 
     @property
     def cur_lr(self):
         return self._current_lr
 
-    def step(self): ...
+    def step(self):
+        self._steps += 1
 
     def get_ckpt_dict(self) -> dict:
-        return {'cur_lr': self._current_lr}
+        return {'cur_lr': self._current_lr, 'lr_steps': self._steps}
 
     def restore_ckpt_dict(self, ckpt: dict):
         if 'cur_lr' in ckpt:
             self._current_lr = ckpt['cur_lr']
+        if 'lr_steps' in ckpt:
+            self._steps = ckpt['lr_steps']
 
 
 class CompositeLRScheduler(LRScheduler):

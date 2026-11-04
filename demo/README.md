@@ -106,7 +106,7 @@ demo/
 ├── run_grpo.py             # GRPO 独立运行脚本 (单轮/多轮，加载 sft_model.pt，保存 grpo_model.pt)
 ├── run_ppo.py              # PPO 独立运行脚本 (单轮/多轮，加载 sft_model.pt，保存 ppo_model.pt)
 ├── main.py                 # 统一命令行调度入口
-├── run_multi_gpu.sh        # 基于 smart_train 的多卡分布式执行脚本
+├── run_multi_gpu.sh        # 基于 torchrun 的多卡分布式执行脚本
 ├── run_all_tests.sh        # 全矩阵 28 项特性组合自动化验证与评估脚本
 ├── data/
 │   ├── tokenizer/          # nanoGPT 字符级分词器 (vocab_size=80, 65 ASCII 字符 + 15 控制 Token)
@@ -129,39 +129,35 @@ python3 demo/prepare_data.py
 
 ---
 
-### 2. 使用 `smart_train` 进行训练
+### 2. 使用标准 `torchrun` 进行分布式训练
 
-`smart_train` 是推荐的训练启动工具，它能自动检测硬件环境：
-- 在 **CUDA 分布式多卡环境** 下，自动通过 `torchrun` 分布式调度；
-- 在 **单卡 / Mac / CPU 环境** 下，自动回退到 `python3` 干净运行，避免 DeepSpeed C++ 扩展报错。
-
-由于原版 `smart_train` 将命令行参数（`extra_args`）直接透传给 `torchrun` 作为启动器参数，`demo/main.py` 全面支持通过环境变量配置训练超参，天然契合 `smart_train` 的设计：
+框架底层已实现自适应检测：当通过 `torchrun` 启动时，会自动配置分布式环境并装载 DeepSpeed 引擎；单卡执行 `python3` 时则自动以单机模式干净运行。
 
 ```bash
 cd demo
 
 # 预训练 Pretrain (ZeRO-2, 2 卡)
-STAGE=pretrain ZERO=2 smart_train main.py --nproc_per_node=2
+torchrun --nproc_per_node=2 main.py --stage pretrain --zero 2
 
 # 监督微调 SFT (ZeRO-2, Chunked, 2 卡，自动载入 pretrain 权重)
-STAGE=sft ZERO=2 CHUNKED=1 smart_train main.py --nproc_per_node=2
+torchrun --nproc_per_node=2 main.py --stage sft --zero 2 --chunked
 
 # 偏好对齐 DPO (ZeRO-3, Chunked, 2 卡，自动载入 SFT 权重)
-STAGE=dpo ZERO=3 CHUNKED=1 smart_train main.py --nproc_per_node=2
+torchrun --nproc_per_node=2 main.py --stage dpo --zero 3 --chunked
 
 # GRPO 强化学习 (ZeRO-2, 单轮或多轮, 2 卡)
-STAGE=grpo ZERO=2 RL_MODE=single smart_train main.py --nproc_per_node=2
-STAGE=grpo ZERO=3 RL_MODE=multi smart_train main.py --nproc_per_node=2
+torchrun --nproc_per_node=2 main.py --stage grpo --zero 2 --rl-mode single
+torchrun --nproc_per_node=2 main.py --stage grpo --zero 3 --rl-mode multi
 
 # PPO 强化学习 (ZeRO-2, 单轮或多轮, 2 卡)
-STAGE=ppo ZERO=2 RL_MODE=single smart_train main.py --nproc_per_node=2
+torchrun --nproc_per_node=2 main.py --stage ppo --zero 2 --rl-mode single
 ```
 
 ---
 
 ### 3. 多卡集群调度脚本 (`run_multi_gpu.sh`)
 
-`run_multi_gpu.sh` 现已整合 `smart_train`，支持便捷的参数透传：
+`run_multi_gpu.sh` 现已整合标准 `torchrun`，支持便捷的参数透传：
 ```bash
 # 2 卡运行 SFT ZeRO-2
 bash demo/run_multi_gpu.sh --nproc 2 --stage sft --zero 2 --chunked

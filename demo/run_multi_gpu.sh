@@ -58,8 +58,6 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-SMART_TRAIN_CMD="$(which smart_train 2>/dev/null || echo "python3 ${SCRIPT_DIR}/../llm_trainer/scripts/smart_train")"
-
 export STAGE="${STAGE}"
 export ZERO="${ZERO}"
 export CHUNKED="${CHUNKED:-0}"
@@ -71,8 +69,7 @@ if [ -n "${INIT_WEIGHTS}" ]; then export INIT_WEIGHTS; fi
 if [ -n "${REF_WEIGHTS}" ]; then export REF_WEIGHTS; fi
 
 echo "=========================================================="
-echo " Launching Training via smart_train"
-echo " Launcher:             ${SMART_TRAIN_CMD}"
+echo " Launching Training via torchrun"
 echo " GPUs (nproc_per_node): ${NPROC}"
 echo " Stage:                ${STAGE}"
 echo " ZeRO Stage:           ${ZERO}"
@@ -80,5 +77,5 @@ echo " Chunked:              ${CHUNKED:-false}"
 echo " RL Mode:              ${RL_MODE}"
 echo "=========================================================="
 
-${SMART_TRAIN_CMD} main.py --nproc_per_node="${NPROC}"
+torchrun --nproc_per_node="${NPROC}" "${SCRIPT_DIR}/main.py"
 

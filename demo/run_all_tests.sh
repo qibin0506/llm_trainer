@@ -40,13 +40,12 @@ while [[ $# -gt 0 ]]; do
 done
 
 RL_BATCH_SIZE=$((BATCH_SIZE > 16 ? 16 : BATCH_SIZE))
-SMART_TRAIN_CMD="$(which smart_train 2>/dev/null || echo "python3 ${SCRIPT_DIR}/../llm_trainer/scripts/smart_train")"
 
 echo "=========================================================="
 echo " Running Full 28-Combination Verification Matrix"
 echo " Stages:               Pretrain (4) / SFT (4) / DPO (4) / GRPO (8) / PPO (8)"
 echo " Dimensions:           ZeRO-2 & ZeRO-3 | Chunked & Non-Chunked | Single-Turn & Multi-Turn RL"
-echo " Launcher:             ${SMART_TRAIN_CMD}"
+echo " Launcher:             torchrun"
 echo " Number of GPUs:       ${NPROC}"
 echo " Batch Size:           ${BATCH_SIZE} (RL: ${RL_BATCH_SIZE})"
 echo " Epochs per Stage:     ${EPOCHS}"

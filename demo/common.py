@@ -315,7 +315,7 @@ def format_chat_prompt(user_content: str, include_assistant_tag: bool = True) ->
     conv = [{"role": "user", "content": user_content}]
     chat_str = tokenizer.apply_chat_template(conv, tokenizer=False)
     if include_assistant_tag:
-        chat_str = f"{chat_str}{tokenizer.text_assistant}{tokenizer.text_answer_start}"
+        chat_str = f"{chat_str}{tokenizer.text_assistant}"
     return chat_str
 
 

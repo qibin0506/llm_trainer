@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='project_llm_trainer',
-    version='0.25.1',
+    version='0.25.2',
     description='LLM and VLM trainer',
     scripts=[
         'scripts/vis_lr',

@@ -5,9 +5,6 @@ setup(
     version='0.24.11',
     description='LLM and VLM trainer',
     scripts=[
-        'scripts/smart_train',
-        'scripts/ds_train',
-        'scripts/py_train',
         'scripts/vis_lr',
         'scripts/vis_log',
         'scripts/calc_intermediate_size',

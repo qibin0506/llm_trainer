@@ -132,6 +132,7 @@ def save_steps(
 ):
     if os.environ.get("SAVE_CHECKPOINT", "1") == "0":
         return
+    
     local_rng_state = get_rng_state_dict()
     world_size = TrainerTools().parallel.world_size
 

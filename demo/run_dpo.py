@@ -41,6 +41,7 @@ def main():
     ref_weights = args.ref_weights or init_weights
 
     dpo_config = DPOConfig(
+        dataset_block_size=512,
         ref_model_weights_path=ref_weights if args.loss_type == "dpo" else None,
         loss_type=args.loss_type,
         loss_beta=0.1,
@@ -56,7 +57,6 @@ def main():
         model_config=model_config,
         init_weights_path=init_weights,
         file_dataset=dataset,
-        dataset_block_size=512,
         data_loader_config=DataLoaderConfig(num_workers=0, shuffle=False),
         optim_config=optim_config,
         ds_config=ds_config,

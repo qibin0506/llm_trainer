@@ -145,10 +145,10 @@ class Parallel(ABC):
         if self.world_size == 1 or not dist.is_initialized():
             return
 
-        msg = f' for {msg}' if msg else ''
-        Logger.std_log(f'wait at {self.device}{msg}')
+        tag = f' ({msg})' if msg else ''
+        Logger.std_log(f'[Sync] Rank {self.global_rank} waiting at barrier{tag}...')
         dist.barrier()
-        Logger.std_log(f'continue at {self.device}{msg}')
+        Logger.std_log(f'[Sync] Rank {self.global_rank} passed barrier{tag}')
 
 
 class DsParallel(Parallel):
@@ -176,7 +176,7 @@ class DsParallel(Parallel):
                 # 2. raise_if_not_found=False 保证若训练非 MoE 模型（如普通 Dense 模型）时安全跳过
                 set_z3_leaf_modules(model, [MoE], raise_if_not_found=False)
             except Exception as e:
-                Logger.std_log(f'Warning: failed to set z3 leaf modules: {e}')
+                Logger.std_log(f'[Warning] Failed to set ZeRO-3 leaf modules: {e}')
 
         model, optim, _, _ = deepspeed.initialize(
             model=model,

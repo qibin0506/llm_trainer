@@ -388,7 +388,7 @@ class BaseTrainer:
                             optimizer = deepspeed.ops.adam.DeepSpeedCPUAdam
                             if TrainerTools().parallel.is_main_process:
                                 Logger.std_log(
-                                    'When set offload_optimizer, lion optim is unsupported, so set optim to adam!!!!!')
+                                    '[Warning] Lion optimizer is unsupported with CPU offload_optimizer. Falling back to DeepSpeedCPUAdam.')
                     else:
                         optimizer = deepspeed.ops.adam.DeepSpeedCPUAdam
             else:
@@ -567,7 +567,7 @@ class BaseTrainer:
 
             if TrainerTools().parallel.is_main_process:
                 log_dict = {k: v for k, v in steps_dict.items() if k not in ('rng_state', 'dataloader_rng_state')}
-                Logger.std_log(f'restore steps_dict={log_dict}')
+                Logger.std_log(f'[Resume] Restored steps state: {log_dict}')
 
     def _convert_train_args(self) -> Tuple[dict, dict, dict]:
         parallel_kwargs: Optional[Dict[str, Any]] = None
@@ -945,7 +945,7 @@ class BaseTrainer:
                 if epoch == self.resume_epoch and file_idx == self.resume_file_idx:
                     skip_batches = self.resume_batch_idx
                     if skip_batches > 0 and TrainerTools().parallel.is_main_process:
-                        Logger.std_log(f"Fast forwarding {skip_batches} batches in {file_path}...")
+                        Logger.std_log(f"[Resume] Fast-forwarding {skip_batches} batches in {file_path}...")
 
                 if skip_batches > 0 and self.resume_dataloader_rng_state is not None:
                     torch.set_rng_state(self.resume_dataloader_rng_state.cpu().to(torch.uint8))

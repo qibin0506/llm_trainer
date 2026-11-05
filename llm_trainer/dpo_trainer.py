@@ -54,7 +54,7 @@ class DPOTrainer(BaseTrainer):
         if self.dpo_config.loss_type == 'orpo' and (self.dpo_config.nll_loss_coef is None or self.dpo_config.nll_loss_coef == 0.0):
             self.dpo_config.nll_loss_coef = 1.0
             if TrainerTools().parallel.is_main_process:
-                Logger.std_log("WARN: ORPO highly recommends using an NLL (SFT) loss. Please set `nll_loss_coef` (e.g., 1.0) in DPOConfig!")
+                Logger.std_log("[Warning] ORPO highly recommends using an NLL (SFT) loss. Please set `nll_loss_coef` (e.g., 1.0) in DPOConfig!")
 
     def _init_ref_model(self):
         if self.dpo_config.loss_type in ['orpo', 'simpo']:
@@ -190,7 +190,7 @@ class DPOTrainer(BaseTrainer):
                 if epoch == self.resume_epoch and file_idx == self.resume_file_idx:
                     skip_batches = self.resume_batch_idx
                     if skip_batches > 0 and TrainerTools().parallel.is_main_process:
-                        Logger.std_log(f"Fast forwarding {skip_batches} batches in {file_path}...")
+                        Logger.std_log(f"[Resume] Fast-forwarding {skip_batches} batches in {file_path}...")
 
                 if skip_batches > 0 and self.resume_dataloader_rng_state is not None:
                     torch.set_rng_state(self.resume_dataloader_rng_state.cpu().to(torch.uint8))

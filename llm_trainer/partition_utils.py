@@ -372,7 +372,7 @@ def _reset_zero3_state_machine(model: nn.Module) -> None:
                 coordinator._invalidate_trace()
     except Exception as e:
         from .log import Logger
-        Logger.std_log(f"WARN: _reset_zero3_state_machine encountered error: {e}")
+        Logger.std_log(f"[Warning] _reset_zero3_state_machine encountered error: {e}")
 
 
 # 必须在 maybe_gather_lm_head_ctx 后面 import
@@ -403,7 +403,7 @@ def _check_tied_embeddings_zero3_warning(origin_model: nn.Module, unwrapped: nn.
     if is_tied:
         from .log import Logger
         Logger.std_log(
-            f"WARNING: [ZeRO-3 & Fused Head Conflict] Model has `tie_word_embeddings=True` (lm_head.weight is embed_tokens.weight) "
+            f"[Warning] [ZeRO-3 & Fused Head Conflict] Model has `tie_word_embeddings=True` (lm_head.weight is embed_tokens.weight) "
             f"while DeepSpeed ZeRO-3 is enabled. `{func_name}` manually gathers and partitions lm_head.weight during "
             f"fused computation, which can conflict with DeepSpeed Parameter Coordinator's lifecycle tracking for embed_tokens. "
             f"If encountering ZeRO-3 partition state mismatch, assertions or hang, consider untying embeddings or disabling fused head."

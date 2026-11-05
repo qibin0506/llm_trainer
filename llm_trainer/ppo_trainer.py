@@ -175,7 +175,7 @@ class PPOTrainer(BaseTrainer):
         if gen_cfg.top_p < 1.0 or (gen_cfg.top_k is not None and gen_cfg.top_k > 0) or gen_cfg.repetition_penalty != 1.0:
             if TrainerTools().parallel.is_main_process:
                 Logger.std_log(
-                    f"WARN: Rollout generate_config uses truncation or penalties (top_p={gen_cfg.top_p}, "
+                    f"[Warning] Rollout generate_config uses truncation or penalties (top_p={gen_cfg.top_p}, "
                     f"top_k={gen_cfg.top_k}, repetition_penalty={gen_cfg.repetition_penalty}). "
                     f"This creates discrepancy between the sampling distribution and the un-truncated log_softmax evaluation. "
                     f"For on-policy RL, top_p=1.0, top_k=None, and repetition_penalty=1.0 are recommended."
@@ -201,15 +201,16 @@ class PPOTrainer(BaseTrainer):
 
         if TrainerTools().parallel.is_main_process:
             for name, model in zip(['policy', 'value'], [policy_model, value_model]):
+                model_tag = f"[{name.capitalize()} Model]"
                 total_params = sum(getattr(p, 'ds_numel', p.numel()) for p in model.parameters())
-                Logger.std_log(f"Total number of parameters: {total_params:,}")
+                Logger.std_log(f"{model_tag} Total number of parameters: {total_params:,}")
 
                 trainable_params = sum(getattr(p, 'ds_numel', p.numel()) for p in model.parameters() if p.requires_grad)
-                Logger.std_log(f"Trainable number of parameters: {trainable_params:,}")
+                Logger.std_log(f"{model_tag} Trainable number of parameters: {trainable_params:,}")
 
                 total_size_bytes = total_params * 4
                 total_size_mb = total_size_bytes / (1024 * 1024)
-                Logger.std_log(f"Total size of the model: {total_size_mb:.2f} MB")
+                Logger.std_log(f"{model_tag} Total size: {total_size_mb:.2f} MB")
 
         if self.train_config.init_weights_path is not None:
             self._load_external_weights(
@@ -787,7 +788,7 @@ class PPOTrainer(BaseTrainer):
                 if max_comp_len > max_new_tokens:
                     if TrainerTools().parallel.is_main_process:
                         Logger.std_log(
-                            f"WARN: generation_service returned completions of length {max_comp_len} "
+                            f"[Warning] generation_service returned completions of length {max_comp_len} "
                             f"exceeding max_new_tokens ({max_new_tokens}). Completions will be truncated, "
                             f"and terminal status will be invalidated for truncated sequences."
                         )
@@ -861,7 +862,7 @@ class PPOTrainer(BaseTrainer):
                         if max_comp_len == 0:
                             if TrainerTools().parallel.is_main_process:
                                 Logger.std_log(
-                                    "WARN: All sequences generated 0 new tokens (empty completion). "
+                                    "[Warning] All sequences generated 0 new tokens (empty completion). "
                                     "Padding completion length to 1 with pad_token_id to prevent negative slice crash."
                                 )
                             max_comp_len = 1
@@ -1453,7 +1454,7 @@ class PPOTrainer(BaseTrainer):
                 if epoch == self.resume_epoch and file_idx == self.resume_file_idx:
                     skip_batches = self.resume_batch_idx
                     if skip_batches > 0 and TrainerTools().parallel.is_main_process:
-                        Logger.std_log(f"Fast forwarding {skip_batches} batches in {file_path}...")
+                        Logger.std_log(f"[Resume] Fast-forwarding {skip_batches} batches in {file_path}...")
 
                 if skip_batches > 0 and self.resume_dataloader_rng_state is not None:
                     torch.set_rng_state(self.resume_dataloader_rng_state.cpu().to(torch.uint8))
@@ -1490,7 +1491,7 @@ class PPOTrainer(BaseTrainer):
                                 self._on_exception(sample_error, epoch, batch)
                             else:
                                 if TrainerTools().parallel.is_main_process:
-                                    Logger.std_log(f"WARN: Rollout sampling failed on a peer rank in epoch {epoch}, batch {batch + 1}. Aborting to prevent collective deadlock.")
+                                    Logger.std_log(f"[Warning] Rollout sampling failed on a peer rank in epoch {epoch}, batch {batch + 1}. Aborting to prevent collective deadlock.")
                                 raise RuntimeError(f"Rollout sampling failed on a peer rank in epoch {epoch}, batch {batch + 1}.")
                     elif sample_error is not None:
                         self._on_exception(sample_error, epoch, batch)
@@ -1511,7 +1512,7 @@ class PPOTrainer(BaseTrainer):
                                 self._on_exception(eval_error, epoch, batch)
                             else:
                                 if TrainerTools().parallel.is_main_process:
-                                    Logger.std_log(f"WARN: Rollout evaluation failed on a peer rank in epoch {epoch}, batch {batch + 1}. Aborting to prevent collective deadlock.")
+                                    Logger.std_log(f"[Warning] Rollout evaluation failed on a peer rank in epoch {epoch}, batch {batch + 1}. Aborting to prevent collective deadlock.")
                                 raise RuntimeError(f"Rollout evaluation failed on a peer rank in epoch {epoch}, batch {batch + 1}.")
                     elif eval_error is not None:
                         self._on_exception(eval_error, epoch, batch)

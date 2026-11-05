@@ -1063,7 +1063,7 @@ def fold_rewards_to_preceding_action(
 
     if TrainerTools().parallel.is_main_process:
         Logger.std_log(
-            f"WARN: [{context_desc}] Detected non-zero 2D env rewards on non-action tokens "
+            f"[Warning] [{context_desc}] Detected non-zero 2D env rewards on non-action tokens "
             f"(e.g. environment feedback/observation). In multi-turn Action-level Bridge credit assignment, "
             f"step rewards must belong to action tokens. Auto-folding and accumulating these rewards "
             f"into the last token of the immediately preceding Action."

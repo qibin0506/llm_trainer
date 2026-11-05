@@ -31,7 +31,7 @@ class TrainerTools:
                             and (self.parallel.device_type != 'cpu')
                             and not isinstance(self.parallel, DsParallel))
 
-            Logger.std_log(f'word_size={self.parallel.world_size}, use_amp={self.use_amp}')
+            Logger.std_log(f'world_size={self.parallel.world_size}, use_amp={self.use_amp}')
 
     def _new_parallel(self):
         parallel_type = os.environ.get('PARALLEL_TYPE')

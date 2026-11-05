@@ -38,6 +38,7 @@ def main():
     init_weights = args.init_weights or get_upstream_weights_path("sft")
 
     sft_config = SFTConfig(
+        dataset_block_size=512,
         mask_prompt=True,
         gradient_accumulation_steps=1,
         chunked_cross_entropy_size=args.chunk_size if args.chunked else None
@@ -49,7 +50,6 @@ def main():
         model_config=model_config,
         init_weights_path=init_weights,
         file_dataset=dataset,
-        dataset_block_size=512,
         data_loader_config=DataLoaderConfig(num_workers=0, shuffle=False),
         optim_config=optim_config,
         ds_config=ds_config,

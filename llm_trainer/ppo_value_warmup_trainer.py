@@ -34,12 +34,8 @@ class PPOValueWarmupTrainer(PPOTrainer):
             - 奖励打分函数，支持 1D 标量或 2D 逐 Token 稠密序列。
         generation_service:
             - 外部自定义生成服务接口（可选）
-        eval_prompts:
-            - 评估测试的提示词列表（可选）
         max_warmup_steps:
             - 最多预热的全局优化更新步数。若达到此步数则提前终止预热（默认 None，表示跑完 n_epochs）。
-        freeze_backbone:
-            - 是否冻结 Transformer 底座参数，仅训练 value_head 标量投影层（默认 False）。
         bootstrap_truncated:
             - 是否对未正常输出 EOS 的截断样本进行价值 Bootstrap。默认 False，即采用无偏的纯蒙特卡洛折现回报（Reward-to-Go），
               彻底阻断未初始化的随机 Critic 产生噪声回传；设为 True 时将使用安全截断的 last_values 进行 Bootstrap。
@@ -50,19 +46,16 @@ class PPOValueWarmupTrainer(PPOTrainer):
             train_config: TrainConfig,
             reward_func: RewardFun,
             generation_service: Optional[GenerationService] = None,
-            eval_prompts: Optional[List[str]] = None,
             max_warmup_steps: Optional[int] = None,
-            freeze_backbone: bool = False,
             bootstrap_truncated: bool = False
     ):
         self.max_warmup_steps = max_warmup_steps
-        self.freeze_backbone = freeze_backbone
         self.bootstrap_truncated = bootstrap_truncated
         super().__init__(
             train_config=train_config,
             reward_func=reward_func,
             generation_service=generation_service,
-            eval_prompts=eval_prompts or []
+            eval_prompts=[]
         )
         self.policy_model = self._init_policy_model()
 
@@ -78,9 +71,7 @@ class PPOValueWarmupTrainer(PPOTrainer):
     def _init_policy_model(self) -> nn.Module:
         return self._init_frozen_model(self.train_config.init_weights_path)
 
-    def _eval(self, tag: str):
-        # 预热阶段策略模型处于冻结状态，无需执行生成评测，避免在 ZeRO-3 / 多轮服务下误传 ValueModel 导致异常
-        pass
+    def _eval(self, tag: str): ...
 
     def _check_eval_model(self, eval_model):
         return self.policy_model
@@ -109,16 +100,12 @@ class PPOValueWarmupTrainer(PPOTrainer):
 
     def _init_train_model_and_optim(self, initial_lr: float):
         with self._new_model_context(self.parallel_kwargs):
-            value_model = ValueModel(self._new_model(self.train_config))
+            value_model = ValueModel(
+                self._new_model(self.train_config),
+                freeze_backbone=self.ppo_config.freeze_value_backbone
+            )
 
-        if self.freeze_backbone:
-            # 冻结 Transformer Backbone，仅训练 value_head 标量投影头
-            for p in value_model.base_model.parameters():
-                p.requires_grad = False
-            for p in value_model.value_head.parameters():
-                p.requires_grad = True
-
-        if self.train_config.is_gradient_checkpointing and not self.freeze_backbone:
+        if self.train_config.is_gradient_checkpointing and not self.ppo_config.freeze_value_backbone:
             if self.is_ds:
                 import deepspeed
                 value_model.gradient_checkpointing_enable(checkpoint_func=deepspeed.checkpointing.checkpoint)

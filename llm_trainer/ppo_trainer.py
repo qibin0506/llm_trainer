@@ -53,7 +53,7 @@ class ValueHead(nn.Linear):
 
 
 class ValueModel(nn.Module):
-    def __init__(self, base_model: Union[LlmModel, VlmModel]):
+    def __init__(self, base_model: Union[LlmModel, VlmModel], freeze_backbone: bool = False):
         super().__init__()
         self.is_gradient_checkpointing = False
         self.base_model = base_model
@@ -67,6 +67,10 @@ class ValueModel(nn.Module):
             for p in self.base_model.lm_head.parameters():
                 if p is not embed_weight:
                     p.requires_grad = False
+
+        if freeze_backbone:
+            for p in self.base_model.parameters():
+                p.requires_grad = False
 
         self.value_head = ValueHead(base_model.config.hidden_size, 1, bias=True)
 
@@ -180,7 +184,10 @@ class PPOTrainer(BaseTrainer):
     def _init_train_model_and_optim(self, initial_lr: float):
         with self._new_model_context(self.parallel_kwargs):
             policy_model = self._new_model(self.train_config)
-            value_model = ValueModel(self._new_model(self.train_config))
+            value_model = ValueModel(
+                self._new_model(self.train_config),
+                freeze_backbone=self.ppo_config.freeze_value_backbone
+            )
 
         self._check_add_fused_head(policy_model)
         train_model = PolicyAndValueModelWrapper(policy_model, value_model)

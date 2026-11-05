@@ -427,6 +427,7 @@ class PPOConfig:
     missing_eos_penalty: Optional[float] = None
     normalize_rewards: bool = False
     normalize_method: str = 'RunningMeanStd'
+    freeze_value_backbone: bool = False
     generate_config: GenerateConfig = field(default_factory=lambda: GenerateConfig(top_p=1.0))
 
 

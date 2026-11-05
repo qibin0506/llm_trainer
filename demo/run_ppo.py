@@ -54,7 +54,7 @@ def main():
         missing_eos_penalty=0.5,
         gradient_accumulation_steps=1,
         chunked_log_probs_size=args.chunk_size if args.chunked else None,
-        generate_config=GenerateConfig(max_seq_len=256, top_p=1.0)
+        generate_config=GenerateConfig(max_new_tokens=256, top_p=1.0)
     )
 
     train_config = TrainConfig(
@@ -68,7 +68,7 @@ def main():
         optim_config=optim_config,
         ds_config=ds_config,
         ppo_config=ppo_config,
-        eval_config=GenerateConfig(max_seq_len=256, temperature=0.8),
+        eval_config=GenerateConfig(max_new_tokens=256, temperature=0.8),
         save_interval=200,
         eval_interval=50,
     )

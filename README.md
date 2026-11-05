@@ -428,7 +428,7 @@ train_config.ppo_config = PPOConfig(
     normalize_rewards=False,
     missing_eos_penalty=0.5,           # 未生成 EOS 结束符扣分
     generate_config=GenerateConfig(
-        max_seq_len=512, 
+        max_new_tokens=512, 
         temperature=0.7,
         top_p=1.0,                     # RL 建议保持 1.0 无偏采样
         chunked_generate_size=2        # 自回归生成采样阶段分块大小
@@ -494,7 +494,7 @@ train_config.grpo_config = GRPOConfig(
     token_level_loss_norm='global',    # 全局 Token 归一化，消除 micro-batch 长度偏差
     missing_eos_penalty=0.5,           # 未生成 EOS 惩罚
     generate_config=GenerateConfig(
-        max_seq_len=1024, 
+        max_new_tokens=1024, 
         temperature=0.9, 
         top_p=1.0,                     # RL 建议保持 1.0 无偏采样
         chunked_generate_size=4        # 组内自回归采样分块大小
@@ -693,7 +693,7 @@ clean_2d_rewards = fold_rewards_to_preceding_action(
 
 | 参数名 | 类型 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- |
-| `max_seq_len` | `int` | `512` | 自回归生成的序列最大总长度（包含 Prompt）。 |
+| `max_new_tokens` | `int` | `512` | 自回归生成的序列最大生成长度。 |
 | `chunked_generate_size` | `Optional[int]` | `None` | 自回归生成阶段 (`batch_generate`) 的 Batch 分块大小，防止并发 KV Cache 过大导致显存 OOM。 |
 | `temperature` | `float` | `1.0` | 采样温度；值越大越随机，值为 `0` 或接近 `0` 时退化为贪婪搜索。 |
 | `top_p` | `float` | `0.95` | Nucleus 采样概率阈值；仅保留累积概率达 `top_p` 的候选词（强化学习 PPO/GRPO 中推荐设为 `1.0` 保证采样与求值无偏）。 |

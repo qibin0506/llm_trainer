@@ -58,7 +58,7 @@ class Trainer(BaseTrainer):
 
     def _create_dataset(self, file_idx) -> Tuple[Dataset, str]:
         file_path = self.train_config.file_dataset[file_idx]
-        block_size = self.train_config.dataset_block_size
+        block_size = self.pretrain_config.dataset_block_size
         return PretrainDataset(file_path, block_size, block_size), file_path
 
     def _calc_attention_mask(self, inputs):

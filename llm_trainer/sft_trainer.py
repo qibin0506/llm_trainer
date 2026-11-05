@@ -114,7 +114,7 @@ class SFTTrainer(BaseTrainer):
 
     def _create_dataset(self, file_idx) -> Tuple[Dataset, str]:
         file_path = self.train_config.file_dataset[file_idx]
-        block_size = self.train_config.dataset_block_size
+        block_size = self.sft_config.dataset_block_size
 
         image_tag_file_path = None
         tokens_per_image = -1

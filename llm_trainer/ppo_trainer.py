@@ -745,20 +745,7 @@ class PPOTrainer(BaseTrainer):
         padded_prompt_ids = padded_prompt_ids.to(device)
         prompt_masks = self._calc_attention_mask(padded_prompt_ids)
         prompt_len = padded_prompt_ids.shape[1]
-
         max_new_tokens = max(1, self.ppo_config.generate_config.max_new_tokens)
-        max_block_size = self.train_config.dataset_block_size
-        if max_block_size is not None and prompt_len + max_new_tokens > max_block_size:
-            max_allowed_prompt_len = max(1, max_block_size - max_new_tokens)
-            if prompt_len > max_allowed_prompt_len:
-                if TrainerTools().parallel.is_main_process:
-                    Logger.std_log(
-                        f"WARN: [Rank {TrainerTools().parallel.global_rank}] Prompt length ({prompt_len}) + max_new_tokens ({max_new_tokens}) > dataset_block_size ({max_block_size}). "
-                        f"Truncating prompt to last {max_allowed_prompt_len} tokens to guarantee generation budget."
-                    )
-                padded_prompt_ids = padded_prompt_ids[:, -max_allowed_prompt_len:]
-                prompt_masks = self._calc_attention_mask(padded_prompt_ids)
-                prompt_len = padded_prompt_ids.shape[1]
 
         external_gen_mask = None
         dones_list = None

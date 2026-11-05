@@ -320,10 +320,12 @@ class PretrainConfig:
     无监督预训练 (Pre-Training) 参数配置项。
 
     Args:
+        dataset_block_size (`int`): 序列截断长度。如果不传将取 Model 的 max_position_embedding。
         gradient_accumulation_steps (`int`): 梯度累积步数，模拟更大的 Batch Size 以适应小显存。
         kd_config (`Optional[KDConfig]`): 知识蒸馏相关配置，若为 None 则不启用。
         chunked_cross_entropy_size (Optional[int]): 分块交叉熵大小，默认为None不分块计算
     """
+    dataset_block_size: int
     gradient_accumulation_steps: int = 1
     kd_config: Optional[KDConfig] = None
     chunked_cross_entropy_size: Optional[int] = None
@@ -335,6 +337,7 @@ class SFTConfig:
     监督微调 (Supervised Fine-Tuning) 参数配置项。
 
     Args:
+        dataset_block_size (`int`): 序列截断长度。如果不传将取 Model 的 max_position_embedding。
         mask_prompt (`bool`): 是否使用 ignore_index (-100) Mask 掉输入中的 Prompt 部分，使模型只对回答计算 Loss。
         gradient_accumulation_steps (`int`): 梯度累积步数。
         kd_config (`Optional[KDConfig]`): 知识蒸馏相关配置。
@@ -343,6 +346,7 @@ class SFTConfig:
         pixel_values_provider (`Optional[PixelValuesProvider]`): VLM 训练时，根据 image_tag 提供图像像素矩阵的回调。
         freeze_llm_model (`bool`): VLM 微调中是否冻结底座大模型，仅微调 Projector 投影层。
     """
+    dataset_block_size: int
     mask_prompt: bool = True
     gradient_accumulation_steps: int = 1
     kd_config: Optional[KDConfig] = None
@@ -358,6 +362,7 @@ class DPOConfig:
     直接偏好优化 (Direct Preference Optimization) 训练配置。
 
     Args:
+        dataset_block_size (`int`): 序列截断长度。如果不传将取 Model 的 max_position_embedding。
         ref_model_weights_path (Optional[str]): 参考模型 (Reference Model) 的初始化权重路径。
         mask_prompt (`bool`): 是否在 Chosen 和 Rejected 数据中屏蔽掉 Prompt 部分的损失。
         gradient_accumulation_steps (`int`): 梯度累积步数。
@@ -368,6 +373,7 @@ class DPOConfig:
         nll_loss_coef (`Optional[float]`): 加入辅助的负对数似然 (NLL) 损失权重，缓解 DPO 生成质量退化。ORPO 必须设置此项 (通常为 1.0)
         simpo_gamma (`float`): SimPO 算法独有的 Target Reward Margin 参数 (建议 0.5~2.0)。
     """
+    dataset_block_size: int
     ref_model_weights_path: Optional[str] = None
     mask_prompt: bool = True
     gradient_accumulation_steps: int = 1
@@ -510,7 +516,6 @@ class TrainConfig:
         model_config (`Union[ModelConfig, VLMConfig]`): LLM/VLM 底层模型的元配置定义。
         init_weights_path (`Optional[str]`): 初始化主干模型的权重路径。
         file_dataset (`FileDataset`): 用于加载训练数据的 DataSet 类实例。
-        dataset_block_size (`int`): 序列截断长度。如果不传将取 Model 的 max_position_embedding。
         data_loader_config (`DataLoaderConfig`): PyTorch Dataloader 配置项（如 shuffle/worker）。
         optim_config (`OptimConfig`): 优化器 (Lion/Adam) 及学习率配置。
         ds_config (`DsConfig`): 掌控分布式底层的 DeepSpeed 引擎配置（含 ZeRO）。
@@ -531,7 +536,6 @@ class TrainConfig:
     init_weights_path: Optional[str] = None
 
     file_dataset: FileDataset
-    dataset_block_size: int
     data_loader_config: DataLoaderConfig = field(default_factory=DataLoaderConfig)
 
     optim_config: OptimConfig = field(default_factory=OptimConfig)

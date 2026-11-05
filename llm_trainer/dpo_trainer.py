@@ -120,7 +120,7 @@ class DPOTrainer(BaseTrainer):
 
     def _create_dataset(self, file_idx) -> Tuple[Dataset, str]:
         file_path = self.train_config.file_dataset[file_idx]
-        block_size = self.train_config.dataset_block_size
+        block_size = self.dpo_config.dataset_block_size
         return DPODataset(file_path, block_size), file_path
 
     def _logprobs(self, logits_or_logprobs, labels, is_logprobs: bool = False):

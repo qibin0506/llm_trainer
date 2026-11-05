@@ -54,7 +54,7 @@ def main():
         optim_config=optim_config,
         ds_config=ds_config,
         sft_config=sft_config,
-        eval_config=GenerateConfig(max_seq_len=256, temperature=0.8),
+        eval_config=GenerateConfig(max_new_tokens=256, temperature=0.8),
         save_interval=200,
         eval_interval=50,
     )

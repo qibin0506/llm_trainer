@@ -224,7 +224,7 @@ class SyncCentralGenerationService(GenerationServiceBase):
         Args:
             model (torch.nn.Module): 当前训练中的模型实例（从中提取最新权重并加载到 Rank 0 的 gen_model 中）。
             prompt_ids (torch.Tensor): 本地 Rank 待生成的输入 Prompt Token IDs，形状为 [batch_size, seq_len]。
-            generate_config (GenerateConfig): 生成超参数配置（max_seq_len, temperature, top_p, top_k 等）。
+            generate_config (GenerateConfig): 生成超参数配置（max_new_tokens, temperature, top_p, top_k 等）。
             task_type (str): 调用任务上下文（如 'eval', 'ppo', 'grpo'）。若为 'eval' 则仅处理 Rank 0 避免重复。
             pixel_values (Optional[torch.Tensor], optional): 多模态图像特征张量，仅 VLM 场景有效。
             tokens_per_image (Optional[int], optional): 单张图像对应的虚拟 Token 数量，仅 VLM 场景有效。
@@ -271,7 +271,7 @@ class SyncCentralGenerationService(GenerationServiceBase):
                         target_prompts_tensor, tokens_per_image, attention_mask
                     )
 
-                max_new_tokens = max(generate_config.max_seq_len - target_prompts_tensor.shape[1], 1)
+                max_new_tokens = max(generate_config.max_new_tokens, 1)
                 completions = []
 
                 actual_chunk_size = generate_config.chunked_generate_size
@@ -400,7 +400,7 @@ class ParallelGenerationService(GenerationServiceBase):
             local_prompts_tensor, _ = batch_repeat_image_tok(local_prompts_tensor, tokens_per_image, None)
             tokens_per_image = -1
 
-        max_new_tokens = max(generate_config.max_seq_len - local_prompts_tensor.shape[1], 1)
+        max_new_tokens = max(generate_config.max_new_tokens, 1)
         with torch.no_grad():
             out_ids = generate(
                 self.gen_model,
@@ -460,7 +460,7 @@ class ParallelGenerationService(GenerationServiceBase):
             return []
 
         attention_mask = (local_prompts_tensor != TrainerTools().tokenizer.pad).long()
-        max_new_tokens = max(generate_config.max_seq_len - local_prompts_tensor.shape[1], 1)
+        max_new_tokens = max(generate_config.max_new_tokens, 1)
         completions = []
 
         actual_chunk_size = generate_config.chunked_generate_size
@@ -790,7 +790,7 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
                 attention_mask[:, -1] = 1
 
             prompt_len = prompt_ids.shape[1]
-            max_new_tokens = max(generate_config.max_seq_len - prompt_len, 1)
+            max_new_tokens = max(generate_config.max_new_tokens, 1)
 
             out_ids, _ = batch_generate(
                 model=gen_model,
@@ -878,10 +878,8 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
                 for i in range(batch_size)
             ]
 
-            # 统一以当前 Batch 的最大 Prompt 长度为基准，计算整条轨迹在 Trainer 端允许的最大完成预算
-            # 确保与 Trainer 端 left_pad 后的 max_new_tokens = max_seq_len - prompt_len 严格契合，杜绝事后静默截断
-            initial_max_prompt_len = prompt_ids.shape[1]
-            max_completion_budget = max(generate_config.max_seq_len - initial_max_prompt_len, 1)
+            # 整条交互轨迹允许的最大生成预算（包含模型生成与环境交互反馈总配额）
+            max_completion_budget = max(generate_config.max_new_tokens, 1)
 
             loop_dones = [False] * batch_size
             terminals = [False] * batch_size
@@ -894,8 +892,7 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
             for turn in range(self.max_turns):
                 for i in range(batch_size):
                     if not loop_dones[i]:
-                        actual_len = (current_prompts[i] != pad_token_id).sum().item()
-                        if actual_len >= generate_config.max_seq_len or len(trajectories[i]) >= max_completion_budget:
+                        if len(trajectories[i]) >= max_completion_budget:
                             loop_dones[i] = True
 
                 local_all_done = torch.tensor(1 if all(loop_dones) else 0, device=comm_device)
@@ -934,15 +931,12 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
                     if (attention_mask == 0).all():
                         attention_mask[:, -1] = 1
 
-                    # 计算活跃样本的最大剩余预算，避免生成步数超出序列预算限制
+                    # 计算活跃样本的最大剩余预算，避免生成步数超出预算限制
                     max_active_budget = max(
                         (max(max_completion_budget - len(trajectories[i]), 1) for i in active_indices),
                         default=1
                     )
-                    local_remaining_max_tokens = min(
-                        max(generate_config.max_seq_len - cur_prompt_len, 1),
-                        max_active_budget
-                    )
+                    local_remaining_max_tokens = max_active_budget
 
                 remaining_max_tokens = local_remaining_max_tokens
 
@@ -1119,7 +1113,7 @@ class MultiTurnRLGenerationService(GenerationServiceBase):
                     # 说明模型在下一轮已无法继续生成任何动作 Token，此时不应将该段悬空 feedback
                     # 塞入 trajectories 尾部（避免污染 completion_ids 长度并导致 PPO GAE Bootstrap 对齐错位），
                     # 直接终止该样本。
-                    if remaining_capacity <= 0 or len(feedback_tokens) >= remaining_capacity or next_prompt_len >= generate_config.max_seq_len:
+                    if remaining_capacity <= 0 or len(feedback_tokens) >= remaining_capacity:
                         loop_dones[idx] = True
                         next_prompts_list[idx] = torch.tensor([pad_token_id], dtype=torch.long, device=gen_device)
                         continue

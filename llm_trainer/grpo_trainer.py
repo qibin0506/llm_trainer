@@ -439,19 +439,19 @@ class GRPOTrainer(BaseTrainer):
         padded_prompt_ids = padded_prompt_ids.repeat_interleave(group_size, 0)
         prompt_masks = self._calc_attention_mask(padded_prompt_ids)
 
-        max_seq_len = self.grpo_config.generate_config.max_seq_len
-        if prompt_len >= max_seq_len:
-            max_allowed_prompt_len = max(1, max_seq_len - 16)
-            if TrainerTools().parallel.is_main_process:
-                Logger.std_log(
-                    f"WARN: [Rank {TrainerTools().parallel.global_rank}] Prompt length ({prompt_len}) >= max_seq_len ({max_seq_len}). "
-                    f"Truncating prompt to last {max_allowed_prompt_len} tokens to leave generation budget and prevent rank abort."
-                )
-            padded_prompt_ids = padded_prompt_ids[:, -max_allowed_prompt_len:]
-            prompt_masks = self._calc_attention_mask(padded_prompt_ids)
-            prompt_len = padded_prompt_ids.shape[1]
-
-        max_new_tokens = max(1, max_seq_len - prompt_len)
+        max_new_tokens = max(1, self.grpo_config.generate_config.max_new_tokens)
+        max_block_size = self.train_config.dataset_block_size
+        if max_block_size is not None and prompt_len + max_new_tokens > max_block_size:
+            max_allowed_prompt_len = max(1, max_block_size - max_new_tokens)
+            if prompt_len > max_allowed_prompt_len:
+                if TrainerTools().parallel.is_main_process:
+                    Logger.std_log(
+                        f"WARN: [Rank {TrainerTools().parallel.global_rank}] Prompt length ({prompt_len}) + max_new_tokens ({max_new_tokens}) > dataset_block_size ({max_block_size}). "
+                        f"Truncating prompt to last {max_allowed_prompt_len} tokens to guarantee generation budget."
+                    )
+                padded_prompt_ids = padded_prompt_ids[:, -max_allowed_prompt_len:]
+                prompt_masks = self._calc_attention_mask(padded_prompt_ids)
+                prompt_len = padded_prompt_ids.shape[1]
 
         external_gen_mask = None
         dones_list = None
@@ -880,7 +880,7 @@ class GRPOTrainer(BaseTrainer):
                 if self.grpo_config.loss_type == "dr_grpo":
                     completion_len_for_loss = (
                             self.grpo_config.dr_grpo_max_completion_len
-                            or self.grpo_config.generate_config.max_seq_len
+                            or self.grpo_config.generate_config.max_new_tokens
                     )
                 else:
                     completion_len_for_loss = actual_completion_len

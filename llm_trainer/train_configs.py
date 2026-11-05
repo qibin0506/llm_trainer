@@ -293,7 +293,7 @@ class GenerateConfig:
     """
     模型自回归生成 (Eval / Generation / Rollout) 阶段的解码配置。
     Args:
-        max_seq_len (`int`): 生成序列的最大总长度（包含 Prompt）。
+        max_new_tokens (`int`): 自回归生成阶段允许生成的最大新 Token 数量（不包含 Prompt）。
         chunked_generate_size (`Optional[int]`): 自回归生成阶段 (batch_generate) 的 Batch 分块大小，防止并发 KV Cache 过大导致显存 OOM。
         temperature (`float`): 采样温度，控制生成随机性。值越高结果越随机。
         top_p (`float`): Nucleus 采样阈值，保留累计概率大于 top_p 的最小词集。
@@ -303,7 +303,7 @@ class GenerateConfig:
         suppress_tokens (`Optional[List[int]]`): 强行抑制不被生成的 Token IDs，将其 Logits 置为 -inf。
         auto_prefix_cache (`bool`): 是否开启自动公共前缀 KV Cache 复用（当 Batch 内样本具有相同 Prompt 前缀且无左填充时大幅加速生成）。
     """
-    max_seq_len: int = 512
+    max_new_tokens: int = 512
     chunked_generate_size: Optional[int] = None
     temperature: float = 1.0
     top_p: float = 0.95

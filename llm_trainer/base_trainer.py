@@ -845,7 +845,7 @@ class BaseTrainer:
                 eval_model.eval()
 
                 tokens = torch.tensor(TrainerTools().tokenizer.encode(eval_prompt), dtype=torch.long).unsqueeze(0)
-                max_new_tokens = max(self.train_config.eval_config.max_seq_len - tokens.shape[1], 0)
+                max_new_tokens = self.train_config.eval_config.max_new_tokens
 
                 with torch.no_grad():
                     gen_result = generate(

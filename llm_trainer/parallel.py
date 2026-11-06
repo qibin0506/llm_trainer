@@ -127,11 +127,11 @@ class Parallel(ABC):
 
     @property
     def local_rank(self) -> int:
-        return self._local_rank
+        return max(0, self._local_rank) if self._use_parallel else 0
 
     @property
     def global_rank(self) -> int:
-        return self._global_rank
+        return max(0, self._global_rank) if self._use_parallel else 0
 
     @property
     def world_size(self) -> int:

@@ -803,8 +803,7 @@ class BaseTrainer:
     ):
         import traceback
         tb_str = traceback.format_exc()
-        rank = TrainerTools().parallel.global_rank if hasattr(TrainerTools(), 'parallel') else 0
-        log_msg = f"[Rank {rank}] Exception at epoch: {epoch}, batch: {batch} -> {e}\n{tb_str}"
+        log_msg = f"[Rank {TrainerTools().parallel.global_rank}] Exception at epoch: {epoch}, batch: {batch} -> {e}\n{tb_str}"
         Logger('exception.txt').log(log_msg, log_to_console=True).release()
 
         # 在分布式环境下主动销毁通信组，使得其他卡能立刻探测到通信断开并退出，避免 NCCL 集合通信卡死 30 分钟

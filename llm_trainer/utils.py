@@ -662,7 +662,7 @@ def _masked_mean_and_var(
             and torch.cuda.is_available()
         )
         if needs_cuda_transfer:
-            target_device = torch.device(f"cuda:{dist.get_rank() % torch.cuda.device_count()}")
+            target_device = torch.device(TrainerTools().parallel.device)
             stats_dev = stats.to(target_device)
             dist.all_reduce(stats_dev, op=dist.ReduceOp.SUM)
             stats = stats_dev.to(stats.device)

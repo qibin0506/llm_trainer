@@ -184,10 +184,9 @@ def load_steps(checkpoint_path: Optional[str] = None) -> Optional[dict]:
 
     # 每个 rank 提取属于自己的 rng_state，避免非主卡被 Rank 0 的随机状态覆盖
     if steps_dict is not None and 'all_rng_states' in steps_dict:
-        rank = max(0, TrainerTools().parallel.global_rank)
         all_rng_states = steps_dict.pop('all_rng_states')
-        if isinstance(all_rng_states, list) and rank < len(all_rng_states):
-            steps_dict['rng_state'] = all_rng_states[rank]
+        if isinstance(all_rng_states, list) and TrainerTools().parallel.global_rank < len(all_rng_states):
+            steps_dict['rng_state'] = all_rng_states[TrainerTools().parallel.global_rank]
 
     return steps_dict
 

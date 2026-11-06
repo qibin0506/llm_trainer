@@ -2,14 +2,14 @@ from setuptools import setup, find_packages
 
 setup(
     name='project_llm_trainer',
-    version='0.25.6',
+    version='0.25.7',
     description='LLM and VLM trainer',
     scripts=[
         'scripts/vis_lr',
         'scripts/vis_log',
         'scripts/calc_intermediate_size',
     ],
-    author='qibin',
+    author='Binn Chi',
     author_email='qibin0506@gmail.com',
     packages=find_packages(),
     install_requires=[

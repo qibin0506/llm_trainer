@@ -101,6 +101,12 @@ def plot_with_plotly(results, separator_indices, loss_file):
                     fig.add_annotation(x=sep_idx, y=1, yref=f"y domain", text=sep_label, showarrow=False,
                                        textangle=-90, xanchor='right', font=dict(color="red", size=10), row=idx + 1,
                                        col=1)
+            elif sep_type == 'warmup_end':
+                fig.add_vline(x=sep_idx, line_dash="dashdot", line_color="orange", opacity=0.8, row=idx + 1, col=1)
+                if idx == 0:
+                    fig.add_annotation(x=sep_idx, y=1, yref="y domain", text=sep_label, showarrow=False,
+                                       textangle=-90, xanchor='right', font=dict(color="orange", size=10), row=idx + 1,
+                                       col=1)
             elif sep_type == 'file':
                 fig.add_vline(x=sep_idx, line_dash="dot", line_color="green", opacity=0.3, row=idx + 1, col=1)
 
@@ -148,6 +154,11 @@ def plot_with_matplotlib(results, separator_indices):
                     if idx == 0:
                         ax.text(sep_idx, ax.get_ylim()[1], sep_label, rotation=90, verticalalignment='top', color='red',
                                 fontsize=8)
+                elif sep_type == 'warmup_end':
+                    ax.axvline(x=sep_idx, color='orange', linestyle='-.', linewidth=1.5, alpha=0.9)
+                    if idx == 0:
+                        ax.text(sep_idx, ax.get_ylim()[1], sep_label, rotation=90, verticalalignment='top',
+                                color='orange', fontsize=8)
                 elif sep_type == 'file':
                     ax.axvline(x=sep_idx, color='green', linestyle=':', linewidth=1.0, alpha=0.6)
                     if idx == 0:
@@ -188,6 +199,7 @@ def main():
 
     if sorted_keys:
         prev_key = sorted_keys[0]
+        prev_warmup = None
         for i, key in enumerate(sorted_keys):
             metrics = data_map[key]
             for k in all_metric_keys:
@@ -196,6 +208,12 @@ def main():
 
             curr_epoch, curr_file, _ = key
             prev_epoch, prev_file, _ = prev_key
+
+            # 检测 is_value_warmup 状态从 1 降为 0 的边界点
+            curr_warmup = metrics.get('is_value_warmup', None)
+            if prev_warmup is not None and prev_warmup > 0.5 and (curr_warmup is not None and curr_warmup < 0.5):
+                separator_indices.append((i, 'warmup_end', 'Warmup End'))
+            prev_warmup = curr_warmup
 
             if curr_epoch != prev_epoch:
                 separator_indices.append((i, 'epoch', f"Ep {curr_epoch}"))
